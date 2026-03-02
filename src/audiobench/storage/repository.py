@@ -245,6 +245,7 @@ class TranscriptionRepository:
                     if rec.source == "live"
                     else (rec.audio_file.file_name if rec.audio_file else "unknown")
                 ),
+                "file_path": (rec.audio_file.file_path if rec.audio_file else None),
                 "source": rec.source,
                 "full_text": rec.full_text,
                 "language": rec.language,
@@ -267,6 +268,21 @@ class TranscriptionRepository:
                     for seg in rec.segments
                 ],
             }
+
+    def update_text(self, transcription_id: int, new_text: str) -> bool:
+        """Update the full text of a transcription (used by REPL .edit).
+
+        Returns True if found and updated, False if not found.
+        """
+        with get_session() as session:
+            rec = session.query(TranscriptionRecord).filter_by(id=transcription_id).first()
+            if rec is None:
+                return False
+            rec.full_text = new_text
+            rec.word_count = len(new_text.split())
+            session.commit()
+            logger.info("Updated text for transcription #%d", transcription_id)
+            return True
 
     def delete_by_id(self, transcription_id: int) -> bool:
         """Delete a transcription by ID.
