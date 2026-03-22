@@ -4,7 +4,7 @@ Wraps piper-tts for high-quality, low-latency speech synthesis.
 All processing happens locally via ONNX models — no cloud APIs.
 
 Usage:
-    from src.audiobench.tts.engine import PiperTTSEngine
+    from audiobench.tts.engine import PiperTTSEngine
 
     engine = PiperTTSEngine()
     engine.synthesize("Hello world", output_path="hello.wav")
@@ -17,8 +17,8 @@ import wave
 from dataclasses import dataclass
 from pathlib import Path
 
-from src.audiobench.config.logging_config import get_logger
-from src.audiobench.core.exceptions import AudioBenchError
+from audiobench.core.error_types import AudioBenchError
+from audiobench.core.logger_factory import get_logger
 
 logger = get_logger("tts.engine")
 

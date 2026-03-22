@@ -4,7 +4,7 @@ Identifies who is speaking in each segment of a transcript.
 Requires a HuggingFace token for pyannote model access.
 
 Usage:
-    from src.audiobench.diarization.engine import PyannoteDiarizer
+    from audiobench.diarization.engine import PyannoteDiarizer
 
     diarizer = PyannoteDiarizer(hf_token="hf_...")
     transcript = diarizer.diarize(audio_path, transcript)
@@ -15,9 +15,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from src.audiobench.config.logging_config import get_logger
-from src.audiobench.core.exceptions import DiarizationError
-from src.audiobench.core.models import Segment, Transcript
+from audiobench.core.error_types import DiarizationError
+from audiobench.core.logger_factory import get_logger
+from audiobench.transcribe.transcription_result import Segment, Transcript
 
 logger = get_logger("diarization.engine")
 

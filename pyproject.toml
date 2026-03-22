@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "audiobench"
 version = "0.1.0"
-description = "Offline audio workbench — transcription, TTS, streaming, and more"
+description = "Offline AI audio toolkit — transcribe, search, chat, visualize, and speak"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
@@ -42,6 +42,7 @@ diarization = ["pyannote.audio>=3.3.0", "torch>=2.0.0", "torchaudio>=2.0.0"]
 tts = ["piper-tts>=1.2.0", "sounddevice>=0.5.0"]
 ai = ["requests>=2.31.0"]
 vosk = ["vosk>=0.3.45"]
+google = ["google-genai>=1.0.0"]
 dev = [
     "pytest>=8.0.0",
     "pytest-cov>=5.0.0",
@@ -50,14 +51,14 @@ dev = [
     "mypy>=1.10.0",
 ]
 docs = ["zensical>=0.0.23"]
-all = ["audiobench[streaming,diarization,tts,ai,vosk,dev,docs]"]
+all = ["audiobench[streaming,diarization,tts,ai,vosk,google,dev,docs]"]
 
 [project.scripts]
-audiobench = "cli.app:cli"
+audiobench = "audiobench.cli.app:cli"
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["src*", "cli*"]
+where = ["src"]
+include = ["audiobench*"]
 
 [tool.black]
 line-length = 100

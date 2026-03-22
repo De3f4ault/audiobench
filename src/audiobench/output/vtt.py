@@ -1,7 +1,7 @@
 """WebVTT (.vtt) subtitle formatter."""
 
-from src.audiobench.core.models import Transcript
-from src.audiobench.output.base import OutputFormatter
+from audiobench.output.base import OutputFormatter
+from audiobench.transcribe.transcription_result import Transcript
 
 
 def _format_vtt_time(seconds: float) -> str:

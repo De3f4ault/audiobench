@@ -21,10 +21,10 @@ import time
 import numpy as np
 import torch
 
-from src.audiobench.config.logging_config import get_logger
-from src.audiobench.config.settings import AudioBenchSettings
-from src.audiobench.core.exceptions import StreamingError
-from src.audiobench.core.models import Segment, Transcript
+from audiobench.core.error_types import StreamingError
+from audiobench.core.logger_factory import get_logger
+from audiobench.core.settings import AudioBenchSettings
+from audiobench.transcribe.transcription_result import Segment, Transcript
 
 logger = get_logger("streaming.session")
 

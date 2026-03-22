@@ -8,15 +8,12 @@ Provides a clean interface over SQLAlchemy for:
 
 from __future__ import annotations
 
-from typing import Optional
+from sqlalchemy import desc
 
-from sqlalchemy import desc, or_
-from sqlalchemy.orm import Session
-
-from src.audiobench.config.logging_config import get_logger
-from src.audiobench.core.models import AudioMetadata, Transcript
-from src.audiobench.storage.database import get_session
-from src.audiobench.storage.models import AudioFileRecord, SegmentRecord, TranscriptionRecord
+from audiobench.core.db_session import get_session
+from audiobench.core.logger_factory import get_logger
+from audiobench.storage.models import AudioFileRecord, SegmentRecord, TranscriptionRecord
+from audiobench.transcribe.transcription_result import AudioMetadata, Transcript
 
 logger = get_logger("storage.repository")
 
@@ -27,7 +24,7 @@ class TranscriptionRepository:
     def save_transcription(
         self,
         transcript: Transcript,
-        audio_metadata: Optional[AudioMetadata] = None,
+        audio_metadata: AudioMetadata | None = None,
     ) -> int:
         """Save a transcription result to the database.
 
@@ -69,6 +66,7 @@ class TranscriptionRepository:
             tx_record = TranscriptionRecord(
                 audio_file_id=audio_record.id if audio_record else None,
                 source="file",
+                file_name=audio_metadata.file_name if audio_metadata else "",
                 full_text=transcript.text,
                 language=transcript.language,
                 language_probability=transcript.language_probability,
@@ -112,6 +110,7 @@ class TranscriptionRepository:
             tx_record = TranscriptionRecord(
                 audio_file_id=None,
                 source="live",
+                file_name="🎤 Live session",
                 full_text=transcript.text,
                 language=transcript.language,
                 language_probability=transcript.language_probability,
@@ -142,7 +141,7 @@ class TranscriptionRepository:
             )
             return tx_record.id
 
-    def find_by_hash(self, file_hash: str) -> Optional[TranscriptionRecord]:
+    def find_by_hash(self, file_hash: str) -> TranscriptionRecord | None:
         """Find an existing transcription by audio file hash (deduplication).
 
         Returns the most recent transcription for the given file hash, or None.
@@ -176,10 +175,12 @@ class TranscriptionRepository:
 
             results = []
             for rec in records:
-                audio = rec.audio_file
-                if rec.source == "live":
+                if rec.file_name:
+                    label = rec.file_name
+                elif rec.source == "live":
                     label = "🎤 Live session"
                 else:
+                    audio = rec.audio_file
                     label = audio.file_name if audio else "unknown"
                 results.append(
                     {
@@ -223,7 +224,8 @@ class TranscriptionRepository:
             return [
                 {
                     "id": rec.id,
-                    "file_name": rec.audio_file.file_name if rec.audio_file else "unknown",
+                    "file_name": rec.file_name
+                    or (rec.audio_file.file_name if rec.audio_file else "unknown"),
                     "language": rec.language,
                     "text_preview": rec.full_text[:200],
                     "created_at": rec.created_at.isoformat() if rec.created_at else "",
@@ -231,7 +233,7 @@ class TranscriptionRepository:
                 for rec in records
             ]
 
-    def get_by_id(self, transcription_id: int) -> Optional[dict]:
+    def get_by_id(self, transcription_id: int) -> dict | None:
         """Get full transcription by ID including all segments."""
         with get_session() as session:
             rec = session.query(TranscriptionRecord).filter_by(id=transcription_id).first()
@@ -240,7 +242,8 @@ class TranscriptionRepository:
 
             return {
                 "id": rec.id,
-                "file_name": (
+                "file_name": rec.file_name
+                or (
                     "🎤 Live session"
                     if rec.source == "live"
                     else (rec.audio_file.file_name if rec.audio_file else "unknown")
@@ -265,7 +268,7 @@ class TranscriptionRepository:
                         "end": seg.end_time,
                         "speaker": seg.speaker,
                     }
-                    for seg in rec.segments
+                    for seg in sorted(rec.segments, key=lambda s: s.segment_index)
                 ],
             }
 

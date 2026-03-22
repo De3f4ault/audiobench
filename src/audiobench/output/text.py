@@ -1,7 +1,7 @@
 """Plain text output formatter."""
 
-from src.audiobench.core.models import Transcript
-from src.audiobench.output.base import OutputFormatter
+from audiobench.output.base import OutputFormatter
+from audiobench.transcribe.transcription_result import Transcript
 
 
 class TextFormatter(OutputFormatter):

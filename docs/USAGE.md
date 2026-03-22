@@ -359,7 +359,7 @@ audiobench preset show meeting
 audiobench preset delete meeting
 ```
 
-Presets are stored as TOML files in `~/.audiobench/presets/`.
+Presets are stored as TOML files in `data/presets/`.
 
 ---
 

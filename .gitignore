@@ -58,3 +58,6 @@ logs/
 tmp/
 *.tmp
 site/
+
+# Runtime data
+data/

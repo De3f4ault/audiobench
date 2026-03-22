@@ -4,6 +4,6 @@ Provides:
     PyannoteDiarizer — pyannote.audio-based speaker identification
 """
 
-from src.audiobench.diarization.engine import PyannoteDiarizer
+from audiobench.diarization.engine import PyannoteDiarizer
 
 __all__ = ["PyannoteDiarizer"]

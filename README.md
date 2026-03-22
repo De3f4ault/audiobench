@@ -1,10 +1,51 @@
 # 🎙️ AudioBench
 
- **offline** AudioBench powered by [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
+**Offline AI audio toolkit** — transcribe, search, chat, visualize, and speak.
 
-> Runs entirely on your machine — no API keys, no cloud, no data leaving your laptop.
+Turn any audio file into a searchable knowledge base that runs entirely on your machine.
+
+> No API keys required · No cloud · No data leaves your laptop
 
 **Python 3.10+** · **MIT License** · **CPU-optimized** (`int8` quantization)
+
+---
+
+## What You Get in One Command
+
+| | Capability | Command | What it does |
+|---|---|---|---|
+| 🎤 | **Transcribe** | `audiobench transcribe file.m4a` | Offline speech-to-text with word timestamps |
+| 🔴 | **Live** | `audiobench listen` | Real-time microphone transcription |
+| 🗣️ | **Speakers** | `--diarize` | Identify who said what |
+| 💬 | **Chat** | `audiobench chat 3` | Ask questions about any transcript |
+| 🔍 | **Search** | `audiobench search "keyword"` | Full-text search across all history |
+| 📊 | **Visualize** | `audiobench inspect file.m4a` | Waveform + spectrogram in one shot |
+| 🔊 | **Speak** | `audiobench speak "Hello"` | Text-to-speech (offline Piper TTS) |
+| 🔧 | **Analyze** | `audiobench analyze file.m4a` | Loudness, silence regions, quality |
+
+---
+
+## See AudioBench in Action
+
+### 📊 Audio Spectrogram
+> `audiobench inspect recording.flac`
+
+![Spectrogram — full frequency analysis of a 27-minute conversation](docs/images/spectrogram.png)
+
+### 🌊 Waveform
+> `audiobench inspect recording.flac`
+
+![Waveform — visualize speech, silence, and volume across the recording](docs/images/waveform.png)
+
+### 🗣️ Speaker Diarization
+> `audiobench transcribe conversation.m4a --diarize --engine gemini`
+
+```
+[Speaker 1]: So what do you think about the project?
+[Speaker 2]: Honestly it's really impressive.
+[Speaker 1]: We should publish it.
+[Speaker 2]: Let's do it this week.
+```
 
 ---
 
@@ -32,8 +73,8 @@ The first run downloads the model (~1.5 GB) to `~/.audiobench/models/`. Subseque
 ### Using Make (recommended)
 
 ```bash
-make install          # Base install
-make dev              # Dev install (linting, tests, editable)
+make install          # Base install (transcription only)
+make dev              # Full install (all extras: docs, dev tools, TTS, streaming, AI)
 ```
 
 ### Manual
@@ -380,10 +421,10 @@ Generates PNG images of the audio waveform and/or spectrogram.
 
 ## Plugin System
 
-Extend AudioBench with custom commands by placing Python files in `~/.audiobench/plugins/`.
+Extend AudioBench with custom commands by placing Python files in `data/plugins/`.
 
 ```python
-# ~/.audiobench/plugins/my_tool.py
+# data/plugins/my_tool.py
 import click
 
 @click.command()
@@ -455,19 +496,21 @@ cp .env.example .env
 ## Directory Layout
 
 ```
-~/.audiobench/              ← App data directory
-├── models/
-│   ├── models--Systran--faster-whisper-large-v3-turbo/  ← Whisper (~1.5 GB)
-│   └── rnnoise/
-│       └── bd.rnnn          ← RNNoise neural denoise model (~293 KB, auto-downloaded)
-├── presets/                 ← Named configuration presets (TOML)
-├── plugins/                 ← User plugins (Python files)
-├── repl_history             ← REPL command history
-└── transcriptions.db        ← SQLite database (history, search)
+audiobench/                    ← Project root
+├── data/                      ← Project-local data (gitignored)
+│   ├── transcriptions.db      ← SQLite database (history, search)
+│   ├── plugins/               ← User plugins (Python files)
+│   ├── presets/               ← Named configuration presets (TOML)
+│   ├── logs/                  ← Application logs
+│   ├── sessions/              ← Live transcription sessions
+│   └── repl_history           ← REPL command history
+├── .env                       ← Your configuration (gitignored)
+└── .env.example               ← Configuration template
 
-./                           ← Project root
-├── .env                     ← Your configuration (gitignored)
-└── .env.example             ← Configuration template
+~/.audiobench/                 ← Shared resources (multi-GB, reused across projects)
+├── models/                    ← Whisper models (~1.5 GB each)
+│   └── rnnoise/               ← RNNoise neural denoise model (~293 KB)
+└── voices/                    ← Piper TTS voice models
 ```
 
 ---
@@ -475,45 +518,64 @@ cp .env.example .env
 ## Project Structure
 
 ```
-audiobench/
-├── cli/                     ← Command-line interface
-│   ├── commands/
-│   │   ├── __init__.py      ← Command registry (29 commands)
-│   │   ├── transcribe.py    ← transcribe, subtitle
-│   │   ├── audio.py         ← analyze, convert, merge
-│   │   ├── chat.py          ← chat, ask (AI conversation)
-│   │   ├── config_cmd.py    ← preset, install-completion
-│   │   ├── analyze.py       ← vocab (word frequency)
-│   │   ├── system.py        ← info, download, doctor, status, cleanup
-│   │   ├── history.py       ← history, search, show, export, delete
-│   │   └── inspect.py       ← inspect (waveform/spectrogram)
-│   ├── repl.py              ← Interactive shell with dot-commands
-│   ├── plugins.py           ← User plugin loader (~/.audiobench/plugins/)
-│   ├── helpers.py           ← PhaseTracker (progress display), file helpers
-│   ├── custom_group.py      ← Fuzzy command matching + suggestions
-│   └── theme.py             ← Rich console styling, colors, panels
-├── src/audiobench/
-│   ├── config/
-│   │   ├── settings.py      ← Pydantic settings (env vars, .env, defaults)
-│   │   └── logging_config.py
-│   ├── core/
-│   │   ├── pipeline.py      ← Orchestrates: load → convert → transcribe → save
-│   │   ├── ffmpeg.py        ← FFmpeg integration (filters, analysis, conversion)
-│   │   ├── filters.py       ← Text quality filters (repetition, broken words)
-│   │   └── models.py        ← Pydantic data models (Segment, Transcript, Word)
-│   ├── engines/
-│   │   └── whisper_engine.py ← faster-whisper integration (batched + sequential)
-│   ├── output/
-│   │   ├── base.py          ← Formatter registry
-│   │   ├── txt.py / srt.py / vtt.py / json_fmt.py
-│   │   └── (output formatters)
-│   └── storage/
-│       ├── database.py      ← SQLAlchemy engine + session
-│       └── repository.py    ← CRUD operations on transcriptions
-├── Makefile                 ← Build targets (install, test, lint, transcribe)
-├── pyproject.toml           ← Project metadata + dependencies
-├── requirements.txt         ← Pinned dependencies
-└── .env.example             ← Configuration template
+src/audiobench/
+├── core/                           ← Infrastructure
+│   ├── settings.py                 ← Pydantic settings (env vars, .env, defaults)
+│   ├── logger_factory.py           ← Logging setup
+│   ├── db_base.py                  ← SQLAlchemy DeclarativeBase
+│   ├── db_engine.py                ← Engine + init_db
+│   ├── db_session.py               ← Session factory
+│   └── error_types.py              ← Custom exceptions
+│
+├── transcribe/                     ← Transcription pipeline
+│   ├── transcriber.py              ← Pipeline orchestrator
+│   ├── audio_converter.py          ← FFmpeg wrapper (filters, conversion)
+│   ├── audio_filters.py            ← Text quality filters
+│   ├── transcription_result.py     ← Pydantic models (Segment, Transcript, Word)
+│   └── engines/
+│       ├── engine_protocol.py      ← Engine interface
+│       ├── engine_registry.py      ← Factory/registry
+│       └── whisper_engine.py       ← faster-whisper (batched + sequential)
+│
+├── chat/                           ← AI chat feature
+│   ├── chat_session.py             ← Chat orchestrator
+│   ├── chat_store.py               ← DB persistence
+│   ├── context_builder.py          ← Prompt templates
+│   └── providers/
+│       └── ollama_provider.py      ← Ollama backend
+│
+├── cli/                            ← Presentation layer
+│   ├── app.py                      ← Entry point + global flags
+│   ├── commands/                   ← Auto-discovered commands
+│   │   ├── __init__.py             ← pkgutil auto-discovery
+│   │   ├── transcribe.py, audio.py, chat.py, history.py, ...
+│   ├── display/                    ← Visual rendering
+│   │   ├── theme.py                ← Colors, Rich console, panels
+│   │   └── phase_tracker.py        ← Progress display
+│   ├── io/                         ← Input/Output handling
+│   │   ├── file_collector.py       ← Path resolution, globs, manifests
+│   │   └── output_resolver.py      ← Output path, format, collisions
+│   ├── plugins/                    ← Plugin system
+│   │   ├── loader.py               ← Plugin discovery + loading
+│   │   └── custom_group.py         ← Fuzzy command matching
+│   └── repl/                       ← Interactive shell
+│       ├── __init__.py             ← Main loop
+│       ├── session.py, dispatch.py, dot_commands.py, ...
+│
+├── storage/                        ← Data layer
+│   ├── models.py                   ← SQLAlchemy ORM models
+│   └── repository.py               ← CRUD operations
+│
+├── output/                         ← Format writers (txt, srt, vtt, json)
+├── streaming/                      ← Live transcription
+├── tts/                            ← Text-to-speech (Piper)
+└── diarization/                    ← Speaker detection
+
+tests/                              ← Test suite (109 tests)
+├── conftest.py                     ← Shared fixtures
+├── test_core/                      ← Settings, DB engine
+├── test_cli/                       ← Commands, IO, REPL
+└── test_storage/                   ← Repository CRUD
 ```
 
 ---
@@ -550,6 +612,28 @@ make status            # Usage statistics
 audiobench -v transcribe meeting.m4a     # Verbose (INFO logs)
 audiobench --debug transcribe meeting.m4a # Debug (all logs)
 ```
+
+---
+
+## Documentation
+
+AudioBench includes a documentation site built with [Zensical](https://zensical.org/).
+
+```bash
+# Install docs dependencies (included in `make dev`)
+pip install -e ".[docs]"
+
+# Build static docs
+make docs
+
+# Serve locally with live reload
+make docs-serve
+
+# Stop the docs server
+make docs-stop
+```
+
+The generated site is output to `site/`.
 
 ---
 

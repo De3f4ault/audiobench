@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from src.audiobench.core.exceptions import OutputFormatError
-from src.audiobench.core.models import Transcript
+from audiobench.core.error_types import OutputFormatError
+from audiobench.transcribe.transcription_result import Transcript
 
 _FORMATTERS: dict[str, type[OutputFormatter]] = {}
 
@@ -38,10 +38,10 @@ def get_formatter(name: str) -> OutputFormatter:
 def _ensure_registered() -> None:
     if _FORMATTERS:
         return
-    from src.audiobench.output.text import TextFormatter
-    from src.audiobench.output.srt import SrtFormatter
-    from src.audiobench.output.vtt import VttFormatter
-    from src.audiobench.output.json_fmt import JsonFormatter
+    from audiobench.output.json_fmt import JsonFormatter
+    from audiobench.output.srt import SrtFormatter
+    from audiobench.output.text import TextFormatter
+    from audiobench.output.vtt import VttFormatter
 
     register_formatter("txt", TextFormatter)
     register_formatter("srt", SrtFormatter)

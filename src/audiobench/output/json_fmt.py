@@ -1,9 +1,8 @@
 """JSON output formatter with full metadata."""
 
-import json
 
-from src.audiobench.core.models import Transcript
-from src.audiobench.output.base import OutputFormatter
+from audiobench.output.base import OutputFormatter
+from audiobench.transcribe.transcription_result import Transcript
 
 
 class JsonFormatter(OutputFormatter):

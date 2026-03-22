@@ -10,7 +10,7 @@ Tables:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -36,9 +36,7 @@ class AudioFileRecord(Base):
     sample_rate: Mapped[int] = mapped_column(Integer, default=0)
     channels: Mapped[int] = mapped_column(Integer, default=0)
     file_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=True, index=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=lambda: datetime.now(timezone.utc)
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
 
     # Relationships
     transcriptions: Mapped[list[TranscriptionRecord]] = relationship(
@@ -46,7 +44,10 @@ class AudioFileRecord(Base):
     )
 
     def __repr__(self) -> str:
-        return f"<AudioFile(id={self.id}, name='{self.file_name}', duration={self.duration_seconds:.1f}s)>"
+        return (
+            f"<AudioFile(id={self.id}, name='{self.file_name}', "
+            f"duration={self.duration_seconds:.1f}s)>"
+        )
 
 
 class TranscriptionRecord(Base):
@@ -56,11 +57,12 @@ class TranscriptionRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     audio_file_id: Mapped[int | None] = mapped_column(
-        Integer, ForeignKey("audio_files.id"), nullable=True
+        Integer, ForeignKey("audio_files.id"), nullable=True, index=True
     )
     source: Mapped[str] = mapped_column(String(20), default="file")
+    file_name: Mapped[str] = mapped_column(String(256), default="", nullable=False)
     full_text: Mapped[str] = mapped_column(Text, default="")
-    language: Mapped[str] = mapped_column(String(10), default="en")
+    language: Mapped[str] = mapped_column(String(10), default="en", index=True)
     language_probability: Mapped[float] = mapped_column(Float, default=0.0)
     engine: Mapped[str] = mapped_column(String(64), default="faster-whisper")
     model_name: Mapped[str] = mapped_column(String(64), default="medium")
@@ -69,7 +71,7 @@ class TranscriptionRecord(Base):
     segment_count: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="completed")
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=lambda: datetime.now(timezone.utc)
+        DateTime, default=lambda: datetime.now(UTC), index=True
     )
 
     # Relationships
@@ -92,7 +94,7 @@ class SegmentRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     transcription_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("transcriptions.id"), nullable=False
+        Integer, ForeignKey("transcriptions.id"), nullable=False, index=True
     )
     segment_index: Mapped[int] = mapped_column(Integer, default=0)
     text: Mapped[str] = mapped_column(Text, default="")
@@ -115,21 +117,22 @@ class ChatConversation(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     title: Mapped[str] = mapped_column(String(256), default="Untitled Chat")
     model_name: Mapped[str] = mapped_column(String(128), default="")
+    engine: Mapped[str] = mapped_column(String(64), default="ollama")
     transcript_ids: Mapped[str] = mapped_column(
         String(512), default="[]"
     )  # JSON list, e.g. "[3,5,7]"
     message_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=lambda: datetime.now(timezone.utc)
+        DateTime, default=lambda: datetime.now(UTC), index=True
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=lambda: datetime.now(timezone.utc),
-        onupdate=lambda: datetime.now(timezone.utc),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
     )
 
     # Relationships
-    messages: Mapped[list["ChatMessage"]] = relationship(
+    messages: Mapped[list[ChatMessage]] = relationship(
         back_populates="conversation", cascade="all, delete-orphan"
     )
 
@@ -146,15 +149,13 @@ class ChatMessage(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     conversation_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("chat_conversations.id"), nullable=False
+        Integer, ForeignKey("chat_conversations.id"), nullable=False, index=True
     )
     role: Mapped[str] = mapped_column(String(16), nullable=False)  # system|user|assistant
     content: Mapped[str] = mapped_column(Text, default="")
     thinking: Mapped[str | None] = mapped_column(Text, nullable=True)
     token_count: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=lambda: datetime.now(timezone.utc)
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
 
     # Relationships
     conversation: Mapped[ChatConversation] = relationship(back_populates="messages")

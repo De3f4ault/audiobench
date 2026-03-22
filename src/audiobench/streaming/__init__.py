@@ -5,7 +5,7 @@ Provides:
     LiveDisplay — Rich Live TUI for displaying real-time transcription
 """
 
-from src.audiobench.streaming.display import LiveDisplay
-from src.audiobench.streaming.session import LiveSession
+from audiobench.streaming.display import LiveDisplay
+from audiobench.streaming.session import LiveSession
 
 __all__ = ["LiveSession", "LiveDisplay"]
