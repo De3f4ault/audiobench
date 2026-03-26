@@ -215,6 +215,10 @@ class TranscriptionPipeline:
             tx_id = self._repository.save_transcription(transcript, metadata)
             logger.info("Pipeline: saved as transcription #%d", tx_id)
 
+            # Step 3.5: Background refinement (non-blocking)
+            if transcript.text and len(transcript.text.strip()) > 20:
+                self._spawn_refinement(tx_id, transcript.text)
+
             # Step 4: Format & output
             if output_path:
                 self._write_output(transcript, fmt, output_path)
@@ -235,6 +239,45 @@ class TranscriptionPipeline:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(content)
+
+    def _spawn_refinement(self, tx_id: int, raw_text: str) -> None:
+        """Spawn a background thread to refine transcript text using an LLM.
+
+        The user sees results immediately — refinement updates the DB
+        in the background.
+        """
+        import threading
+
+        def _refine_in_background() -> None:
+            try:
+                from audiobench.chat.providers.ollama_provider import OllamaClient
+                from audiobench.transcribe.refiner import TranscriptRefiner
+
+                client = OllamaClient(
+                    base_url=self._settings.ollama_base_url,
+                    model=self._settings.ollama_model,
+                )
+                if not client.is_available():
+                    logger.info("Ollama not available, skipping refinement for #%d", tx_id)
+                    return
+
+                refiner = TranscriptRefiner(client)
+                refined = refiner.refine(raw_text)
+
+                if refined and refined != raw_text:
+                    self._repository.update_full_text(tx_id, refined, raw_text)
+                else:
+                    logger.info("Refinement produced no changes for #%d", tx_id)
+            except Exception as e:
+                logger.warning("Background refinement failed for #%d: %s", tx_id, e)
+
+        thread = threading.Thread(
+            target=_refine_in_background,
+            name=f"refine-{tx_id}",
+            daemon=True,
+        )
+        thread.start()
+        logger.info("Spawned background refinement thread for #%d", tx_id)
 
     def _reconstruct_transcript(self, data: dict, metadata: AudioMetadata) -> Transcript:
         """Reconstruct a Transcript from cached DB data."""
