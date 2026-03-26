@@ -287,6 +287,38 @@ class TranscriptionRepository:
             logger.info("Updated text for transcription #%d", transcription_id)
             return True
 
+    def update_full_text(
+        self,
+        transcription_id: int,
+        refined_text: str,
+        raw_text: str,
+    ) -> bool:
+        """Update transcript with LLM-refined text, preserving the raw version.
+
+        Args:
+            transcription_id: The transcription to update.
+            refined_text: LLM-cleaned transcript text.
+            raw_text: Original Whisper output (preserved in raw_text column).
+
+        Returns:
+            True if found and updated, False if not found.
+        """
+        with get_session() as session:
+            rec = session.query(TranscriptionRecord).filter_by(id=transcription_id).first()
+            if rec is None:
+                return False
+            rec.raw_text = raw_text
+            rec.full_text = refined_text
+            rec.word_count = len(refined_text.split())
+            session.commit()
+            logger.info(
+                "Refined transcript #%d (%d → %d chars)",
+                transcription_id,
+                len(raw_text),
+                len(refined_text),
+            )
+            return True
+
     def delete_by_id(self, transcription_id: int) -> bool:
         """Delete a transcription by ID.
 

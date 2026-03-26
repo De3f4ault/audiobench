@@ -57,6 +57,7 @@ class ChatRepository:
         role: str,
         content: str,
         thinking: str | None = None,
+        model_name: str | None = None,
     ) -> int:
         """Add a message to a conversation.
 
@@ -65,6 +66,7 @@ class ChatRepository:
             role: Message role — "system", "user", or "assistant".
             content: The message text.
             thinking: Optional chain-of-thought text.
+            model_name: Optional model name (for comparison pairs).
 
         Returns:
             The message ID.
@@ -75,6 +77,7 @@ class ChatRepository:
                 role=role,
                 content=content,
                 thinking=thinking,
+                model_name=model_name,
                 token_count=len(content) // 4,  # rough estimate
             )
             session.add(msg)
@@ -114,6 +117,7 @@ class ChatRepository:
                         "role": msg.role,
                         "content": msg.content,
                         "thinking": msg.thinking,
+                        "model_name": msg.model_name,
                         "token_count": msg.token_count,
                         "created_at": (msg.created_at.isoformat() if msg.created_at else ""),
                     }

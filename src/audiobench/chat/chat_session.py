@@ -239,6 +239,8 @@ class ChatSession:
                     {
                         "role": msg["role"],
                         "content": msg["content"],
+                        "thinking": msg.get("thinking"),
+                        "model_name": msg.get("model_name"),
                     }
                 )
 
@@ -273,7 +275,7 @@ class ChatSession:
         self._chat_repo.add_message(conv_id, "user", user_input)
 
         # Build full message list for API
-        api_messages = [{"role": "system", "content": self._system_prompt}] + self._messages
+        api_messages = self._build_api_messages()
 
         # Accumulators (read by finalize_response)
         self._pending_content: list[str] = []
@@ -360,6 +362,7 @@ class ChatSession:
                 messages=[{"role": "user", "content": prompt}],
                 model=self._model,
                 temperature=0.3,
+                think=False,
             )
             title = result.get("content", "").strip()
             if title and len(title) < 100:
@@ -394,3 +397,27 @@ class ChatSession:
         """Switch the model mid-conversation."""
         self._model = model
         logger.info("Switched model to %s", model)
+
+    def _build_api_messages(self) -> list[dict]:
+        """Build the message list for the API, handling comparison pairs.
+
+        When consecutive assistant messages exist (from a comparison), we
+        only include the primary model's response to avoid confusing the LLM.
+        """
+        api_msgs = [{"role": "system", "content": self._system_prompt}]
+        messages = list(self._messages)
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            if (
+                msg["role"] == "assistant"
+                and i + 1 < len(messages)
+                and messages[i + 1]["role"] == "assistant"
+            ):
+                # Comparison pair — use the first response (primary model)
+                api_msgs.append({"role": "assistant", "content": msg["content"]})
+                i += 2  # skip both
+            else:
+                api_msgs.append({"role": msg["role"], "content": msg["content"]})
+                i += 1
+        return api_msgs
