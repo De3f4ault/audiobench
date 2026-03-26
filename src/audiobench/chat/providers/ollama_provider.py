@@ -16,6 +16,7 @@ Usage:
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 
 from audiobench.core.error_types import AudioBenchError
@@ -28,6 +29,10 @@ class AIError(AudioBenchError):
     """AI/LLM operation failure."""
 
 
+# Regex to extract <think>...</think> blocks from content (fallback for non-native thinking)
+_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+
 class OllamaClient:
     """REST client for local Ollama server.
 
@@ -38,7 +43,7 @@ class OllamaClient:
     def __init__(
         self,
         base_url: str = "http://localhost:11434",
-        model: str = "qwen3-next:80b-cloud",
+        model: str = "deepseek-v3.2:cloud",
         timeout: int = 120,
     ) -> None:
         self._base_url = base_url.rstrip("/")
@@ -216,12 +221,23 @@ class OllamaClient:
         except Exception as e:
             raise AIError("Streaming failed", str(e)) from e
 
+    @staticmethod
+    def _extract_thinking(content: str) -> tuple[str, str | None]:
+        """Extract <think> blocks from content if present (fallback for non-native thinking)."""
+        match = _THINK_RE.search(content)
+        if match:
+            thinking = match.group(1).strip()
+            clean = _THINK_RE.sub("", content).strip()
+            return clean, thinking
+        return content, None
+
     def chat(
         self,
         messages: list[dict],
         model: str | None = None,
         temperature: float = 0.3,
         num_ctx: int | None = None,
+        think: bool = True,
     ) -> dict:
         """Non-streaming chat via /api/chat.
 
@@ -230,6 +246,7 @@ class OllamaClient:
             model: Override the default model.
             temperature: Creativity level.
             num_ctx: Context window size (tokens). None = model default.
+            think: Enable model thinking/chain-of-thought separation.
 
         Returns:
             Dict with "content" and optional "thinking" keys.
@@ -244,6 +261,7 @@ class OllamaClient:
             "model": model_name,
             "messages": messages,
             "stream": False,
+            "think": think,
             "options": {"temperature": temperature},
         }
         if num_ctx:
@@ -261,9 +279,16 @@ class OllamaClient:
             data = resp.json()
 
             message = data.get("message", {})
+            content = message.get("content", "")
+            thinking = message.get("thinking")
+
+            # Fallback: extract <think> tags from content if no native thinking
+            if not thinking and content:
+                content, thinking = self._extract_thinking(content)
+
             return {
-                "content": message.get("content", ""),
-                "thinking": message.get("thinking"),
+                "content": content,
+                "thinking": thinking,
             }
 
         except requests.ConnectionError:
@@ -282,6 +307,7 @@ class OllamaClient:
         model: str | None = None,
         temperature: float = 0.3,
         num_ctx: int | None = None,
+        think: bool = True,
     ) -> Iterator[dict]:
         """Stream chat response tokens via /api/chat.
 
@@ -290,6 +316,7 @@ class OllamaClient:
             model: Override the default model.
             temperature: Creativity level.
             num_ctx: Context window size (tokens).
+            think: Enable model thinking/chain-of-thought separation.
 
         Yields:
             Dicts with "content" and/or "thinking" keys per chunk.
@@ -305,6 +332,7 @@ class OllamaClient:
             "model": model_name,
             "messages": messages,
             "stream": True,
+            "think": think,
             "options": {"temperature": temperature},
         }
         if num_ctx:
