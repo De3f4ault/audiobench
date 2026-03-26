@@ -24,14 +24,24 @@ class DefaultGroup(click.Group):
             args.insert(0, self.default_command)
             return super().parse_args(ctx, args)
 
+        # Words that should never fall through to the default command.
+        # These are common user expectations that aren't files.
+        _meta_words = {"help", "version"}
+
         # If we have arguments, check if the first one is a known command or an option.
         if (
             args
             and args[0] not in self.commands
             and not args[0].startswith("-")
+            and args[0].lower() not in _meta_words
             and self.default_command is not None
         ):
             args.insert(0, self.default_command)
+
+        # Redirect bare "help" to --help
+        if args and args[0].lower() == "help" and args[0] not in self.commands:
+            args[0] = "--help"
+
         return super().parse_args(ctx, args)
 
     def resolve_command(self, ctx, args):

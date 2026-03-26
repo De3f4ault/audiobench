@@ -108,7 +108,7 @@ class AudioBenchSettings(BaseSettings):
 
     # --- AI / LLM ---
     ollama_model: str = Field(
-        default="qwen3-next:80b-cloud",
+        default="deepseek-v3.2:cloud",
         description="Default Ollama model for AI features",
     )
     ollama_base_url: str = Field(
