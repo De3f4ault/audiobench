@@ -31,6 +31,8 @@ CHAT_HELP_TEXT = (
     "  /remove <ID>       Remove a transcript from context\n"
     "  /clear             Clear history and all context\n"
     "  /model <name>      Switch model mid-chat\n"
+    "  /compare <model>     Toggle side-by-side comparison\n"
+    "  /compare off         Disable comparison mode\n"
     "  /think             Toggle thinking display\n"
     "  /retry             Regenerate last response\n"
     "  /export [file]     Export chat to markdown\n"
@@ -168,6 +170,52 @@ def _handle_slash_command(
         # We store a flag on the session object
         session._retry_requested = True  # noqa: SLF001
         return False  # handled in the REPL loop
+
+    elif command == "/compare":
+        if not arg:
+            # Status: show current comparison state
+            cmp_model = getattr(session, "_compare_model", None)
+            if cmp_model:
+                console.print(
+                    f"  [{ACCENT}]⚡ Comparison mode ON[/]\n"
+                    f"  [{DIM}]Primary:   {session.model}[/]\n"
+                    f"  [{DIM}]Secondary: {cmp_model}[/]\n"
+                    f"  [{DIM}]Use /compare off to disable[/]"
+                )
+            else:
+                console.print(
+                    f"  [{DIM}]Comparison mode is OFF[/]\n"
+                    f"  [{DIM}]Usage: /compare <model> to enable[/]\n"
+                    f"  [{DIM}]Example: /compare qwen3-next:80b-cloud[/]"
+                )
+            return False
+        if arg.strip().lower() == "off":
+            old = getattr(session, "_compare_model", None)
+            session._compare_model = None  # noqa: SLF001
+            if old:
+                console.print(
+                    f"  [{SUCCESS}]✓ Comparison mode OFF[/] "
+                    f"[{DIM}](was comparing with {old})[/]"
+                )
+            else:
+                console.print(f"  [{DIM}]Comparison mode was already off[/]")
+            return False
+        # Enable or switch comparison model
+        new_model = arg.strip()
+        old = getattr(session, "_compare_model", None)
+        session._compare_model = new_model  # noqa: SLF001
+        if old and old != new_model:
+            console.print(
+                f"  [{ACCENT}]⚡ Switched comparison:[/] "
+                f"[{DIM}]{old}[/] → [{BOLD}]{new_model}[/]"
+            )
+        else:
+            console.print(
+                f"  [{ACCENT}]⚡ Comparison mode ON[/]\n"
+                f"  [{DIM}]Every prompt will compare {session.model} vs {new_model}[/]\n"
+                f"  [{DIM}]/compare off to disable[/]"
+            )
+        return False
 
     else:
         console.print(f"  [{DIM}]Unknown command: {command} (type /help for commands)[/]")
@@ -454,41 +502,98 @@ def chat(
     console.print()
 
     # ── Render past messages on resume ──
-    import contextlib
-    import readline as _readline
     import time as _time
     from pathlib import Path as _Path
 
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.formatted_text import ANSI
+    from prompt_toolkit.history import FileHistory
     from rich.console import Group
+    from rich.layout import Layout
     from rich.markdown import Markdown as RichMarkdown
     from rich.padding import Padding
+    from rich.panel import Panel
 
-    # ── Readline history setup ──
+    # ── prompt_toolkit session with persistent history ──
     _history_file = _Path.home() / ".cache" / "audiobench_chat_history"
     _history_file.parent.mkdir(parents=True, exist_ok=True)
-    with contextlib.suppress(FileNotFoundError):
-        _readline.read_history_file(str(_history_file))
-    _readline.set_history_length(500)
+    _pt_session: PromptSession = PromptSession(
+        history=FileHistory(str(_history_file)),
+    )
+    _multiline_active = False  # toggled by """
 
     def _save_readline_history() -> None:
-        with contextlib.suppress(OSError):
-            _readline.write_history_file(str(_history_file))
+        pass  # prompt_toolkit auto-saves via FileHistory
+
+    def _render_comparison_pair(msg_a: dict, msg_b: dict) -> None:
+        """Render a comparison pair as side-by-side panels."""
+        layout = Layout()
+        layout.split_row(
+            Layout(name="left"),
+            Layout(name="right"),
+        )
+        for side, msg in [("left", msg_a), ("right", msg_b)]:
+            parts = []
+            if msg.get("thinking") and session.show_thinking:
+                think_preview = msg["thinking"][:300]
+                if len(msg["thinking"]) > 300:
+                    think_preview += "…"
+                parts.append(Text(f"💭 {think_preview}", style="dim italic"))
+            parts.append(
+                RichMarkdown(msg["content"], code_theme=CHAT_CODE_THEME)
+            )
+            model_label = msg.get("model_name") or "Model"
+            border = "cyan" if side == "left" else "magenta"
+            layout[side].update(
+                Panel(Group(*parts), title=model_label, border_style=border)
+            )
+        console.print(layout)
 
     # ── Render past messages on resume ──
     if resume_id and session.messages:
         console.print(f"  [{DIM}]─── Previous Messages ───[/]")
         console.print()
-        for msg in session.messages:
+        msgs = session.messages
+        i = 0
+        while i < len(msgs):
+            msg = msgs[i]
             if msg["role"] == "user":
                 console.print(f"  [{PROMPT}]>>> {msg['content']}[/]")
                 console.print()
-            elif msg["role"] == "assistant" and msg["content"].strip():
-                md = RichMarkdown(
-                    msg["content"],
-                    code_theme=CHAT_CODE_THEME,
-                )
-                chat_console.print(Padding(md, (0, 2, 1, 2)))
-                console.print()
+                i += 1
+            elif msg["role"] == "assistant":
+                # Detect comparison pair: two consecutive assistants with different models
+                if (
+                    i + 1 < len(msgs)
+                    and msgs[i + 1]["role"] == "assistant"
+                    and msg.get("model_name") != msgs[i + 1].get("model_name")
+                ):
+                    _render_comparison_pair(msg, msgs[i + 1])
+                    console.print()
+                    i += 2
+                elif msg["content"].strip():
+                    # Show thinking if present
+                    if msg.get("thinking") and session.show_thinking:
+                        think_preview = msg["thinking"][:200]
+                        if len(msg["thinking"]) > 200:
+                            think_preview += "…"
+                        console.print(
+                            Padding(
+                                Text(f"💭 {think_preview}", style="dim italic"),
+                                (0, 2, 0, 4),
+                            )
+                        )
+                    md = RichMarkdown(
+                        msg["content"],
+                        code_theme=CHAT_CODE_THEME,
+                    )
+                    chat_console.print(Padding(md, (0, 2, 1, 2)))
+                    console.print()
+                    i += 1
+                else:
+                    i += 1
+            else:
+                i += 1
         console.print(f"  [{DIM}]─── End of History ───[/]")
         console.print()
 
@@ -613,29 +718,133 @@ def chat(
             console.print(error_panel("AI Error", str(e)))
             console.print()
 
+    # ── Helper: compare two models and render ──
+    def _compare_and_render(user_text: str, compare_model: str) -> None:
+        """Run comparison between primary and secondary model."""
+        console.print()
+        try:
+            from audiobench.chat.compare import ModelComparison
+
+            # Build messages for the comparison
+            cmp_messages = session._build_api_messages()  # noqa: SLF001
+            cmp_messages.append({"role": "user", "content": user_text})
+
+            comparison = ModelComparison(
+                client=client,
+                messages=cmp_messages,
+                model_a=session.model,
+                model_b=compare_model,
+                temperature=temperature,
+                show_thinking=session.show_thinking,
+            )
+            result = comparison.run()
+
+            # Ensure conversation exists
+            if not session.conversation_id:
+                session._conversation_id = chat_repo.create_conversation(  # noqa: SLF001
+                    model=session.model,
+                    title="Model Comparison",
+                )
+
+            # Save user message
+            chat_repo.add_message(
+                session.conversation_id, "user", user_text
+            )
+            session._messages.append(  # noqa: SLF001
+                {"role": "user", "content": user_text}
+            )
+
+            # Save Model A response
+            res_a = result["model_a"]
+            chat_repo.add_message(
+                session.conversation_id,
+                "assistant",
+                res_a["content"],
+                thinking=res_a["thinking"],
+                model_name=res_a["model_name"],
+            )
+            session._messages.append({  # noqa: SLF001
+                "role": "assistant",
+                "content": res_a["content"],
+                "thinking": res_a["thinking"],
+                "model_name": res_a["model_name"],
+            })
+
+            # Save Model B response
+            res_b = result["model_b"]
+            chat_repo.add_message(
+                session.conversation_id,
+                "assistant",
+                res_b["content"],
+                thinking=res_b["thinking"],
+                model_name=res_b["model_name"],
+            )
+            session._messages.append({  # noqa: SLF001
+                "role": "assistant",
+                "content": res_b["content"],
+                "thinking": res_b["thinking"],
+                "model_name": res_b["model_name"],
+            })
+
+            # Stats
+            elapsed = result["elapsed"]
+            total_tokens = res_a["tokens"] + res_b["tokens"]
+            tps = total_tokens / elapsed if elapsed > 0 else 0
+            console.print(
+                f"  [{DIM}]{total_tokens} tok · {tps:.0f} tok/s · {elapsed:.1f}s[/]"
+            )
+            console.print()
+
+            # Trigger title generation if first turn
+            if session.turn_count <= 1:
+                session._generate_title_async()  # noqa: SLF001
+
+        except KeyboardInterrupt:
+            console.print()
+            console.print(f"  [{DIM}]Comparison interrupted[/]")
+            console.print()
+
+        except Exception as e:
+            console.print(error_panel("Comparison Error", str(e)))
+            console.print()
+
     # ── Multi-line input helper ──
     def _read_multiline() -> str:
-        """Read lines until closing triple-quotes."""
-        lines: list[str] = []
-        console.print(f'  [{DIM}]Multi-line mode (type """ to end):[/]')
-        while True:
-            try:
-                line = input("... ")
-            except (EOFError, KeyboardInterrupt):
-                break
-            if line.strip() == '"""':
-                break
-            lines.append(line)
-        return "\n".join(lines)
+        """Read multi-line input via prompt_toolkit (Alt+Enter or \"\"\" to end)."""
+        console.print(
+            f'  [{DIM}]Multi-line mode — type \"\"\" on its own line or press '
+            f'Alt+Enter to submit:[/]'
+        )
+        try:
+            text = _pt_session.prompt(
+                ANSI('\033[38;5;240m... \033[0m'),
+                multiline=True,
+            )
+        except (EOFError, KeyboardInterrupt):
+            return ""
+        # Strip wrapping triple-quotes if user typed them
+        text = text.strip()
+        if text.startswith('"""'):
+            text = text[3:]
+        if text.endswith('"""'):
+            text = text[:-3]
+        return text.strip()
 
     # ── Interactive REPL ──
     last_user_input: str | None = None
     session._retry_requested = False  # noqa: SLF001
+    if not hasattr(session, "_compare_model"):
+        session._compare_model = None  # noqa: SLF001
 
     while True:
         try:
-            user_input = input("\001\033[38;5;48m\002>>> ").strip()
-            print("\033[0m", end="", flush=True)
+            # Show comparison mode in prompt
+            cmp_active = getattr(session, "_compare_model", None)
+            if cmp_active:
+                prompt_str = ANSI('\033[38;5;214m⚡ >>> \033[0m')
+            else:
+                prompt_str = ANSI('\033[38;5;48m>>> \033[0m')
+            user_input = _pt_session.prompt(prompt_str).strip()
         except (EOFError, KeyboardInterrupt):
             console.print()
             _save_readline_history()
@@ -699,4 +908,10 @@ def chat(
             continue
 
         last_user_input = user_input
-        _stream_and_render(user_input)
+
+        # Route through comparison or single-model
+        compare_model = getattr(session, "_compare_model", None)
+        if compare_model:
+            _compare_and_render(user_input, compare_model)
+        else:
+            _stream_and_render(user_input)
