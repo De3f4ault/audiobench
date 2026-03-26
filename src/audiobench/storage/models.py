@@ -62,6 +62,7 @@ class TranscriptionRecord(Base):
     source: Mapped[str] = mapped_column(String(20), default="file")
     file_name: Mapped[str] = mapped_column(String(256), default="", nullable=False)
     full_text: Mapped[str] = mapped_column(Text, default="")
+    raw_text: Mapped[str] = mapped_column(Text, default="")
     language: Mapped[str] = mapped_column(String(10), default="en", index=True)
     language_probability: Mapped[float] = mapped_column(Float, default=0.0)
     engine: Mapped[str] = mapped_column(String(64), default="faster-whisper")
@@ -154,6 +155,7 @@ class ChatMessage(Base):
     role: Mapped[str] = mapped_column(String(16), nullable=False)  # system|user|assistant
     content: Mapped[str] = mapped_column(Text, default="")
     thinking: Mapped[str | None] = mapped_column(Text, nullable=True)
+    model_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     token_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
 
