@@ -534,14 +534,14 @@ def auto_cmd(target: str, model: str | None, focus: str | None, dry_run: bool) -
         console.print(error_panel("No segments", "Transcript has no timed segments"))
         sys.exit(1)
 
-    # ── Build timestamped transcript ──
+    # ── Build timestamped transcript (exact seconds) ──
     lines = []
     for seg in segments:
         start = seg.get("start", 0)
-        mins, secs = int(start // 60), int(start % 60)
+        end = seg.get("end", start)
         text = seg.get("text", "").strip()
         if text:
-            lines.append(f"[{mins:02d}:{secs:02d}] {text}")
+            lines.append(f"[{start:.2f}s→{end:.2f}s] {text}")
 
     timestamped_text = "\n".join(lines)
 
@@ -625,7 +625,7 @@ def auto_cmd(target: str, model: str | None, focus: str | None, dry_run: bool) -
             ("Type", {"justify": "center", "width": 6}),
             ("Time", {"justify": "right", "width": 14}),
             ("Name", {"justify": "left", "width": 50}),
-            ("Notes", {"justify": "left", "width": 30}),
+            ("Notes", {"justify": "left", "min_width": 40, "no_wrap": False}),
         ],
     )
 
@@ -652,7 +652,7 @@ def auto_cmd(target: str, model: str | None, focus: str | None, dry_run: bool) -
             bm_type = "bookmark"
         notes = item.get("notes")
         if notes:
-            notes = str(notes)[:200]
+            notes = str(notes)[:500]
 
         emoji = BOOKMARK_TYPES.get(bm_type, "🔖")
         time_str = _format_timestamp(ts)
@@ -663,7 +663,7 @@ def auto_cmd(target: str, model: str | None, focus: str | None, dry_run: bool) -
             emoji,
             time_str,
             name,
-            (notes or "")[:30],
+            notes or "",
         )
 
         if not dry_run:

@@ -153,10 +153,11 @@ TITLE_PROMPT = (
 # ── Auto-Bookmarking Prompts ──────────────────────────────
 
 AUTO_BOOKMARK_SYSTEM = (
-    "You are an expert audio analyst. Your task is to identify the most "
-    "important moments in a transcript and return them as structured JSON. "
-    "You MUST respond with ONLY a valid JSON array — no markdown, no "
-    "explanation, no code fences. Just the raw JSON array."
+    "You are an expert audio analyst specializing in transcript annotation. "
+    "Your task is to identify the most important moments in a transcript and "
+    "return them as structured JSON. You MUST respond with ONLY a valid JSON "
+    "array — no markdown, no explanation, no code fences, no preamble. "
+    "Just the raw JSON array."
 )
 
 
@@ -164,37 +165,64 @@ def auto_bookmark(transcript_with_timestamps: str, *, focus: str | None = None) 
     """Build prompt for AI auto-bookmark extraction.
 
     Args:
-        transcript_with_timestamps: Transcript text with [MM:SS] prefixed segments.
-        focus: Optional user instruction to focus extraction (e.g. "action items only").
+        transcript_with_timestamps: Transcript text with exact second timestamps.
+        focus: Optional user instruction to focus extraction.
 
     Returns:
         Formatted prompt string.
     """
-    focus_line = ""
+    focus_block = ""
     if focus:
-        focus_line = f"\nFOCUS: {focus}\n"
+        focus_block = (
+            f"\n**FOCUS INSTRUCTION**: {focus}\n"
+            "Prioritize bookmarks related to this focus, but still include "
+            "other significant moments.\n"
+        )
 
     return (
-        "Analyze the transcript below and identify the most important moments.\n\n"
+        "Analyze the transcript below and identify the most important moments.\n"
+        "Each line is prefixed with the EXACT timestamp in seconds: [123.45s]\n\n"
         "For each moment, return a JSON object with these fields:\n"
-        '  - "timestamp": start time in seconds (float)\n'
-        '  - "end_timestamp": end time in seconds (float or null for point bookmarks)\n'
+        '  - "timestamp": EXACT start time in seconds (float) — MUST match a [XXs] marker\n'
+        '  - "end_timestamp": EXACT end time in seconds (float) for regions, or null for points\n'
         '  - "name": concise label (max 80 chars) — use the speaker\'s own words when possible\n'
-        '  - "type": one of "bookmark", "highlight", "todo", "note", "edit"\n'
-        '  - "notes": brief context or why this moment matters (1-2 sentences)\n\n'
-        "Type guidelines:\n"
-        '  - "highlight" → key insight, decision, or turning point\n'
-        '  - "todo" → action item, task, or follow-up commitment\n'
-        '  - "note" → interesting observation, context, or background\n'
-        '  - "bookmark" → important moment that doesn\'t fit other types\n'
-        '  - "edit" → dead air, filler, off-topic tangent, or cut candidate\n\n'
-        "Rules:\n"
-        "- Return 5-15 bookmarks depending on transcript length\n"
-        "- Timestamps MUST match the [MM:SS] markers in the transcript\n"
-        "- Prefer quality over quantity — only truly important moments\n"
-        "- For regions (edit cuts, tangents), set both timestamp and end_timestamp\n"
-        "- Respond with ONLY the JSON array, no other text\n"
-        f"{focus_line}\n"
+        '  - "type": one of the 5 types below\n'
+        '  - "notes": 1-3 sentences explaining WHY this moment matters\n\n'
+        "═══ TYPE GUIDE WITH EXAMPLES ═══\n\n"
+        '  "highlight" (⭐) — Key insight, decision, or turning point\n'
+        '     Example: A speaker says "we\'ve decided to pivot to Rust"\n'
+        '     Example: A profound realization or emotional breakthrough\n\n'
+        '  "todo" (📌) — Action item, task, commitment, or follow-up\n'
+        '     Example: "I need to call Sarah about the budget by Friday"\n'
+        '     Example: Any stated intention to do something later\n\n'
+        '  "note" (📝) — Interesting context, background info, or observation\n'
+        '     Example: Historical background that explains a later point\n'
+        '     Example: A tangential but interesting fact or anecdote\n\n'
+        '  "bookmark" (🔖) — Important structural moment (intro, conclusion, topic shift)\n'
+        '     Example: "Let me now talk about the second quarter"\n'
+        '     Example: Opening/closing of a recording or major section\n\n'
+        '  "edit" (✂️) — Dead air, filler, tangent, repetition, or cut candidate\n'
+        '     Example: Long pause, "um um um", off-topic rambling\n'
+        '     Example: Technical interruption, audio glitch, repeated content\n'
+        '     ALWAYS use both timestamp AND end_timestamp for edit regions\n\n'
+        "═══ RULES ═══\n\n"
+        "1. TIMESTAMP PRECISION: Use the EXACT second values from the [XXs] markers.\n"
+        "   Do NOT round or approximate. If a segment starts at [223.45s], use 223.45.\n"
+        "2. COUNT: Return 5-15 bookmarks scaled to transcript length:\n"
+        "   - Under 5 minutes: 3-5 bookmarks\n"
+        "   - 5-15 minutes: 5-8 bookmarks\n"
+        "   - 15-30 minutes: 8-12 bookmarks\n"
+        "   - 30+ minutes: 10-15 bookmarks\n"
+        "3. TYPE DIVERSITY: Use ALL 5 types where applicable. Always scan for:\n"
+        "   - At least one ✂️ edit region (dead air, filler, cut candidates)\n"
+        "   - Any 📌 todo/action items if present\n"
+        "   - Structural 🔖 bookmarks for major topic shifts\n"
+        "4. REGIONS vs POINTS: Use regions (start + end) for extended passages.\n"
+        "   Use points (end_timestamp = null) only for brief, instant moments.\n"
+        "5. QUALITY: Only bookmark truly significant moments. No padding.\n"
+        "6. OUTPUT: Respond with ONLY the JSON array. No other text.\n"
+        f"{focus_block}\n"
         f"TRANSCRIPT:\n{transcript_with_timestamps}"
     )
+
 
