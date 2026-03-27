@@ -1,4 +1,4 @@
-"""SQLAlchemy ORM models for persisting transcription and chat data.
+"""SQLAlchemy ORM models for persisting transcription, chat, and bookmark data.
 
 Tables:
     audio_files: Source audio file metadata + SHA-256 hash for dedup
@@ -6,6 +6,7 @@ Tables:
     segments: Individual segments within a transcription
     chat_conversations: Persistent AI chat sessions
     chat_messages: Individual messages within a chat conversation
+    bookmarks: Timestamp markers and region annotations for audio files
 """
 
 from __future__ import annotations
@@ -40,6 +41,9 @@ class AudioFileRecord(Base):
 
     # Relationships
     transcriptions: Mapped[list[TranscriptionRecord]] = relationship(
+        back_populates="audio_file", cascade="all, delete-orphan"
+    )
+    bookmarks: Mapped[list[BookmarkRecord]] = relationship(
         back_populates="audio_file", cascade="all, delete-orphan"
     )
 
@@ -165,3 +169,48 @@ class ChatMessage(Base):
     def __repr__(self) -> str:
         preview = self.content[:40] if self.content else ""
         return f"<ChatMessage(id={self.id}, role='{self.role}', text='{preview}...')>"
+
+
+class BookmarkRecord(Base):
+    """Persisted bookmark or region marker for an audio file.
+
+    Point bookmarks have only `timestamp`; region markers also set
+    `end_timestamp` to define a span.
+    """
+
+    __tablename__ = "bookmarks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    audio_file_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("audio_files.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    transcription_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("transcriptions.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    timestamp: Mapped[float] = mapped_column(Float, nullable=False)
+    end_timestamp: Mapped[float | None] = mapped_column(Float, nullable=True)
+    name: Mapped[str] = mapped_column(String(512), default="Untitled")
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    bookmark_type: Mapped[str] = mapped_column(String(16), default="bookmark")
+    color: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(UTC),
+    )
+
+    # Relationships
+    audio_file: Mapped[AudioFileRecord] = relationship(back_populates="bookmarks")
+    transcription: Mapped[TranscriptionRecord | None] = relationship()
+
+    @property
+    def is_region(self) -> bool:
+        """True if this bookmark defines a region (start + end)."""
+        return self.end_timestamp is not None
+
+    def __repr__(self) -> str:
+        kind = "Region" if self.is_region else "Point"
+        return (
+            f"<Bookmark(id={self.id}, {kind}, "
+            f"t={self.timestamp:.1f}, name='{self.name[:30]}')>"
+        )
