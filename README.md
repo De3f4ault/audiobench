@@ -22,6 +22,8 @@ Turn any audio file into a searchable knowledge base that runs entirely on your 
 | 📊 | **Visualize** | `audiobench inspect file.m4a` | Waveform + spectrogram in one shot |
 | 🔊 | **Speak** | `audiobench speak "Hello"` | Text-to-speech (offline Piper TTS) |
 | 🔧 | **Analyze** | `audiobench analyze file.m4a` | Loudness, silence regions, quality |
+| 🔖 | **Bookmark** | `audiobench bookmark list 3` | Timestamp markers and region annotations |
+| 🤖 | **AI Bookmark** | `audiobench bookmark auto 66` | AI-powered auto-bookmarking with type classification |
 
 ---
 
@@ -320,6 +322,49 @@ audiobench chat 3              # Chat with transcript #3 as context
 
 Full-featured AI chat with readline history, multi-line input, `/export`, `/retry`, and markdown rendering.
 
+### `bookmark` — Timestamp Markers & Annotations
+
+Mark and manage important moments in any audio file:
+
+```bash
+# List bookmarks for a file
+audiobench bookmark list 3              # By audio file ID
+audiobench bookmark list recording.m4a  # By file path
+
+# Add a bookmark manually
+audiobench bookmark add 3 01:25 "Key decision made"
+audiobench bookmark add 3 05:30-08:15 "Budget discussion" --type highlight
+
+# AI auto-bookmarking — let AI find the important moments
+audiobench bookmark auto 66                        # Analyze transcript #66
+audiobench bookmark auto 66 --focus "action items"  # Focus on action items
+audiobench bookmark auto 66 --dry-run               # Preview without saving
+audiobench bookmark auto 66 --model deepseek-v3.2:cloud  # Override model
+
+# Manage bookmarks
+audiobench bookmark rename 1 "New name"    # Rename
+audiobench bookmark note 1 "Added context" # Add notes
+audiobench bookmark type 1 highlight       # Change type
+audiobench bookmark rm 1                   # Delete
+audiobench bookmark search "keyword"       # Search by name
+
+# Export/Import
+audiobench bookmark export 3                       # JSON export
+audiobench bookmark export 3 --format audacity     # Audacity label track
+audiobench bookmark import 3 labels.txt            # Import labels
+```
+
+#### Interactive Playback Bookmarking
+
+During `audiobench play`, use these keybindings:
+
+| Key | Action |
+|-----|--------|
+| `b` | Drop point bookmark at current position |
+| `B` | Start/end region bookmark |
+| `n` / `p` | Jump to next/previous bookmark |
+| `l` | Cycle bookmark type (bookmark → highlight → todo → note → edit) |
+
 ### `vocab` — Word Frequency Analysis
 
 ```bash
@@ -480,6 +525,7 @@ cp .env.example .env
 | `AUDIOBENCH_CPU_THREADS` | `0` | CPU threads (`0` = auto-detect) |
 | `AUDIOBENCH_OUTPUT_FORMAT` | `txt` | Default output format |
 | `AUDIOBENCH_LOG_LEVEL` | `WARNING` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `AUDIOBENCH_BOOKMARK_MODEL` | `qwen3-coder:480b-cloud` | Ollama model for AI bookmark extraction |
 
 ---
 
@@ -564,7 +610,8 @@ src/audiobench/
 │
 ├── storage/                        ← Data layer
 │   ├── models.py                   ← SQLAlchemy ORM models
-│   └── repository.py               ← CRUD operations
+│   ├── repository.py               ← Transcription CRUD operations
+│   └── bookmark_repository.py      ← Bookmark CRUD, Audacity import/export
 │
 ├── output/                         ← Format writers (txt, srt, vtt, json)
 ├── streaming/                      ← Live transcription

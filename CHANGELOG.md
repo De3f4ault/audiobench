@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Audacity label track export/import (`--format audacity`) alongside JSON
   - Auto-detection of import format (JSON vs TSV)
 - Database migration `m005_bookmarks` (idempotent, runs automatically)
+- **AI Auto-Bookmarking** — intelligent transcript annotation
+  - `audiobench bookmark auto <ID>` — AI identifies key moments and creates structured bookmarks
+  - Exact timestamp extraction from transcript segments (no rounding)
+  - 5-type classification: ⭐ highlight, 📌 todo, 📝 note, 🔖 bookmark, ✂️ edit
+  - Length-scaled output (3–15 bookmarks based on duration)
+  - `--model` override (default: `qwen3-coder:480b-cloud`), `--focus`, `--dry-run`
+  - Configurable `AUDIOBENCH_BOOKMARK_MODEL` setting
 
 ## [0.1.0] — 2026-03-20
 

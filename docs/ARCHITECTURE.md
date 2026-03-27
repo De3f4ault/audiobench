@@ -105,6 +105,7 @@ Managed by Pydantic Settings (`src/audiobench/core/settings.py`).
 | `ReplSession` | `cli/repl/session.py` | Interactive shell state, context tracking |
 | `Transcript` / `Segment` / `Word` | `transcribe/transcription_result.py` | Pydantic data models |
 | `AudioBenchGroup` | `cli/plugins/custom_group.py` | Fuzzy command matching + suggestions |
+| `BookmarkRepository` | `storage/bookmark_repository.py` | Bookmark CRUD, Audacity label import/export |
 
 ---
 
@@ -148,6 +149,9 @@ SQLite via SQLAlchemy. Three tables: `audio_files`, `transcriptions`, `segments`
 | `audio_files` | `id`, `file_hash` (SHA-256), `file_name`, `file_path`, `duration_seconds` |
 | `transcriptions` | `id`, `audio_file_id` (FK), `full_text`, `language`, `model_name`, `engine`, `created_at` |
 | `segments` | `id`, `transcription_id` (FK), `text`, `start`, `end`, `speaker` |
+| `bookmarks` | `id`, `audio_file_id` (FK), `timestamp`, `end_timestamp`, `name`, `type`, `notes` |
+| `chat_sessions` | `id`, `title`, `model`, `created_at` |
+| `chat_messages` | `id`, `session_id` (FK), `role`, `content`, `thinking` |
 
 ---
 

@@ -454,3 +454,66 @@ Use a smaller model:
 ```bash
 audiobench transcribe -m small recording.m4a
 ```
+
+---
+
+## 15. Bookmarks & AI Auto-Bookmarking
+
+### Manual bookmarks
+
+```bash
+# Add a point bookmark
+audiobench bookmark add 3 01:25 "Key decision"
+
+# Add a region bookmark (start-end)
+audiobench bookmark add 3 05:30-08:15 "Budget discussion" --type highlight
+
+# List, search, manage
+audiobench bookmark list 3
+audiobench bookmark search "decision"
+audiobench bookmark rename 1 "Updated name"
+audiobench bookmark note 1 "Why this matters"
+audiobench bookmark type 1 todo
+audiobench bookmark rm 1
+```
+
+### AI auto-bookmarking
+
+Let AI analyze your transcript and automatically identify key moments:
+
+```bash
+# Basic — analyze transcript and create bookmarks
+audiobench bookmark auto 66
+
+# Focus on specific types of content
+audiobench bookmark auto 66 --focus "action items and decisions"
+
+# Preview without saving
+audiobench bookmark auto 66 --dry-run
+
+# Use a different model
+audiobench bookmark auto 66 --model deepseek-v3.2:cloud
+```
+
+AI identifies 5 types of moments:
+- ⭐ **Highlight** — key insight, decision, turning point
+- 📌 **Todo** — action item, follow-up, commitment
+- 📝 **Note** — interesting context, background info
+- 🔖 **Bookmark** — structural marker, topic shift
+- ✂️ **Edit** — dead air, filler, cut candidate
+
+### Interactive playback bookmarking
+
+During `audiobench play`, press:
+- `b` — drop point bookmark
+- `B` — start/stop region bookmark
+- `n` / `p` — jump to next/previous bookmark
+- `l` — cycle bookmark type
+
+### Export / Import
+
+```bash
+audiobench bookmark export 3                      # JSON
+audiobench bookmark export 3 --format audacity    # Audacity label track
+audiobench bookmark import 3 labels.txt           # Auto-detects format
+```
