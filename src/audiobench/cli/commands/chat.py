@@ -26,7 +26,7 @@ CHAT_HELP_TEXT = (
     "  [bold]Slash Commands[/]\n"
     "  ─────────────────────────────────────\n"
     "  /help              Show this help\n"
-    "  /context           Show loaded transcripts\n"
+    "  /context [ID]      Show context, or add transcript by ID\n"
     "  /load <ID>         Add a transcript to context\n"
     "  /remove <ID>       Remove a transcript from context\n"
     "  /clear             Clear history and all context\n"
@@ -36,6 +36,7 @@ CHAT_HELP_TEXT = (
     "  /think             Toggle thinking display\n"
     "  /retry             Regenerate last response\n"
     "  /export [file]     Export chat to markdown\n"
+    "  /bookmarks [ID]    List bookmarks for a transcript\n"
     "  /history           List past chat sessions\n"
     "  /save              Force-save conversation\n"
     "  /exit              Exit chat (also Ctrl+D)\n"
@@ -70,10 +71,24 @@ def _handle_slash_command(
         console.print(CHAT_HELP_TEXT)
 
     elif command == "/context":
-        console.print()
-        for line in session.get_context_summary():
-            console.print(f"    {line}")
-        console.print()
+        if arg and arg.strip().isdigit():
+            # /context <ID> → shorthand for /load <ID>
+            tid = int(arg.strip())
+            record = tx_repo.get_by_id(tid)
+            if not record:
+                console.print(f"  [{DIM}]Transcript #{tid} not found[/]")
+                return False
+            session.load_transcripts([record])
+            console.print(
+                f"  [{SUCCESS}]✓ Loaded #{tid} "
+                f"{record['file_name']} "
+                f"({record['word_count']:,} words)[/]"
+            )
+        else:
+            console.print()
+            for line in session.get_context_summary():
+                console.print(f"    {line}")
+            console.print()
 
     elif command == "/load":
         if not arg or not arg.strip().isdigit():
@@ -216,6 +231,50 @@ def _handle_slash_command(
                 f"  [{DIM}]/compare off to disable[/]"
             )
         return False
+
+    elif command == "/bookmarks":
+        from audiobench.core.db_engine import init_db
+        from audiobench.storage.bookmark_repository import (
+            BOOKMARK_TYPES,
+            BookmarkRepository,
+            _format_timestamp as _bfmt,
+        )
+
+        init_db()
+        bm_repo = BookmarkRepository()
+
+        if arg and arg.strip().isdigit():
+            # Show bookmarks for a specific transcript's audio file
+            tid = int(arg.strip())
+            record = tx_repo.get_by_id(tid)
+            if not record:
+                console.print(f"  [{DIM}]Transcript #{tid} not found[/]")
+                return False
+            audio_id = record.get("audio_file_id")
+            if not audio_id:
+                console.print(f"  [{DIM}]No audio file linked to #{tid}[/]")
+                return False
+            bookmarks = bm_repo.list_for_file(audio_id)
+            label = f"#{tid} {record.get('file_name', '')}"
+        else:
+            bookmarks = bm_repo.list_all(limit=15)
+            label = "All files"
+
+        if not bookmarks:
+            console.print(f"  [{DIM}]No bookmarks found[/]")
+            return False
+
+        console.print()
+        console.print(f"  [{ACCENT}]Bookmarks — {label}[/]")
+        for b in bookmarks:
+            emoji = BOOKMARK_TYPES.get(b["bookmark_type"], "🔖")
+            time_str = _bfmt(b["timestamp"])
+            if b.get("is_region") and b.get("end_timestamp"):
+                time_str += f"→{_bfmt(b['end_timestamp'])}"
+            console.print(
+                f"    [{DIM}]#{b['id']}[/] {emoji} {time_str}  {b['name'][:40]}"
+            )
+        console.print()
 
     else:
         console.print(f"  [{DIM}]Unknown command: {command} (type /help for commands)[/]")
