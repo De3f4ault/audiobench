@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "audiobench"
-version = "0.1.0"
+version = "0.2.0"
 description = "Offline AI audio toolkit — transcribe, search, chat, visualize, and speak"
 readme = "README.md"
 license = {text = "MIT"}
