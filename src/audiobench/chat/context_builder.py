@@ -148,3 +148,53 @@ TITLE_PROMPT = (
     "User: {first_message}\n"
     "Assistant: {first_response}"
 )
+
+
+# ── Auto-Bookmarking Prompts ──────────────────────────────
+
+AUTO_BOOKMARK_SYSTEM = (
+    "You are an expert audio analyst. Your task is to identify the most "
+    "important moments in a transcript and return them as structured JSON. "
+    "You MUST respond with ONLY a valid JSON array — no markdown, no "
+    "explanation, no code fences. Just the raw JSON array."
+)
+
+
+def auto_bookmark(transcript_with_timestamps: str, *, focus: str | None = None) -> str:
+    """Build prompt for AI auto-bookmark extraction.
+
+    Args:
+        transcript_with_timestamps: Transcript text with [MM:SS] prefixed segments.
+        focus: Optional user instruction to focus extraction (e.g. "action items only").
+
+    Returns:
+        Formatted prompt string.
+    """
+    focus_line = ""
+    if focus:
+        focus_line = f"\nFOCUS: {focus}\n"
+
+    return (
+        "Analyze the transcript below and identify the most important moments.\n\n"
+        "For each moment, return a JSON object with these fields:\n"
+        '  - "timestamp": start time in seconds (float)\n'
+        '  - "end_timestamp": end time in seconds (float or null for point bookmarks)\n'
+        '  - "name": concise label (max 80 chars) — use the speaker\'s own words when possible\n'
+        '  - "type": one of "bookmark", "highlight", "todo", "note", "edit"\n'
+        '  - "notes": brief context or why this moment matters (1-2 sentences)\n\n'
+        "Type guidelines:\n"
+        '  - "highlight" → key insight, decision, or turning point\n'
+        '  - "todo" → action item, task, or follow-up commitment\n'
+        '  - "note" → interesting observation, context, or background\n'
+        '  - "bookmark" → important moment that doesn\'t fit other types\n'
+        '  - "edit" → dead air, filler, off-topic tangent, or cut candidate\n\n'
+        "Rules:\n"
+        "- Return 5-15 bookmarks depending on transcript length\n"
+        "- Timestamps MUST match the [MM:SS] markers in the transcript\n"
+        "- Prefer quality over quantity — only truly important moments\n"
+        "- For regions (edit cuts, tangents), set both timestamp and end_timestamp\n"
+        "- Respond with ONLY the JSON array, no other text\n"
+        f"{focus_line}\n"
+        f"TRANSCRIPT:\n{transcript_with_timestamps}"
+    )
+

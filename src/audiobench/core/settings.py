@@ -115,6 +115,10 @@ class AudioBenchSettings(BaseSettings):
         default="http://localhost:11434",
         description="Ollama server base URL",
     )
+    bookmark_model: str = Field(
+        default="qwen3-coder:480b-cloud",
+        description="Ollama model for AI bookmark extraction (structured output)",
+    )
 
     # --- Engine Selection ---
     engine: str = Field(

@@ -468,3 +468,232 @@ def import_cmd(target: str, input_file: str, fmt: str) -> None:
         count = repo.import_json(audio_id, data)
 
     console.print(f"  [{SUCCESS}]✓[/] Imported {count} bookmark(s) ({fmt} format)")
+
+
+# ── AI Auto-Bookmarking ────────────────────────────────────
+
+
+@bookmark.command(name="auto")
+@click.argument("target")
+@click.option("--model", default=None, help="Override AI model (default: from settings)")
+@click.option(
+    "--focus",
+    default=None,
+    help="Focus extraction (e.g. 'action items only', 'key decisions')",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Show what would be created without saving",
+)
+def auto_cmd(target: str, model: str | None, focus: str | None, dry_run: bool) -> None:
+    """Use AI to automatically identify and bookmark key moments.
+
+    \b
+    Examples:
+      audiobench bookmark auto 66                       Auto-bookmark transcript #66
+      audiobench bookmark auto 66 --focus "action items" Focus on action items
+      audiobench bookmark auto 66 --model deepseek-v3.2:cloud  Use a specific model
+      audiobench bookmark auto 66 --dry-run              Preview without saving
+    """
+    import re
+
+    from audiobench.chat.context_builder import AUTO_BOOKMARK_SYSTEM, auto_bookmark
+    from audiobench.chat.providers.ollama_provider import AIError, OllamaClient
+    from audiobench.core.db_engine import init_db
+    from audiobench.core.settings import get_settings
+    from audiobench.storage.bookmark_repository import BookmarkRepository
+    from audiobench.storage.repository import TranscriptionRepository
+
+    settings = get_settings()
+    model_name = model or settings.bookmark_model
+
+    # ── Resolve transcript ──
+    init_db()
+    repo = TranscriptionRepository()
+
+    # Try as transcript ID
+    record = None
+    try:
+        tid = int(target)
+        record = repo.get_by_id(tid)
+    except ValueError:
+        pass
+
+    if record is None:
+        console.print(error_panel("Not found", f"Transcript '{target}' not found"))
+        sys.exit(1)
+
+    audio_file_id = record.get("audio_file_id")
+    if audio_file_id is None:
+        console.print(error_panel("No audio link", "Transcript has no linked audio file"))
+        sys.exit(1)
+
+    segments = record.get("segments", [])
+    if not segments:
+        console.print(error_panel("No segments", "Transcript has no timed segments"))
+        sys.exit(1)
+
+    # ── Build timestamped transcript ──
+    lines = []
+    for seg in segments:
+        start = seg.get("start", 0)
+        mins, secs = int(start // 60), int(start % 60)
+        text = seg.get("text", "").strip()
+        if text:
+            lines.append(f"[{mins:02d}:{secs:02d}] {text}")
+
+    timestamped_text = "\n".join(lines)
+
+    # ── Header ──
+    console.print()
+    console.print(f"  [{ACCENT}]🤖 AI Auto-Bookmark[/]")
+    console.print(f"  [{DIM}]{'─' * 44}[/]")
+    console.print(f"    Source:  [{ACCENT}]#{record['id']} {record['file_name']}[/]")
+    console.print(f"    Model:   {model_name}")
+    console.print(f"    Segments: {len(segments)}")
+    if focus:
+        console.print(f"    Focus:   {focus}")
+    if dry_run:
+        console.print(f"    Mode:    [yellow]DRY RUN[/]")
+    console.print(f"  [{DIM}]{'─' * 44}[/]")
+    console.print()
+
+    # ── Call AI ──
+    try:
+        client = OllamaClient(
+            base_url=settings.ollama_base_url,
+            model=model_name,
+        )
+
+        if not client.is_available():
+            console.print(
+                error_panel(
+                    "Ollama not running",
+                    f"Start with: ollama serve\nThen pull: ollama pull {model_name}",
+                )
+            )
+            sys.exit(1)
+
+        prompt = auto_bookmark(timestamped_text, focus=focus)
+
+        console.print(f"  [{DIM}]Analyzing transcript...[/]")
+
+        response = client.generate(
+            prompt,
+            model=model_name,
+            system_prompt=AUTO_BOOKMARK_SYSTEM,
+            temperature=0.2,
+        )
+
+    except AIError as e:
+        console.print(error_panel("AI Error", str(e)))
+        sys.exit(1)
+
+    # ── Parse JSON response ──
+    # Strip markdown fences if the model wraps output
+    cleaned = response.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    cleaned = cleaned.strip()
+
+    # Extract <think> blocks if present
+    cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL).strip()
+
+    try:
+        bookmarks_data = json_lib.loads(cleaned)
+    except json_lib.JSONDecodeError as e:
+        console.print(error_panel("Parse error", f"AI returned invalid JSON:\n{e}\n\nRaw:\n{cleaned[:500]}"))
+        sys.exit(1)
+
+    if not isinstance(bookmarks_data, list):
+        console.print(error_panel("Parse error", "AI response is not a JSON array"))
+        sys.exit(1)
+
+    if not bookmarks_data:
+        console.print(f"  [{DIM}]AI found no notable moments in this transcript.[/]")
+        return
+
+    # ── Validate and display ──
+    valid_types = {"bookmark", "highlight", "todo", "note", "edit"}
+    bm_repo = BookmarkRepository()
+    created = 0
+
+    table = make_table(
+        "AI Bookmarks",
+        columns=[
+            ("Type", {"justify": "center", "width": 6}),
+            ("Time", {"justify": "right", "width": 14}),
+            ("Name", {"justify": "left", "width": 50}),
+            ("Notes", {"justify": "left", "width": 30}),
+        ],
+    )
+
+    for item in bookmarks_data:
+        ts = item.get("timestamp")
+        if ts is None:
+            continue
+
+        try:
+            ts = float(ts)
+        except (ValueError, TypeError):
+            continue
+
+        end_ts = item.get("end_timestamp")
+        if end_ts is not None:
+            try:
+                end_ts = float(end_ts)
+            except (ValueError, TypeError):
+                end_ts = None
+
+        name = str(item.get("name", "Untitled"))[:80]
+        bm_type = str(item.get("type", "bookmark"))
+        if bm_type not in valid_types:
+            bm_type = "bookmark"
+        notes = item.get("notes")
+        if notes:
+            notes = str(notes)[:200]
+
+        emoji = BOOKMARK_TYPES.get(bm_type, "🔖")
+        time_str = _format_timestamp(ts)
+        if end_ts:
+            time_str += f"→{_format_timestamp(end_ts)}"
+
+        table.add_row(
+            emoji,
+            time_str,
+            name,
+            (notes or "")[:30],
+        )
+
+        if not dry_run:
+            if end_ts:
+                bm_repo.add_region(
+                    audio_file_id=audio_file_id,
+                    start_timestamp=ts,
+                    end_timestamp=end_ts,
+                    name=name,
+                    bookmark_type=bm_type,
+                    notes=notes,
+                    transcription_id=record.get("id"),
+                )
+            else:
+                bm_repo.add(
+                    audio_file_id=audio_file_id,
+                    timestamp=ts,
+                    name=name,
+                    bookmark_type=bm_type,
+                    notes=notes,
+                    transcription_id=record.get("id"),
+                )
+            created += 1
+
+    console.print(table)
+    console.print()
+
+    if dry_run:
+        console.print(f"  [yellow]⚠ Dry run — {len(bookmarks_data)} bookmark(s) NOT saved[/]")
+    else:
+        console.print(f"  [{SUCCESS}]✓[/] Created {created} bookmark(s) via AI")
+    console.print()
+
