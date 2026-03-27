@@ -192,6 +192,7 @@ class TranscriptionRepository:
                         "word_count": rec.word_count,
                         "duration": rec.duration_seconds,
                         "status": rec.status,
+                        "audio_file_id": rec.audio_file_id,
                         "created_at": rec.created_at.isoformat() if rec.created_at else "",
                         "text_preview": rec.full_text[:100] + "..."
                         if len(rec.full_text) > 100
@@ -249,6 +250,7 @@ class TranscriptionRepository:
                     else (rec.audio_file.file_name if rec.audio_file else "unknown")
                 ),
                 "file_path": (rec.audio_file.file_path if rec.audio_file else None),
+                "audio_file_id": rec.audio_file_id,
                 "source": rec.source,
                 "full_text": rec.full_text,
                 "language": rec.language,
