@@ -177,6 +177,8 @@ def _play_with_lyrics(
     speed: float | None,
     total_duration: float,
     resume: bool = False,
+    audio_file_id: int | None = None,
+    transcription_id: int | None = None,
 ) -> None:
     """Play audio with interactive controls and synchronized transcript."""
     import select
@@ -227,6 +229,26 @@ def _play_with_lyrics(
     listen_start = time.monotonic()
     listen_start_pos = mpv.get_position()
 
+    # ── Bookmark support ──────────────────────────────────
+    bookmark_repo = None
+    bookmark_flash: str | None = None
+    bookmark_flash_until: float = 0.0
+    region_start: float | None = None
+    last_bookmark_id: int | None = None
+
+    if audio_file_id is not None:
+        from audiobench.storage.bookmark_repository import (
+            BOOKMARK_TYPES,
+            BookmarkRepository,
+            _format_timestamp as _bfmt,
+        )
+        bookmark_repo = BookmarkRepository()
+
+    def _set_flash(msg: str) -> None:
+        nonlocal bookmark_flash, bookmark_flash_until
+        bookmark_flash = msg
+        bookmark_flash_until = time.monotonic() + 2.0  # show for 2s
+
     # cbreak mode: read individual keypresses while preserving output processing
     # (setraw breaks ANSI escape handling needed by Rich Live)
     fd = sys.stdin.fileno()
@@ -236,6 +258,7 @@ def _play_with_lyrics(
         tty.setcbreak(fd)
 
         with Live(console=console, refresh_per_second=4, transient=True) as live:
+            current_idx = -1  # track segment index across loop iterations
             while mpv.is_running():
                 # ── Handle keypresses (non-blocking) ──
                 # Keybindings follow mpv defaults
@@ -293,6 +316,69 @@ def _play_with_lyrics(
                                     mpv.seek(60)
                                 elif arrow == "B":   # ↓ seek -60s
                                     mpv.seek(-60)
+
+                    # ── Bookmark keybindings ──
+                    elif key == "b" and bookmark_repo and audio_file_id:
+                        # Instant point bookmark — auto-name from transcript
+                        pos = mpv.get_position()
+                        auto_name = f"Bookmark @ {_bfmt(pos)}"
+                        if segments and current_idx >= 0:
+                            seg_text = (segments[current_idx].get("text", "") or "").strip()
+                            if seg_text:
+                                auto_name = seg_text[:80]
+                        bid = bookmark_repo.add(
+                            audio_file_id, pos,
+                            name=auto_name,
+                            transcription_id=transcription_id,
+                        )
+                        last_bookmark_id = bid
+                        _set_flash(f"🔖 {_bfmt(pos)} \"{auto_name[:40]}\"")
+
+                    elif key == "B" and bookmark_repo and audio_file_id:
+                        # Region start/end toggle
+                        pos = mpv.get_position()
+                        if region_start is None:
+                            region_start = pos
+                            _set_flash(f"▶ Region start @ {_bfmt(pos)}")
+                        else:
+                            auto_name = f"Region {_bfmt(region_start)}→{_bfmt(pos)}"
+                            bid = bookmark_repo.add_region(
+                                audio_file_id, region_start, pos,
+                                name=auto_name,
+                                transcription_id=transcription_id,
+                            )
+                            last_bookmark_id = bid
+                            _set_flash(f"■ Region saved: {_bfmt(region_start)}→{_bfmt(pos)}")
+                            region_start = None
+
+                    elif key == "n" and bookmark_repo and audio_file_id:
+                        # Jump to next bookmark
+                        pos = mpv.get_position()
+                        nxt = bookmark_repo.get_nearest(audio_file_id, pos, "next")
+                        if nxt:
+                            mpv.seek_absolute(nxt["timestamp"])
+                            emoji = BOOKMARK_TYPES.get(nxt["bookmark_type"], "🔖")
+                            _set_flash(f"→ {emoji} {_bfmt(nxt['timestamp'])} {nxt['name'][:30]}")
+                        else:
+                            _set_flash("→ No more bookmarks")
+
+                    elif key == "p" and bookmark_repo and audio_file_id:
+                        # Jump to previous bookmark
+                        pos = mpv.get_position()
+                        prev = bookmark_repo.get_nearest(audio_file_id, pos, "prev")
+                        if prev:
+                            mpv.seek_absolute(prev["timestamp"])
+                            emoji = BOOKMARK_TYPES.get(prev["bookmark_type"], "🔖")
+                            _set_flash(f"← {emoji} {_bfmt(prev['timestamp'])} {prev['name'][:30]}")
+                        else:
+                            _set_flash("← No earlier bookmarks")
+
+                    elif key == "l" and bookmark_repo and last_bookmark_id:
+                        # Cycle type of last-created bookmark
+                        new_type = bookmark_repo.cycle_type(last_bookmark_id)
+                        if new_type:
+                            emoji = BOOKMARK_TYPES.get(new_type, "🔖")
+                            _set_flash(f"{emoji} Type → {new_type}")
 
                 # ── Read state from mpv (batch for low latency) ──
                 current_time, current_speed, paused = mpv.get_playback_state()
@@ -371,11 +457,48 @@ def _play_with_lyrics(
 
                 parts.append(segment_text)
 
+                # ── Bookmark flash / region indicator ──
+                flash_text = None
+                if region_start is not None:
+                    elapsed = mpv.get_position() - region_start
+                    flash_text = Text(
+                        f"  ● Recording region ({_bfmt(elapsed)})...",
+                        style="bold red",
+                    )
+                elif bookmark_flash and time.monotonic() < bookmark_flash_until:
+                    flash_text = Text(f"  {bookmark_flash}", style="bold green")
+
+                if flash_text:
+                    parts.append(Text(""))
+                    parts.append(Align.center(flash_text))
+
+                # ── Bookmark indicator bar ──
+                if bookmark_repo and audio_file_id and total_duration > 0:
+                    file_bookmarks = bookmark_repo.list_for_file(audio_file_id)
+                    if file_bookmarks:
+                        bar_width = 30
+                        indicator = list("─" * bar_width)
+                        for bm in file_bookmarks:
+                            pos_frac = min(bm["timestamp"] / total_duration, 1.0)
+                            idx = min(int(pos_frac * bar_width), bar_width - 1)
+                            emoji = BOOKMARK_TYPES.get(bm["bookmark_type"], "│")
+                            # Use a simple marker character for the bar
+                            indicator[idx] = "┃"
+                        marker_line = Text("  " + "".join(indicator), style="dim cyan")
+                        parts.append(Align.center(marker_line))
+
                 # Controls hint (centered)
-                controls = Text(
-                    "␣ pause  ←→ ±5s  ↑↓ ±60s  [ ] speed  9/0 vol  m mute  ⌫ reset  q quit",
-                    style="dim",
-                )
+                if bookmark_repo:
+                    ctrl_str = (
+                        "␣ pause  ←→ ±5s  ↑↓ ±60s  b mark  B region  "
+                        "n/p jump  l type  [ ] speed  q quit"
+                    )
+                else:
+                    ctrl_str = (
+                        "␣ pause  ←→ ±5s  ↑↓ ±60s  [ ] speed  "
+                        "9/0 vol  m mute  ⌫ reset  q quit"
+                    )
+                controls = Text(ctrl_str, style="dim")
                 parts.append(Text(""))
                 parts.append(Align.center(controls))
 
@@ -535,6 +658,18 @@ def _play_with_subtitles(
     is_flag=True,
     help="Resume from last saved position",
 )
+@click.option(
+    "--bookmark",
+    "from_bookmark",
+    default=None,
+    help="Start from bookmark (by ID or name)",
+)
+@click.option(
+    "--bookmarks",
+    "show_bookmarks",
+    is_flag=True,
+    help="List bookmarks for this file before playing",
+)
 def play(
     target: str,
     seek_to: str | None,
@@ -543,6 +678,8 @@ def play(
     watch: bool,
     quiet: bool,
     resume: bool,
+    from_bookmark: str | None,
+    show_bookmarks: bool,
 ) -> None:
     """Play an audio file or a transcript's source audio.
 
@@ -678,12 +815,87 @@ def play(
             console.print(f"    Segs:   {len(segments)}")
         console.print(f"  [{DIM}]{'─' * 44}[/]")
 
+    # ── Handle --bookmark ──
+    audio_file_id: int | None = None
+    transcription_id: int | None = None
+
+    if record:
+        audio_file_id = record.get("audio_file_id")
+        transcription_id = record.get("id")  # transcription record ID
+
+    # If no audio_file_id yet (playing by file path), try to resolve from DB
+    if audio_file_id is None and file_path:
+        from audiobench.storage.bookmark_repository import BookmarkRepository
+
+        _bm_repo = BookmarkRepository()
+        audio_file_id = _bm_repo._get_audio_file_id_by_path(str(file_path))
+
+    # ── Show bookmarks before playback (--bookmarks) ──
+    if show_bookmarks and audio_file_id and not quiet:
+        from audiobench.storage.bookmark_repository import (
+            BOOKMARK_TYPES as _BM_TYPES,
+            BookmarkRepository as _BmRepo,
+            _format_timestamp as _bfmt,
+        )
+
+        _sb_repo = _BmRepo()
+        file_bms = _sb_repo.list_for_file(audio_file_id)
+        if file_bms:
+            console.print(f"\n  [{ACCENT}]Bookmarks ({len(file_bms)})[/]")
+            for bm in file_bms:
+                emoji = _BM_TYPES.get(bm["bookmark_type"], "🔖")
+                t = _bfmt(bm["timestamp"])
+                if bm.get("is_region") and bm.get("end_timestamp"):
+                    t += f"→{_bfmt(bm['end_timestamp'])}"
+                console.print(
+                    f"    [{DIM}]#{bm['id']}[/] {emoji} {t}  {bm['name'][:40]}"
+                )
+            console.print()
+        else:
+            console.print(f"  [{DIM}]No bookmarks yet (press b during playback)[/]")
+
+    if from_bookmark and audio_file_id:
+        from audiobench.storage.bookmark_repository import BookmarkRepository
+
+        bm_repo = BookmarkRepository()
+        bm = None
+
+        # Try as bookmark ID
+        if from_bookmark.isdigit():
+            bm = bm_repo.get_by_id(int(from_bookmark))
+
+        # Fallback: fuzzy name match
+        if bm is None:
+            candidates = bm_repo.search(from_bookmark, audio_file_id=audio_file_id)
+            if candidates:
+                bm = candidates[0]
+
+        if bm:
+            start_seconds = bm["timestamp"]
+            if not quiet:
+                from audiobench.storage.bookmark_repository import (
+                    BOOKMARK_TYPES,
+                    _format_timestamp as _bfmt,
+                )
+                emoji = BOOKMARK_TYPES.get(bm["bookmark_type"], "🔖")
+                console.print(
+                    f"    From:   {emoji} #{bm['id']} {_bfmt(start_seconds)} "
+                    f"\"{bm['name'][:40]}\""
+                )
+        else:
+            console.print(
+                error_panel("Bookmark not found", f"'{from_bookmark}'")
+            )
+            sys.exit(1)
+
     # ── Route to mode ──
     if lyrics and segments:
         _play_with_lyrics(
             file_path, segments, record_name,
             start_seconds, speed, total_duration,
             resume=resume,
+            audio_file_id=audio_file_id,
+            transcription_id=transcription_id,
         )
     elif watch and segments:
         _play_with_subtitles(
