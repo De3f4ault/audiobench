@@ -56,12 +56,20 @@ def get_engine() -> Engine:
             def _set_sqlite_pragmas(dbapi_conn: Any, _connection_record: Any) -> None:
                 cursor = dbapi_conn.cursor()
                 cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA busy_timeout=15000")   # wait up to 15s on lock, not 0ms
                 cursor.execute("PRAGMA synchronous=NORMAL")
                 cursor.execute("PRAGMA foreign_keys=ON")
                 cursor.execute("PRAGMA mmap_size=268435456")
                 cursor.execute("PRAGMA cache_size=-32000")
                 cursor.close()
 
+        # ── Announce the resolved DB path loudly ─────────────────────────────
+        # This intentionally goes to stdout (not just the log file) so that
+        # any invocation — CLI, daemon, test script — shows exactly which file
+        # the engine is pointed at before any query runs. If this path looks
+        # wrong, stop and fix it rather than debugging silent data divergence.
+        resolved_db = url.split("///")[-1] if "sqlite:///" in url else url.split("@")[-1]
+        logger.debug(f"[db] Canonical database: {Path(resolved_db).resolve()}")
         logger.info("Database engine created: %s", url.split("@")[-1] if "@" in url else url)
 
     return _engine
@@ -141,6 +149,15 @@ def init_db() -> None:
                 logger.warning("Migration m008 failed (non-fatal): %s", e)
 
             try:
+                from audiobench.storage.migrations.m012_backfill_columns import (
+                    migrate as migrate_012,
+                )
+
+                migrate_012(db_path)
+            except Exception as e:
+                logger.warning("Migration m012 failed (non-fatal): %s", e)
+
+            try:
                 from audiobench.storage.migrations.m009_rag_indexing import (
                     migrate as migrate_009,
                 )
@@ -157,7 +174,7 @@ def init_db() -> None:
                 migrate_010(db_path)
             except Exception as e:
                 logger.warning("Migration m010 failed (non-fatal): %s", e)
-                
+
             try:
                 from audiobench.storage.migrations.m011_strategy_column import (
                     migrate as migrate_011,

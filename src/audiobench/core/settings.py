@@ -126,6 +126,11 @@ class AudioBenchSettings(BaseSettings):
     enable_diarization: bool = Field(default=False, description="Enable speaker diarization")
 
     # --- Database ---
+    # CANONICAL DATABASE: data/transcriptions.db (relative to project root).
+    # The absolute path is computed from settings.py's own location — it does NOT
+    # depend on the working directory, so it resolves identically from any invocation
+    # context (CLI, daemon, test script). There is exactly one database. If you see
+    # any other .db file at a plausible-looking path, it is a stub or artifact.
     database_url: str = Field(
         default_factory=lambda: f"sqlite:///{_DATA_DIR / 'transcriptions.db'}",
         description="SQLAlchemy database URL",
