@@ -34,7 +34,7 @@ def handle_structural_question(session: ReplSession, question: str) -> bool:
             days = 1
         elif "month" in q_lower:
             days = 30
-            
+
         _count_transcriptions(days)
         return True
 
@@ -73,7 +73,7 @@ def _count_transcriptions(days: int) -> None:
     except Exception as e:
         console.print(f"  [{WARNING}]Could not query command graph: {e}[/]")
         return
-        
+
     time_str = f"in the last {days} days" if days > 1 else "today"
     console.print(f"\n  [{BOLD}]Command Graph:[/] You transcribed [{ACCENT}]{count}[/] files {time_str}.\n")
 
@@ -97,6 +97,6 @@ def _show_graph_stats() -> None:
     )
     for row in stats[:5]:
         table.add_row(f"\\{row['command']}", str(row['count']))
-        
+
     console.print()
     console.print(table)

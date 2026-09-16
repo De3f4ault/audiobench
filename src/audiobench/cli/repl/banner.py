@@ -19,8 +19,9 @@ from audiobench.cli.repl.session import ReplSession
 def print_banner(session: ReplSession) -> None:
     cmd_count = len(session.cli_group.commands)
 
-    from audiobench.cli.display.theme import BOX_STYLE
     from rich.panel import Panel
+
+    from audiobench.cli.display.theme import BOX_STYLE
 
     content = f"[{BOLD}][{ACCENT}]v{APP_VERSION}  •  {cmd_count} commands[/][/]"
     console.print(

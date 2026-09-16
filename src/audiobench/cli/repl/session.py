@@ -8,7 +8,6 @@ Provides:
 
 from __future__ import annotations
 
-import contextlib
 import json
 import threading
 import time
@@ -209,8 +208,9 @@ class ReplSession:
         """
         job_badge = ""
         try:
-            from audiobench.core.settings import get_settings
             from pathlib import Path
+
+            from audiobench.core.settings import get_settings
 
             active_file = Path(get_settings().data_dir) / "jobs.active"
             if active_file.exists():

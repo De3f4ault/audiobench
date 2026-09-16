@@ -24,7 +24,6 @@ from audiobench.cli.display.theme import (
     ACCENT,
     BOLD,
     DIM,
-    SUCCESS,
     WARNING,
     console,
 )
@@ -89,30 +88,30 @@ def dot_help(session: ReplSession, args: str) -> None:
 @register_dot("use")
 def dot_use(session: ReplSession, args: str) -> None:
     """Set the current context to a specific transcript ID."""
+    from audiobench.cli.repl.dispatch import print_context_summary
     from audiobench.core.focused_entity import FocusedEntity
     from audiobench.storage.repository import TranscriptionRepository
-    from audiobench.cli.repl.dispatch import print_context_summary
-    
+
     arg = args.strip()
     if not arg.isdigit():
         console.print(f"  [{WARNING}]Usage: .use <transcript_id>[/]")
         return
-        
+
     tx_id = int(arg)
     repo = TranscriptionRepository()
     rec = repo.get_by_id(tx_id)
     if not rec:
         console.print(f"  [{WARNING}]Transcript #{tx_id} not found.[/]")
         return
-        
+
     session.set_context(tx_id)
-    
+
     # Also focus the associated audio file if possible
     audio_file_id = rec.get("audio_file_id")
     if audio_file_id:
         file_name = rec.get("file_name", f"File #{audio_file_id}")
         session.focus = FocusedEntity(type="file", id=audio_file_id, label=file_name)
-        
+
     print_context_summary(session)
 
 @register_dot("focus")
@@ -162,6 +161,7 @@ def _is_daemon_available() -> bool:
     """Quick non-blocking check: is the daemon socket alive?"""
     try:
         from pathlib import Path
+
         from audiobench.core.settings import get_settings
         from audiobench.daemon.factory import _is_socket_alive
         socket_path = Path(get_settings().daemon_socket_path)
@@ -187,11 +187,12 @@ def _resolve_provenance(expr) -> dict:
     }
 
     try:
-        from audiobench.storage.repository import TranscriptionRepository
         from audiobench.core.db_session import get_session as db_session
         from audiobench.storage.models import (
-            AudioFileRecord, TranscriptionRecord,
-            ChatSession, AskLog
+            AskLog,
+            AudioFileRecord,
+            ChatSession,
+            TranscriptionRecord,
         )
 
         source_type = expr.source_type
@@ -401,12 +402,12 @@ def _action_menu(
             _show_graph_context(expr, expr_repo)
 
         elif choice == "f" and prov.get("audio_file_id"):
-            from audiobench.core.focused_entity import FocusedEntity
-            from audiobench.cli.repl.session import NavigationFrame
             from audiobench.cli.repl.dispatch import print_context_summary
+            from audiobench.cli.repl.session import NavigationFrame
+            from audiobench.core.focused_entity import FocusedEntity
             file_id = prov["audio_file_id"]
             file_name = prov.get("file_name", f"File #{file_id}")
-            session.push_frame(NavigationFrame(context=".search", state={}, intent=f"focused from .search"))
+            session.push_frame(NavigationFrame(context=".search", state={}, intent="focused from .search"))
             session.focus = FocusedEntity(type="file", id=file_id, label=file_name)
             print_context_summary(session)
             return  # Exit the action menu and return to REPL
@@ -486,7 +487,7 @@ def _show_surrounding(expr, expr_repo) -> None:
     # Find sibling expressions that share the same parent via SOURCE relations
     try:
         from audiobench.core.db_session import get_session as db_session
-        from audiobench.storage.models import ExpressionRecord, ExpressionRelation
+        from audiobench.storage.models import ExpressionRelation
 
         with db_session() as s:
             sibling_ids = (
@@ -639,7 +640,7 @@ def dot_search(session: ReplSession, args: str) -> None:
         console.print(f"  [{DIM}]Searching the expression namespace...[/]")
         try:
             from audiobench.daemon.factory import get_daemon_client
-            
+
             use_bm25 = preset in ("balanced", "deep")
             use_dense = True
             use_colbert = preset in ("balanced", "deep")
@@ -782,9 +783,9 @@ def _interactive_fts_loop(session: ReplSession, results: list[dict]) -> None:
                 audio_file_id = r.get("audio_file_id") or r.get("id")
                 file_name = r.get("file_name", f"File #{audio_file_id}")
                 if audio_file_id:
-                    from audiobench.core.focused_entity import FocusedEntity
-                    from audiobench.cli.repl.session import NavigationFrame
                     from audiobench.cli.repl.dispatch import print_context_summary
+                    from audiobench.cli.repl.session import NavigationFrame
+                    from audiobench.core.focused_entity import FocusedEntity
                     session.push_frame(NavigationFrame(context=".search", state={}, intent="focused from .search (FTS)"))
                     session.focus = FocusedEntity(type="file", id=audio_file_id, label=file_name)
                     print_context_summary(session)

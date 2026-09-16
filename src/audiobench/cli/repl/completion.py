@@ -14,10 +14,10 @@ Template system:
 from __future__ import annotations
 
 import glob
+
 import click
-from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
-from sqlalchemy import text
+from prompt_toolkit.completion import Completer, Completion
 
 from audiobench.cli.repl.session import ReplSession
 from audiobench.core.db_session import get_session
@@ -182,6 +182,7 @@ _AUDIO_FILE_CMDS = {"transcribe", "convert", "play", "inspect", "analyze", "subt
 
 # Audio extensions to complete
 from audiobench.transcribe.audio_converter import ALL_SUPPORTED_FORMATS
+
 _AUDIO_EXTS = tuple(f".{ext}" for ext in ALL_SUPPORTED_FORMATS)
 
 

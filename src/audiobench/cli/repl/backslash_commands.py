@@ -28,7 +28,6 @@ from audiobench.cli.display.theme import (
 from audiobench.cli.repl.dispatch import register_backslash, register_resume
 from audiobench.cli.repl.session import ReplSession
 
-
 # ── Security helpers ──────────────────────────────────────────────────────
 
 
@@ -145,10 +144,10 @@ def cmd_focus(session: ReplSession, args: str) -> None:
     arg = args.strip()
 
     from audiobench.core.db_engine import init_db
-    from audiobench.core.focused_entity import FocusedEntity
-    from audiobench.storage.repository import TranscriptionRepository
     from audiobench.core.db_session import get_session
+    from audiobench.core.focused_entity import FocusedEntity
     from audiobench.storage.models import WorkRecord
+    from audiobench.storage.repository import TranscriptionRepository
 
     init_db()
 
@@ -173,7 +172,7 @@ def cmd_focus(session: ReplSession, args: str) -> None:
         search_str = arg.strip("\"'")
         with get_session() as session_db:
             works = session_db.query(WorkRecord).filter(
-                (WorkRecord.title.ilike(f"%{search_str}%")) | 
+                (WorkRecord.title.ilike(f"%{search_str}%")) |
                 (WorkRecord.author.ilike(f"%{search_str}%"))
             ).all()
             if not works:
@@ -298,10 +297,11 @@ def cmd_search(session: ReplSession, args: str) -> None:
     For meaning-based cross-source search, use: .search "concept"
     """
     import shlex
+
+    from audiobench.cli.repl.dispatch import print_context_summary
+    from audiobench.cli.repl.session import NavigationFrame
     from audiobench.core.db_engine import init_db
     from audiobench.core.focused_entity import FocusedEntity
-    from audiobench.cli.repl.session import NavigationFrame
-    from audiobench.cli.repl.dispatch import print_context_summary
     from audiobench.storage.repository import TranscriptionRepository
 
     if not args.strip():
@@ -397,8 +397,8 @@ def cmd_search(session: ReplSession, args: str) -> None:
                 tx_id = r.get("id")
                 if tx_id:
                     from audiobench.core.db_session import get_session as _gs
-                    from audiobench.storage.models import ExpressionRecord
                     from audiobench.memory.enums import SourceType
+                    from audiobench.storage.models import ExpressionRecord
                     with _gs() as db:
                         expr = db.query(ExpressionRecord).filter_by(
                             source_id=tx_id,
@@ -418,8 +418,9 @@ def cmd_search(session: ReplSession, args: str) -> None:
 @register_backslash("history")
 def cmd_history(session: ReplSession, args: str) -> None:
     """Show transcript history. Usage: \\history [--limit 5]"""
-    from audiobench.cli.repl.dispatch import dispatch_command
     import shlex
+
+    from audiobench.cli.repl.dispatch import dispatch_command
 
     parsed_args = shlex.split(args)
     dispatch_command(session, ["history"] + parsed_args)
@@ -428,13 +429,12 @@ def cmd_history(session: ReplSession, args: str) -> None:
 @register_backslash("stats")
 def cmd_stats(session: ReplSession, args: str) -> None:
     """Show detailed stats for the current transcript."""
-    from audiobench.cli.display.theme import ACCENT, BOLD, DIM, console
-    from audiobench.cli.display.theme import format_duration
-    
+    from audiobench.cli.display.theme import ACCENT, BOLD, DIM, console, format_duration
+
     if not session.last_id:
         console.print(f"  [{DIM}]No focused transcript. Use [{ACCENT}]\\focus <id>[/][/]")
         return
-        
+
     repo = session._get_repo()
     rec = repo.get_by_id(session.last_id)
     if not rec:
@@ -443,11 +443,11 @@ def cmd_stats(session: ReplSession, args: str) -> None:
     console.print(f"\n  [{BOLD}]Transcription #{rec['id']}[/]")
     console.print(f"  [{DIM}]{'─' * 40}[/]")
     console.print(f"  [{DIM}]File:[/]       [{ACCENT}]{rec.get('file_name', 'Unknown')}[/]")
-    
+
     duration = format_duration(rec.get("duration_seconds") or 0)
     console.print(f"  [{DIM}]Duration:[/]   {duration}")
     console.print(f"  [{DIM}]Words:[/]      {rec.get('word_count', 0):,}")
-    
+
     metadata = rec.get("metadata") or {}
     console.print(f"  [{DIM}]Model:[/]      {metadata.get('model', 'Unknown')}")
     console.print(f"  [{DIM}]Engine:[/]     {metadata.get('engine', 'Unknown')}")
@@ -459,11 +459,11 @@ def cmd_stats(session: ReplSession, args: str) -> None:
 def cmd_chat(session: ReplSession, args: str) -> None:
     """Start an interactive chat with the current transcript."""
     from audiobench.cli.repl.dispatch import dispatch_command
-    
+
     if not session.last_id:
         console.print(f"  [{DIM}]No focused transcript. Use [{ACCENT}]\\focus <id>[/][/]")
         return
-        
+
     dispatch_command(session, ["chat", str(session.last_id)])
 
 
@@ -471,11 +471,11 @@ def cmd_chat(session: ReplSession, args: str) -> None:
 def cmd_ask(session: ReplSession, args: str) -> None:
     """Ask a question about the current transcript."""
     from audiobench.cli.repl.dispatch import dispatch_command
-    
+
     if not session.last_id:
         console.print(f"  [{DIM}]No focused transcript. Use [{ACCENT}]\\focus <id>[/][/]")
         return
-        
+
     if not args.strip():
         dispatch_command(session, ["ask", str(session.last_id), "--interactive"])
     else:
@@ -486,11 +486,11 @@ def cmd_ask(session: ReplSession, args: str) -> None:
 def cmd_summarize(session: ReplSession, args: str) -> None:
     """Generate an AI summary of the current transcript."""
     from audiobench.cli.repl.dispatch import dispatch_command
-    
+
     if not session.last_id:
         console.print(f"  [{DIM}]No focused transcript. Use [{ACCENT}]\\focus <id>[/][/]")
         return
-        
+
     if not args.strip():
         dispatch_command(session, ["summarize", str(session.last_id), "--interactive"])
     else:
@@ -500,12 +500,13 @@ def cmd_summarize(session: ReplSession, args: str) -> None:
 @require_tier(2)
 def cmd_import(session: ReplSession, args: str) -> None:
     """Import audio files into the internal library. [Tier 2 required]"""
-    from audiobench.cli.repl.session import NavigationFrame
-    from audiobench.cli.repl.dispatch import dispatch_command
     import shlex
-    
+
+    from audiobench.cli.repl.dispatch import dispatch_command
+    from audiobench.cli.repl.session import NavigationFrame
+
     session.push_frame(NavigationFrame(context="import", state={}, intent="import files"))
-    
+
     if not args.strip():
         dispatch_command(session, ["import"])
     else:
@@ -516,12 +517,13 @@ def cmd_import(session: ReplSession, args: str) -> None:
 @require_tier(2)
 def cmd_transcribe(session: ReplSession, args: str) -> None:
     """Transcribe audio files (interactive wizard by default). [Tier 2 required]"""
-    from audiobench.cli.repl.session import NavigationFrame
-    from audiobench.cli.repl.dispatch import dispatch_command
     import shlex
-    
+
+    from audiobench.cli.repl.dispatch import dispatch_command
+    from audiobench.cli.repl.session import NavigationFrame
+
     session.push_frame(NavigationFrame(context="transcribe", state={}, intent="transcribe audio"))
-    
+
     if not args.strip():
         dispatch_command(session, ["transcribe", "--interactive"])
     else:
@@ -532,8 +534,8 @@ def cmd_transcribe(session: ReplSession, args: str) -> None:
 @require_tier(2)
 def cmd_config(session: ReplSession, args: str) -> None:
     """Run configuration wizard. [Tier 2 required]"""
-    from audiobench.cli.repl.session import NavigationFrame
     from audiobench.cli.repl.dispatch import dispatch_command
+    from audiobench.cli.repl.session import NavigationFrame
     session.push_frame(NavigationFrame(context="config", state={}, intent="configure app"))
     dispatch_command(session, ["config", "--interactive"])
 
@@ -545,12 +547,12 @@ def _resolve_capture_destination(session: ReplSession, repo) -> int:
     active_id = session.navigation_stack[-1].state.get("collection_id") if session.navigation_stack else None
     if active_id:
         return active_id
-        
+
     # Tier 2: Focus is on an audio file
     if session.focus and session.focus.type == "file":
         col = repo.find_or_create_collection(session.focus.id, f"Notes: {session.focus.label}")
         return col.id
-        
+
     # Tier 3: No focus, global inbox
     col = repo.find_or_create_collection(None, "Global Inbox")
     return col.id
@@ -559,9 +561,9 @@ def _resolve_capture_destination(session: ReplSession, repo) -> int:
 @register_backslash("capture")
 def cmd_capture(session: ReplSession, args: str) -> None:
     """Capture a thought or expression to the current context collection or inbox."""
-    from audiobench.cli.display.theme import console, SUCCESS
+    from audiobench.cli.display.theme import SUCCESS, console
     from audiobench.storage.note_repository import NoteRepository
-    
+
     arg = args.strip()
     if not arg:
         try:
@@ -572,7 +574,7 @@ def cmd_capture(session: ReplSession, args: str) -> None:
 
     repo = NoteRepository()
     collection_id = _resolve_capture_destination(session, repo)
-    
+
     expression_id = None
     if arg.startswith("expression:"):
         from audiobench.storage.expression_repository import ExpressionRepository
@@ -583,15 +585,15 @@ def cmd_capture(session: ReplSession, args: str) -> None:
             expr = expr_repo.get_by_id(expression_id)
             if expr:
                 arg = f"Captured expression: {expr.content[:100]}..."
-                
+
     cols = repo.list_collections(limit=100)
     target_col = next((c for c in cols if c.id == collection_id), None)
-    
+
     cap = repo.create_capture(
-        collection_id=collection_id, 
-        body=arg, 
-        segment_id=None, 
-        transcript_expression_id=expression_id, 
+        collection_id=collection_id,
+        body=arg,
+        segment_id=None,
+        transcript_expression_id=expression_id,
         collection_expression_id=target_col.expression_id if target_col else None
     )
     console.print(f"  [{SUCCESS}]→ Captured to: {target_col.title if target_col else 'Inbox'} (#capture:{cap.id})[/]")
@@ -838,30 +840,30 @@ def _workflow_show(name: str) -> None:
 @register_backslash("related")
 def cmd_related(session: ReplSession, args: str) -> None:
     """Show semantically related fragments from other transcripts."""
-    from audiobench.cli.display.theme import console, ACCENT, BOLD, DIM, WARNING
+    from audiobench.cli.display.theme import ACCENT, BOLD, DIM, WARNING, console
     if not session.last_id:
         console.print(f"  [{DIM}]No focused transcript. Use [{ACCENT}]\\focus <id>[/][/]")
         return
-        
+
     repo = session._get_repo()
     rec = repo.get_by_id(session.last_id)
     if not rec:
         return
-        
+
     # Get text to search. Summary if available, otherwise first 500 chars.
     text_to_search = rec.get("summary", "")
     if not text_to_search:
         text_to_search = rec.get("full_text", "")[:500]
-        
+
     if not text_to_search.strip():
         console.print(f"  [{DIM}]Transcript is empty, cannot find related content.[/]")
         return
-        
+
     console.print(f"  [{DIM}]Searching for related fragments across the library...[/]")
-    
+
     from audiobench.daemon.factory import get_daemon_client
     daemon = get_daemon_client()
-    
+
     try:
         # Ask daemon for search
         results = daemon.search(
@@ -874,14 +876,14 @@ def cmd_related(session: ReplSession, args: str) -> None:
     except Exception as e:
         console.print(f"  [{WARNING}]Daemon search failed: {e}[/]")
         return
-        
+
     if not results:
         console.print(f"  [{DIM}]No related fragments found.[/]")
         return
-        
+
     from audiobench.storage.expression_repository import ExpressionRepository
     expr_repo = ExpressionRepository()
-    
+
     # Filter out current source_id
     related_exprs = []
     seen_ids = set()
@@ -894,19 +896,19 @@ def cmd_related(session: ReplSession, args: str) -> None:
                 related_exprs.append((expr, r.get("score", 0.0)))
                 if len(related_exprs) >= 5:
                     break
-                    
+
     if not related_exprs:
         console.print(f"  [{DIM}]No related fragments found outside of this transcript.[/]")
         return
-        
+
     console.print(f"\n  [{BOLD}]Related Thoughts[/]")
     console.print(f"  [{DIM}]{'─' * 40}[/]")
-    
+
     for i, (expr, score) in enumerate(related_exprs, 1):
         # get original audio file name
         audio_file = repo.get_by_id(expr.source_id)
         name = audio_file.get("file_name", f"Transcript #{expr.source_id}") if audio_file else f"Source #{expr.source_id}"
-        
+
         console.print(f"  [{ACCENT}]{i}. {name}[/] [{DIM}](score: {score:.2f})[/]")
         content = expr.content.strip().replace('\n', ' ')
         if len(content) > 150:
@@ -918,45 +920,46 @@ def cmd_related(session: ReplSession, args: str) -> None:
 def cmd_name(session: ReplSession, args: str) -> None:
     """Rename a speaker in the focused transcript and globally."""
     import shlex
-    from audiobench.cli.display.theme import console, ACCENT, BOLD, DIM, WARNING
-    
+
+    from audiobench.cli.display.theme import ACCENT, BOLD, DIM, WARNING, console
+
     if not session.last_id:
         console.print(f"  [{DIM}]No focused transcript. Use [{ACCENT}]\\focus <id>[/][/]")
         return
-        
+
     try:
         parts = shlex.split(args)
     except ValueError as e:
         console.print(f"  [{WARNING}]Failed to parse arguments: {e}[/]")
         return
-        
+
     if len(parts) != 2:
         console.print(f"  [{WARNING}]Usage: \\name \"Old Name\" \"New Name\"[/]")
         return
-        
+
     old_name, new_name = parts[0], parts[1]
     repo = session._get_repo()
     rec = repo.get_by_id(session.last_id)
     if not rec:
         return
-        
+
     # Update local segments
     from audiobench.core.db_session import get_session
     from audiobench.storage.models import SegmentRecord
-    
+
     with get_session() as db:
         segments = db.query(SegmentRecord).filter(
             SegmentRecord.transcription_id == session.last_id,
             SegmentRecord.speaker == old_name
         ).all()
-        
+
         if not segments:
             console.print(f"  [{WARNING}]Speaker '{old_name}' not found in this transcript.[/]")
             return
-            
+
         for seg in segments:
             seg.speaker = new_name
-            
+
         # Update speaker_map on the transcription record
         import json
         try:
@@ -972,12 +975,12 @@ def cmd_name(session: ReplSession, args: str) -> None:
             console.print(f"  [{WARNING}]Failed to update speaker_map: {e}[/]")
 
         db.commit()
-        
+
     # Update Global Speaker Profile
     try:
         from audiobench.memory.memory_store import SpeakerProfileStore
         profile_store = SpeakerProfileStore()
-        
+
         # We need to find the profile with old_name.
         # But LanceDB search is vector-based. We can filter by name.
         results = profile_store.table.search().where(f"name = '{old_name}'").limit(1).to_list()
@@ -1118,9 +1121,10 @@ def resume_config(session: ReplSession, frame) -> None:
 def cmd_obs(session: ReplSession, args: str) -> None:
     """Launch the Observatory live TUI. Usage: \\obs [--subsystem X] [--level L]"""
     import shlex
+
+    from audiobench.events import get_bus
     from audiobench.observatory.db import init_journal_db
     from audiobench.observatory.subscriber import get_subscriber
-    from audiobench.events import get_bus
 
     init_journal_db()
     get_bus().on("*", get_subscriber().record)
@@ -1154,6 +1158,7 @@ def cmd_logs(session: ReplSession, args: str) -> None:
       \logs --follow     — live tail mode
     """
     import shlex
+
     from audiobench.observatory.db import init_journal_db, query_events
 
     init_journal_db()
@@ -1181,7 +1186,7 @@ def cmd_logs(session: ReplSession, args: str) -> None:
 
     if follow:
         import time
-        console.print(f"[dim]Following Observatory events. Ctrl+C to stop.[/]\n")
+        console.print("[dim]Following Observatory events. Ctrl+C to stop.[/]\n")
         last_id = 0
         try:
             while True:
@@ -1433,8 +1438,9 @@ def cmd_enroll(session: ReplSession, args: str) -> None:
         \enroll ~/voice.opus "My Name"    Direct path + name, confirm only
     """
     from pathlib import Path
-    from audiobench.cli.display.theme import BOLD, BOX_STYLE
+
     from rich.panel import Panel
+
 
     # ── Resolve audio path ───────────────────────────────────────────────────
     parts = args.strip().split(None, 1) if args.strip() else []
@@ -1452,8 +1458,9 @@ def cmd_enroll(session: ReplSession, args: str) -> None:
             )
         )
         try:
-            from audiobench.cli.tui.import_tui import ImportFileManager
             import curses
+
+            from audiobench.cli.tui.import_tui import ImportFileManager
 
             AUDIO_EXTS = {
                 "mp3", "m4a", "m4b", "aac", "ogg", "opus", "flac",
@@ -1647,11 +1654,8 @@ def cmd_enroll(session: ReplSession, args: str) -> None:
         result = enroll(audio_path=audio_path, name=name)
 
         console.print(f"\n  [{SUCCESS}]✓ Voiceprint enrolled as '{result['name']}'[/]")
-        console.print(
-            f"  [{SUCCESS}]✓ {result['segments_tagged']:,} existing segments retroactively tagged Tier 2[/]"
-        )
         console.print(f"  [{SUCCESS}]✓ All future transcriptions will auto-tag on biometric pass[/]")
-        console.print(f"\n  Run [{ACCENT}]\\voices[/] to manage enrolled speakers.")
+        console.print(f"  [{DIM}]To retroactively tag existing recordings in your database, run [{ACCENT}]\\voices retag[/].[/]")
 
     except ImportError as e:
         console.print(f"  [{WARNING}]{e}[/]")
@@ -1678,8 +1682,8 @@ def cmd_voices(session: ReplSession, args: str) -> None:
     """
     import json
 
-    from audiobench.security.voiceprint import is_enrolled, get_enrollment_summary
     from audiobench.core.settings import get_settings
+    from audiobench.security.voiceprint import is_enrolled
 
     parts = args.strip().split()
     sub = parts[0].lower() if parts else ""
@@ -1696,8 +1700,13 @@ def cmd_voices(session: ReplSession, args: str) -> None:
     if sub == "retag":
         console.print(f"  [{DIM}]Re-running biometric pass on entire corpus...[/]")
         try:
-            from audiobench.security.voiceprint import _load_ecapa, _voiceprint_path, _retroactive_tag
             import numpy as np
+
+            from audiobench.security.voiceprint import (
+                _load_ecapa,
+                _retroactive_tag,
+                _voiceprint_path,
+            )
             model = _load_ecapa()
             enrolled_vec = np.load(str(_voiceprint_path())).astype("float32")
             n = _retroactive_tag(model, enrolled_vec)
@@ -1707,7 +1716,7 @@ def cmd_voices(session: ReplSession, args: str) -> None:
         return
 
     # ── Default: show status table ──
-    console.print(f"\n  [bold]Voice Management[/]")
+    console.print("\n  [bold]Voice Management[/]")
     console.print(f"  [{DIM}]{'─' * 60}[/]")
 
     if not is_enrolled():
