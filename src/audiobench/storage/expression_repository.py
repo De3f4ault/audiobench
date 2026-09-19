@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from sqlalchemy import asc, tuple_
+from sqlalchemy import asc
 
 from audiobench.core.db_session import get_session
 from audiobench.core.logger_factory import get_logger
@@ -145,10 +145,10 @@ class ExpressionRepository:
         items_to_process = list(unique_items.values())
 
         # ── Step 2: separate already-known from genuinely new ───────────────
-        # We NO LONGER drop `already_known` items early. 
-        # Even if we know an expression exists in SQLite via `known_hashes`, 
+        # We NO LONGER drop `already_known` items early.
+        # Even if we know an expression exists in SQLite via `known_hashes`,
         # we MUST query the DB for its ID so we can return the `ExpressionRecord`.
-        # If we drop it here, the caller (RAG sweep) will never pass it to LanceDB 
+        # If we drop it here, the caller (RAG sweep) will never pass it to LanceDB
         # for embedding, breaking startup recovery!
         need_db_lookup = items_to_process
         already_known = []
@@ -460,11 +460,16 @@ class ExpressionRepository:
                 try:
                     from audiobench.daemon.factory import get_daemon_client
                     client = get_daemon_client()
-                    for expr_id in expr_ids:
-                        try:
-                            client.delete(expr_id)
-                        except Exception as e:
-                            logger.warning("Failed to delete vector node %d from daemon: %s", expr_id, e)
+                    try:
+                        # Single batch IPC call — O(1) round-trips regardless of size
+                        client.delete_batch(expr_ids)
+                    except AttributeError:
+                        # Graceful fallback for older daemon builds during rolling restart
+                        for expr_id in expr_ids:
+                            try:
+                                client.delete(expr_id)
+                            except Exception as e:
+                                logger.warning("Failed to delete vector %d from daemon: %s", expr_id, e)
                 except Exception as e:
                     logger.warning("Could not connect to daemon for vector deletion: %s", e)
 

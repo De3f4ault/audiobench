@@ -36,9 +36,9 @@ class DaemonClient:
         import time
 
         logger.info("Spawning background daemon...")
-        log_file = open(
-            "/home/de3f4ault/Desktop/Projects/audiobench/data/logs/daemon_autostart.log", "w"
-        )
+        log_dir = Path(settings.data_dir) / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = open(log_dir / "daemon_autostart.log", "w")
         subprocess.Popen(
             [sys.executable, "-m", "audiobench", "daemon", "start"],
             stdin=subprocess.DEVNULL,
@@ -75,7 +75,8 @@ class DaemonClient:
         except Exception:
             return False
 
-    from typing import Any, Generator
+    from collections.abc import Generator
+    from typing import Any
 
     def _stream(self, cmd: str, args: dict[str, Any], _is_retry: bool = False) -> Generator[dict[str, Any], None, None]:
         """Send one JSON request and yield JSON response frames as they arrive."""
@@ -94,12 +95,12 @@ class DaemonClient:
                 if not chunk:
                     break
                 buf.extend(chunk)
-                
+
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     if not line.strip():
                         continue
-                    
+
                     response = json.loads(line.decode("utf-8"))
                     yield response
                     if response.get("status") in ("ok", "error") or ("success" in response and response.get("status") != "progress"):
@@ -159,7 +160,7 @@ class DaemonClient:
                 request_id = str(uuid.uuid4())
                 payload = json.dumps({"cmd": "ping", "args": {}, "request_id": request_id}) + "\n"
                 sock.sendall(payload.encode("utf-8"))
-                
+
                 buf = bytearray()
                 while True:
                     chunk = sock.recv(4096)
@@ -190,7 +191,7 @@ class DaemonClient:
         import logging
         if not self.ping():
             return
-            
+
         try:
             self._send("reload_settings", {})
         except Exception as e:
@@ -245,6 +246,12 @@ class DaemonClient:
         """Remove an expression from LanceDB."""
         self._send("delete", {"expression_id": expression_id})
 
+    def delete_batch(self, expression_ids: list[int]) -> None:
+        """Remove a batch of expressions from LanceDB."""
+        if not expression_ids:
+            return
+        self._send("delete_batch", {"expression_ids": [int(eid) for eid in expression_ids]})
+
     def status(self) -> dict:
         """Return daemon status dict."""
         return self._send("status", {})
@@ -281,15 +288,15 @@ class DaemonClient:
             "verb": verb,
             "context": context or {},
         }
-        
+
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(60.0)
         sock.connect(str(self._socket_path))
-        
+
         request_id = str(uuid.uuid4())
         payload = json.dumps({"cmd": "operate", "args": args, "request_id": request_id}) + "\n"
         sock.sendall(payload.encode("utf-8"))
-        
+
         buf = bytearray()
         try:
             while True:
@@ -297,11 +304,11 @@ class DaemonClient:
                 if not chunk:
                     break
                 buf.extend(chunk)
-                
+
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     response = json.loads(line.decode("utf-8"))
-                    
+
                     if response.get("status") == "progress":
                         yield response
                     elif response.get("status") == "ok":
@@ -437,3 +444,90 @@ class DaemonClient:
         """Request LanceDB optimization from the daemon."""
         return self._send("optimize", {})
 
+    # ------------------------------------------------------------------
+    # Universal Playback interface
+    # ------------------------------------------------------------------
+
+    def playback_play(
+        self,
+        file_path: str,
+        *,
+        start_pos: float = 0.0,
+        speed: float = 1.0,
+        audio_file_id: int | None = None,
+        transcription_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Start playback or seek within the current file.
+
+        Note: None-valued optional arguments are omitted from payload to minimize wire size.
+        """
+        args: dict[str, Any] = {
+            "file_path": file_path,
+            "start_pos": start_pos,
+            "speed": speed,
+        }
+        if audio_file_id is not None:
+            args["audio_file_id"] = audio_file_id
+        if transcription_id is not None:
+            args["transcription_id"] = transcription_id
+        return self._send("playback_play", args)
+
+    def playback_sync_session(
+        self,
+        file_path: str,
+        *,
+        transcription_id: int | None = None,
+        position: float = 0.0,
+        audio_file_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Sync playback session metadata without spawning a daemon mpv process."""
+        args: dict[str, Any] = {
+            "file_path": file_path,
+            "position": position,
+        }
+        if transcription_id is not None:
+            args["transcription_id"] = transcription_id
+        if audio_file_id is not None:
+            args["audio_file_id"] = audio_file_id
+        return self._send("playback_sync_session", args)
+
+    def playback_seek(self, position: float) -> dict[str, Any]:
+        """Seek to absolute position in seconds."""
+        return self._send("playback_seek", {"position": position})
+
+    def playback_seek_relative(self, offset: float) -> dict[str, Any]:
+        """Seek by relative offset in seconds."""
+        return self._send("playback_seek_relative", {"offset": offset})
+
+    def playback_pause(self) -> dict[str, Any]:
+        """Pause playback."""
+        return self._send("playback_pause", {})
+
+    def playback_resume(self) -> dict[str, Any]:
+        """Resume playback."""
+        return self._send("playback_resume", {})
+
+    def playback_toggle(self) -> dict[str, Any]:
+        """Toggle pause/play."""
+        return self._send("playback_toggle", {})
+
+    def playback_speed(self, speed: float) -> dict[str, Any]:
+        """Set playback speed."""
+        return self._send("playback_speed", {"speed": speed})
+
+    def playback_stop(self) -> dict[str, Any]:
+        """Stop playback and tear down mpv."""
+        return self._send("playback_stop", {})
+
+    def playback_status(self) -> dict[str, Any]:
+        """Return current playback status."""
+        return self._send("playback_status", {})
+
+    def playback_context(
+        self, position: float | None = None, window: int = 3
+    ) -> dict[str, Any]:
+        """Return transcript segments around current/given position."""
+        args: dict[str, Any] = {"window": window}
+        if position is not None:
+            args["position"] = position
+        return self._send("playback_context", args)

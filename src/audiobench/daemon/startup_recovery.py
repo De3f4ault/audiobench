@@ -17,8 +17,8 @@ Each step is idempotent. run() returns {step_name: recovered_count}.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 logger = logging.getLogger("audiobench.daemon.startup_recovery")
 
@@ -90,6 +90,7 @@ def GhostJobRecovery() -> int:
     Returns the count of jobs marked failed.
     """
     import os
+
     from audiobench.jobs.repository import JobRepository
 
     repo = JobRepository()
@@ -116,6 +117,7 @@ def UnindexedExpressionRecovery(sweep_state=None) -> int:
     Returns the count of expression IDs enqueued.
     """
     from sqlalchemy import text as sql_text
+
     from audiobench.core.db_session import get_session
 
     if sweep_state is None:
@@ -127,15 +129,64 @@ def UnindexedExpressionRecovery(sweep_state=None) -> int:
     with get_session() as session:
         rows = session.execute(
             sql_text("""
-            SELECT e.id, e.source_id 
+            SELECT e.id, e.source_id
             FROM expressions e
             JOIN transcriptions t ON e.source_id = t.id
             WHERE e.source_type = 'audio_transcript'
+              AND t.status = 'complete'
+              AND t.full_text IS NOT NULL
+              AND TRIM(t.full_text) != ''
+              AND (
+                  e.graph_role = 'sweep_chunk'
+                  OR (
+                      e.graph_role IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM expressions c
+                          WHERE c.source_id = e.source_id
+                            AND c.source_type = 'audio_transcript'
+                            AND c.graph_role = 'sweep_chunk'
+                      )
+                  )
+              )
             """)
+            # graph_role filter is intentional and load-bearing:
+            # Only sweep_chunk nodes (T3) are written to LanceDB. T1 (sweep_document)
+            # and T2 (sweep_passage) are graph-structure nodes that exist only in SQLite.
+            #
+            # NULL rows are included ONLY for transcripts that have no sweep_chunk
+            # children — i.e. genuine pre-Track-4-only transcripts whose flat rows
+            # were the sole LanceDB representation.  If a transcript already has
+            # sweep_chunk nodes, its NULL rows are orphaned residue from the old flat
+            # path that was superseded by Track 4 tiering; they were never written to
+            # LanceDB and including them would trigger a permanent boot loop where
+            # recovery resets is_indexed=0 every restart.
         ).fetchall()
 
     missing_tx = {r[1] for r in rows if r[0] not in indexed_ids and r[1] is not None}
-    if missing_tx:
+
+    # ── Pass 2: catch transcripts that are marked indexed but have NO expressions ──
+    # This happens when expressions were purged by migration, test teardown, or
+    # the is_indexed flag was set before the sweep could write expressions.
+    with get_session() as session:
+        orphan_tx_ids = set(
+            session.execute(
+                sql_text("""
+                    SELECT t.id FROM transcriptions t
+                    WHERE t.status = 'complete'
+                      AND t.is_indexed = 1
+                      AND t.full_text IS NOT NULL
+                      AND TRIM(t.full_text) != ''
+                      AND NOT EXISTS (
+                          SELECT 1 FROM expressions e
+                          WHERE e.source_type = 'audio_transcript'
+                            AND e.source_id = t.id
+                      )
+                """)
+            ).scalars().all()
+        )
+
+    all_to_reset = missing_tx | orphan_tx_ids
+    if all_to_reset:
         # Reset is_indexed=0 in SQLite so these transcripts are picked up by
         # the sweep loop's incremental refresh (which queries WHERE is_indexed=0)
         # on EVERY tick, not just once in the startup deque.  Without this reset
@@ -143,21 +194,22 @@ def UnindexedExpressionRecovery(sweep_state=None) -> int:
         # any restart that happens before the sweep finishes writing them.
         from audiobench.core.db_session import get_session as _gs2
         with _gs2() as s2:
-            ids_list = ", ".join(str(i) for i in missing_tx)
+            ids_list = ", ".join(str(i) for i in all_to_reset)
             s2.execute(
                 sql_text(
                     f"UPDATE transcriptions SET is_indexed=0 WHERE id IN ({ids_list})"
                 )
             )
             s2.commit()
-        sweep_state.push_transcripts(list(missing_tx))
+        sweep_state.push_transcripts(list(all_to_reset))
         logger.info(
             "UnindexedExpressionRecovery: reset is_indexed=0 and queued %d transcript(s) "
-            "to recover %d missing LanceDB expression(s).",
+            "(%d with missing LanceDB expressions, %d with zero SQLite expressions).",
+            len(all_to_reset),
             len(missing_tx),
-            sum(1 for r in rows if r[0] not in indexed_ids and r[1] in missing_tx),
+            len(orphan_tx_ids),
         )
-    return len(missing_tx)
+    return len(all_to_reset)
 
 
 def WorkAssignedBackfill() -> int:
@@ -168,9 +220,9 @@ def WorkAssignedBackfill() -> int:
     """
     import json
     import sqlite3
-    from audiobench.observatory.db import get_journal_db_path
+
     from audiobench.core.db_session import get_session
-    from sqlalchemy import text as sql_text
+    from audiobench.observatory.db import get_journal_db_path
 
     journal_path = get_journal_db_path()
     conn = sqlite3.connect(str(journal_path), timeout=5.0)
@@ -191,8 +243,8 @@ def WorkAssignedBackfill() -> int:
         if not events:
             return 0
 
-        from audiobench.storage.models import ExpressionRecord, TranscriptionRecord
         from audiobench.memory.enums import SourceType
+        from audiobench.storage.models import ExpressionRecord, TranscriptionRecord
 
         for event in events:
             try:

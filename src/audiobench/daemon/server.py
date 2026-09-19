@@ -17,9 +17,11 @@ import os
 import signal
 import sys
 import time
-import warnings
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from audiobench.playback.service import PlaybackService
 
 # Best-effort glibc page release after large embedding batches.  Only
 # available on Linux; silently skipped on other platforms.
@@ -44,10 +46,14 @@ def _release_pages() -> None:
 from audiobench.core.db_session import get_session
 from audiobench.core.logger_factory import get_logger
 from audiobench.core.settings import get_settings
-from audiobench.daemon.protocol import DaemonRequest, DaemonResponse
+from audiobench.daemon.protocol import DaemonRequest, DaemonResponse, DaemonError
 from audiobench.memory.chunking import content_aware_router
 from audiobench.memory.memory_store import MemoryStore, SegmentVectorStore
-from audiobench.memory.singletons import get_primary_embedder, get_reranker, pre_warm_retrieval_pipeline
+from audiobench.memory.singletons import (
+    get_primary_embedder,
+    get_reranker,
+    pre_warm_retrieval_pipeline,
+)
 from audiobench.storage.models import TranscriptionRecord
 from audiobench.supervisor.registry import upsert_process
 
@@ -55,11 +61,15 @@ logger = get_logger("daemon.server")
 
 # Module-level state (lives for the lifetime of the daemon process)
 _start_time: float = 0.0
-_last_request_time: float = time.time()
+_last_request_time: float = 0.0
+_active_clients: int = 0
+_query_cache: Any = None
 _memory_store: MemoryStore | None = None
 _segment_store: SegmentVectorStore | None = None
 import threading
+
 from audiobench.daemon.sweep_state import SweepState  # type hinting
+
 _sweep_state: SweepState | None = None  # loaded lazily
 
 _optimize_lock = threading.Lock()
@@ -88,10 +98,11 @@ def _get_segment_store() -> SegmentVectorStore:
 def _handle_ping(args: dict[str, Any]) -> dict[str, Any]:
     """Return daemon health and stats."""
     import psutil
-    from audiobench.daemon.sweep_state import get_sweep_state
+
     from audiobench.daemon.intelligence.calibration import get_calibration_tracker
     from audiobench.daemon.intelligence.timing_model import get_timing_model
-    
+    from audiobench.daemon.sweep_state import get_sweep_state
+
     process = psutil.Process()
     memory_mb = process.memory_info().rss / (1024 * 1024)
 
@@ -168,17 +179,27 @@ def _handle_delete(args: dict[str, Any]) -> dict[str, Any]:
     return {"deleted": True}
 
 
+def _handle_delete_batch(args: dict[str, Any]) -> dict[str, Any]:
+    """Delete a batch of expression nodes from LanceDB in a single operation."""
+    expression_ids = [int(eid) for eid in args.get("expression_ids", [])]
+    if expression_ids:
+        _get_store().delete_node_batch(expression_ids)
+    return {"deleted": len(expression_ids)}
+
+
 def _handle_status(args: dict[str, Any]) -> dict[str, Any]:
     """Return daemon and store statistics."""
     from audiobench.daemon.intelligence.timing_model import get_timing_model
     store = _get_store()
     node_count = store.count_nodes()
     timing_summary = get_timing_model().get_summary()
+    pb = _get_playback_service().status() if _playback_service is not None else {"playing": False}
     return {
         "uptime_seconds": round(time.time() - _start_time, 2),
         "embedding_model_version": store.model_version,
         "total_nodes": node_count,
         "timing_model": timing_summary,
+        "playback": pb,
     }
 
 
@@ -369,27 +390,27 @@ def _handle_autocomplete(args: dict[str, Any]) -> dict[str, Any]:
     """Semantic autocomplete fast-path."""
     from audiobench.daemon.autocomplete import get_autocomplete_index
     from audiobench.memory.singletons import get_primary_embedder, get_primary_inference_lock
-    
+
     prefix = str(args.get("prefix", ""))
     if not prefix:
         return {"results": []}
-        
+
     index = get_autocomplete_index()
     if not index.ready:
         return {"error": "INDEX_NOT_READY"}
-        
+
     model = get_primary_embedder()
     with get_primary_inference_lock():
         vector = model.encode(f"search_query: {prefix}").tolist()
-        
+
     results = index.lookup(vector, k=int(args.get("top_k", 5)))
-    
+
     expression_ids = [r["expression_id"] for r in results if "expression_id" in r]
     if expression_ids:
         from audiobench.storage.expression_repository import ExpressionRepository
         repo = ExpressionRepository()
         expr_map = repo.get_by_ids(expression_ids)
-        
+
         enriched_results = []
         for r in results:
             expr_id = r.get("expression_id")
@@ -406,9 +427,10 @@ def _handle_autocomplete(args: dict[str, Any]) -> dict[str, Any]:
 def _handle_confirm_inference(args: dict[str, Any]) -> dict[str, Any]:
     """Confirm a proposed system inference."""
     from sqlalchemy import text as sql_text
+
     from audiobench.core.db_session import get_session
     from audiobench.daemon.intelligence.calibration import get_calibration_tracker
-    
+
     expression_id = int(args["expression_id"])
     with get_session() as session:
         session.execute(
@@ -416,7 +438,7 @@ def _handle_confirm_inference(args: dict[str, Any]) -> dict[str, Any]:
             {"eid": expression_id}
         )
         session.commit()
-        
+
     get_calibration_tracker().record_confirm(expression_id)
     return {"status": "ok", "expression_id": expression_id, "action": "confirmed"}
 
@@ -424,9 +446,10 @@ def _handle_confirm_inference(args: dict[str, Any]) -> dict[str, Any]:
 def _handle_reject_inference(args: dict[str, Any]) -> dict[str, Any]:
     """Reject a proposed system inference."""
     from sqlalchemy import text as sql_text
+
     from audiobench.core.db_session import get_session
     from audiobench.daemon.intelligence.calibration import get_calibration_tracker
-    
+
     expression_id = int(args["expression_id"])
     with get_session() as session:
         session.execute(
@@ -434,7 +457,7 @@ def _handle_reject_inference(args: dict[str, Any]) -> dict[str, Any]:
             {"eid": expression_id}
         )
         session.commit()
-        
+
     get_calibration_tracker().record_reject(expression_id)
     return {"status": "ok", "expression_id": expression_id, "action": "rejected"}
 
@@ -451,6 +474,7 @@ def _handle_authorize_proposal(args: dict[str, Any]) -> dict[str, Any]:
 def _handle_get_inferences(args: dict[str, Any]) -> dict[str, Any]:
     """Return proposed system inferences for the InferencesFeed panel."""
     from sqlalchemy import text as sql_text
+
     from audiobench.core.db_session import get_session
 
     with get_session() as session:
@@ -475,6 +499,7 @@ def _handle_get_inferences(args: dict[str, Any]) -> dict[str, Any]:
 def _handle_get_proposals(args: dict[str, Any]) -> dict[str, Any]:
     """Return pending daemon proposals for the ProposalsFeed panel."""
     from sqlalchemy import text as sql_text
+
     from audiobench.core.db_session import get_session
 
     with get_session() as session:
@@ -501,12 +526,12 @@ def _handle_optimize(args: dict[str, Any]) -> dict[str, Any]:
     """Run LanceDB optimize on all tables (on-demand via CLI)."""
     from audiobench.daemon.lancedb_optimizer import _do_optimize_all_tables
     global _optimize_in_progress
-    
+
     with _optimize_lock:
         if _optimize_in_progress:
             return {"error": "Optimization already in progress"}
         _optimize_in_progress = True
-        
+
     try:
         result = _do_optimize_all_tables(triggered_by="cli_command")
         return result
@@ -522,12 +547,103 @@ def _handle_reload_settings(args: dict[str, Any]) -> dict[str, Any]:
     return {"status": "ok"}
 
 
+_playback_service: PlaybackService | None = None
+
+
+def _get_playback_service() -> PlaybackService:
+    global _playback_service
+    if _playback_service is None:
+        from audiobench.playback.service import PlaybackService
+
+        _playback_service = PlaybackService()
+    return _playback_service
+
+
+def _handle_playback_play(args: dict[str, Any]) -> dict[str, Any]:
+    svc = _get_playback_service()
+    return svc.play(
+        args["file_path"],
+        start_pos=float(args.get("start_pos", 0.0)),
+        speed=float(args.get("speed", 1.0)),
+        audio_file_id=args.get("audio_file_id"),
+        transcription_id=args.get("transcription_id"),
+    )
+
+
+def _handle_playback_sync_session(args: dict[str, Any]) -> dict[str, Any]:
+    svc = _get_playback_service()
+    return svc.sync_session(
+        args["file_path"],
+        transcription_id=args.get("transcription_id"),
+        position=float(args.get("position", 0.0)),
+        audio_file_id=args.get("audio_file_id"),
+    )
+
+
+def _handle_playback_seek(args: dict[str, Any]) -> dict[str, Any]:
+    svc = _get_playback_service()
+    return svc.seek(float(args["position"]))
+
+
+def _handle_playback_seek_relative(args: dict[str, Any]) -> dict[str, Any]:
+    svc = _get_playback_service()
+    return svc.seek_relative(float(args.get("offset", 0.0)))
+
+
+def _handle_playback_pause(args: dict[str, Any]) -> dict[str, Any]:
+    svc = _get_playback_service()
+    return svc.pause()
+
+
+def _handle_playback_resume(args: dict[str, Any]) -> dict[str, Any]:
+    svc = _get_playback_service()
+    return svc.resume()
+
+
+def _handle_playback_toggle(args: dict[str, Any]) -> dict[str, Any]:
+    svc = _get_playback_service()
+    return svc.toggle()
+
+
+def _handle_playback_speed(args: dict[str, Any]) -> dict[str, Any]:
+    svc = _get_playback_service()
+    return svc.set_speed(float(args["speed"]))
+
+
+def _handle_playback_stop(args: dict[str, Any]) -> dict[str, Any]:
+    svc = _get_playback_service()
+    return svc.stop()
+
+
+def _handle_playback_status(args: dict[str, Any]) -> dict[str, Any]:
+    if _playback_service is None:
+        return {
+            "playing": False,
+            "paused": False,
+            "position": 0.0,
+            "duration": 0.0,
+            "speed": 1.0,
+            "file": None,
+            "audio_file_id": None,
+            "transcription_id": None,
+        }
+    return _playback_service.status()
+
+
+def _handle_playback_context(args: dict[str, Any]) -> dict[str, Any]:
+    svc = _get_playback_service()
+    pos = float(args["position"]) if "position" in args and args["position"] is not None else None
+    window = int(args.get("window", 3))
+    return svc.get_context_window(position=pos, window=window)
+
+
 _HANDLERS: dict[str, Any] = {
     "reload_settings": _handle_reload_settings,
     "ping": _handle_ping,
     "embed": _handle_embed,
     "search": _handle_search,
     "delete": _handle_delete,
+    "delete_batch": _handle_delete_batch,
     "status": _handle_status,
     "chunk": _handle_chunk,
     "rerank": _handle_rerank,
@@ -547,6 +663,17 @@ _HANDLERS: dict[str, Any] = {
     "unregister_process": _handle_unregister_process,
     "log_events": _handle_log_events,
     "optimize": _handle_optimize,
+    "playback_play": _handle_playback_play,
+    "playback_sync_session": _handle_playback_sync_session,
+    "playback_seek": _handle_playback_seek,
+    "playback_seek_relative": _handle_playback_seek_relative,
+    "playback_pause": _handle_playback_pause,
+    "playback_resume": _handle_playback_resume,
+    "playback_toggle": _handle_playback_toggle,
+    "playback_speed": _handle_playback_speed,
+    "playback_stop": _handle_playback_stop,
+    "playback_status": _handle_playback_status,
+    "playback_context": _handle_playback_context,
 }
 
 
@@ -555,14 +682,15 @@ _HANDLERS: dict[str, Any] = {
 # ---------------------------------------------------------------------------
 
 
-from typing import AsyncGenerator
 import inspect
+from collections.abc import AsyncGenerator
+
 
 async def _dispatch(raw: str) -> AsyncGenerator[str, None]:
     """Parse a JSON request line, call handler, yield JSON response lines."""
     global _last_request_time
     _last_request_time = time.time()
-    
+
     request_id = "unknown"
     try:
         req: DaemonRequest = json.loads(raw)
@@ -585,12 +713,12 @@ async def _dispatch(raw: str) -> AsyncGenerator[str, None]:
             yield json.dumps(response)
     except Exception as exc:
         logger.exception("Error handling request %s", request_id)
-        error_payload = {
+        error_payload: DaemonError = {
             "code": "OPERATION_FAILED",
             "message": str(exc),
-            "request_id": request_id
+            "request_id": str(request_id)
         }
-        response = {"status": "error", "success": False, "error": error_payload, "request_id": request_id}
+        response: DaemonResponse = {"status": "error", "success": False, "error": error_payload, "request_id": str(request_id)}
         yield json.dumps(response)
 
 
@@ -607,13 +735,13 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
         if not raw:
             return
         raw_str = raw.decode("utf-8").strip()
-        
+
         # Before logging, check if it's autocomplete (high-frequency, low-signal)
         try:
             parsed_cmd = json.loads(raw_str).get("cmd", "") if raw_str else ""
         except json.JSONDecodeError:
             parsed_cmd = ""
-            
+
         if parsed_cmd != "autocomplete":
             logger.debug("Received from %s: %s", peer, raw_str[:120])
 
@@ -732,10 +860,11 @@ def _cleanup(socket_path: Path, pid_path: Path) -> None:
 
 def _do_sweep_once() -> None:
     """Perform one pass of the RAG consistency sweep (called from the loop)."""
+    from sqlalchemy import text as sql_text
+
     from audiobench.daemon.sweep_state import get_sweep_state
     from audiobench.memory.enums import SourceType
     from audiobench.storage.expression_repository import ExpressionRepository
-    from sqlalchemy import text as sql_text
 
     state = get_sweep_state()
 
@@ -778,32 +907,34 @@ def _do_sweep_once() -> None:
 
                 chunks = content_aware_router(text)
                 if chunks:
-                    from audiobench.memory.chunking import parent_child_grouper, _clean_text
+                    from audiobench.memory.chunking import _clean_text, parent_child_grouper
                     from audiobench.memory.enums import RelationType
-                    
+
                     parent_groups = parent_child_grouper(chunks)
                     nodes = []
-                    
-                    # Tier 1
+
+                    # Tier 1: full-text document node (not embedded in LanceDB)
                     cleaned_text = _clean_text(text)
                     t1_expr = expr_repo.register(
                         content=cleaned_text,
                         source_type=SourceType.AUDIO_TRANSCRIPT.value,
                         source_id=tx["id"],
                         work_id=tx["work_id"],
+                        graph_role="sweep_document",
                     )
-                    
+
                     for pg in parent_groups:
-                        # Tier 2
+                        # Tier 2: passage/context group node (not embedded in LanceDB)
                         t2_expr = expr_repo.register(
                             content=pg.parent_text,
                             source_type=SourceType.AUDIO_TRANSCRIPT.value,
                             source_id=tx["id"],
                             work_id=tx["work_id"],
+                            graph_role="sweep_passage",
                         )
                         expr_repo.link(t2_expr.id, t1_expr.id, RelationType.SOURCE.value)
-                        
-                        # Tier 3
+
+                        # Tier 3: embedded leaf node (written to LanceDB)
                         for child in pg.children:
                             t3_expr = expr_repo.register(
                                 content=child.content,
@@ -811,9 +942,10 @@ def _do_sweep_once() -> None:
                                 source_id=tx["id"],
                                 speaker=child.speaker,
                                 work_id=tx["work_id"],
+                                graph_role="sweep_chunk",
                             )
                             expr_repo.link(t3_expr.id, t2_expr.id, RelationType.SOURCE.value)
-                            
+
                             nodes.append({
                                 "expression_id": t3_expr.id,
                                 "content": child.content,
@@ -856,7 +988,67 @@ def _do_sweep_once() -> None:
         if failed_ids:
             state.requeue_transcripts(failed_ids)
 
+    # ── Search query sweep (query deque → expressions → LanceDB) ────────────
+    # Ingests completed search queries as SEARCH_QUERY + SEARCH_SYNTHESIS
+    # expressions, builds ELABORATES / THEMATIC / TEMPORAL relations, and
+    # embeds both into LanceDB.  First pass retroactively covers all existing
+    # sessions; subsequent passes handle new queries within 5 minutes.
+    query_ids = state.pop_query_batch(size=50)
+    if not query_ids:
+        logger.debug("RAG sweep: all search queries ingested (deque empty).")
+    else:
+        logger.info(
+            "RAG sweep: ingesting %d search queries as expressions...", len(query_ids)
+        )
+        from audiobench.memory.search_ingester import SearchIngester
+        _ingester = SearchIngester()
+        q_success_ids: list[int] = []
+        q_failed_ids: list[int] = []
+        for qid in query_ids:
+            try:
+                _ingester.ingest_query(qid)
+                q_success_ids.append(qid)
+            except Exception as exc:
+                logger.error(
+                    "RAG sweep: failed to ingest search query %d: %s", qid, exc
+                )
+                q_failed_ids.append(qid)
+        if q_failed_ids:
+            state.requeue_queries(q_failed_ids)
+        logger.info(
+            "RAG sweep: ingested %d search queries as expressions (%d failed).",
+            len(q_success_ids), len(q_failed_ids),
+        )
+
+    # ── Search summary sweep (session deque → SEARCH_SESSION_SUMMARY exprs) ─
+    # Ingests AI-generated session summaries as expressions with INSPIRED_BY
+    # links to all constituent query expressions.
+    summary_session_ids = state.pop_summary_session_batch(size=20)
+    if summary_session_ids:
+        logger.info(
+            "RAG sweep: ingesting %d session summaries as expressions...",
+            len(summary_session_ids),
+        )
+        from audiobench.memory.search_ingester import SearchIngester as _SI
+        _sum_ingester = _SI()
+        s_failed_ids: list[int] = []
+        for sid in summary_session_ids:
+            try:
+                _sum_ingester.ingest_session_summary(sid)
+            except Exception as exc:
+                logger.error(
+                    "RAG sweep: failed to ingest session summary %d: %s", sid, exc
+                )
+                s_failed_ids.append(sid)
+        if s_failed_ids:
+            state.requeue_summary_sessions(s_failed_ids)
+        logger.info(
+            "RAG sweep: ingested %d session summaries (%d failed).",
+            len(summary_session_ids) - len(s_failed_ids), len(s_failed_ids),
+        )
+
     # ── Segment sweep (segment deque → batch embed → LanceDB + SQLite) ─────
+
     #
     # Sub-batch at 64 segments per iteration rather than pulling 256 at once.
     #
@@ -1009,15 +1201,16 @@ def _do_sweep_once() -> None:
     reconciled = _reconcile_metadata()
     if reconciled > 0:
         logger.info("RAG sweep: reconciled metadata for %d expressions.", reconciled)
-        
+
     _maybe_trigger_threshold_optimize()
 
 
 def _reconcile_metadata() -> int:
     """Drain the reconciliation_queue and update LanceDB metadata."""
-    from audiobench.observatory.db import get_journal_db_path
     import sqlite3
-    
+
+    from audiobench.observatory.db import get_journal_db_path
+
     conn = sqlite3.connect(str(get_journal_db_path()), timeout=5.0)
     conn.row_factory = sqlite3.Row
     try:
@@ -1026,17 +1219,17 @@ def _reconcile_metadata() -> int:
         ).fetchall()
         if not rows:
             return 0
-        
+
         store = _get_store()
         for row in rows:
             store.update_expression_work_id(
                 expression_id=row["expression_id"],
                 work_id=row["work_id"]
             )
-            
+
         ids = [row["id"] for row in rows]
         conn.execute(
-            f"DELETE FROM reconciliation_queue WHERE id IN ({','.join('?' * len(ids))})", 
+            f"DELETE FROM reconciliation_queue WHERE id IN ({','.join('?' * len(ids))})",
             ids
         )
         conn.commit()
@@ -1052,28 +1245,28 @@ def _maybe_trigger_threshold_optimize() -> None:
     """Check write threshold and run optimize in background if exceeded."""
     from audiobench.core.settings import get_settings
     from audiobench.daemon.lancedb_optimizer import read_optimize_state
-    
+
     settings = get_settings()
     threshold = settings.lancedb_optimize_write_threshold
     if threshold <= 0:
         return
-        
+
     state = read_optimize_state()
     current_writes = state["unoptimized_writes"]
-        
+
     if current_writes >= threshold:
         global _optimize_in_progress
         with _optimize_lock:
             if _optimize_in_progress:
                 return
             _optimize_in_progress = True
-            
+
         logger.info("Write threshold reached (%d >= %d). Triggering background optimize.", current_writes, threshold)
-        
+
         def run_bg() -> None:
             from audiobench.daemon.lancedb_optimizer import _do_optimize_all_tables
             global _optimize_in_progress
-            
+
             try:
                 _do_optimize_all_tables(triggered_by="write_threshold")
             except Exception as e:
@@ -1081,7 +1274,7 @@ def _maybe_trigger_threshold_optimize() -> None:
             finally:
                 with _optimize_lock:
                     _optimize_in_progress = False
-                    
+
         threading.Thread(target=run_bg, name="lancedb-optimize-bg", daemon=True).start()
 
 
@@ -1093,6 +1286,7 @@ def _refresh_sweep_state_incremental(state) -> None:
     re-queuing duplicates after restarts while still catching new work.
     """
     from sqlalchemy import text as sql_text
+
     from audiobench.core.db_session import get_session as _gs
 
     try:
@@ -1122,8 +1316,49 @@ def _refresh_sweep_state_incremental(state) -> None:
                 logger.debug(
                     "SweepState refresh: +%d new segment IDs", len(fresh_seg)
                 )
+
+            # New uningested search queries
+            new_queries = session.execute(
+                sql_text(
+                    "SELECT sq.id FROM search_queries sq "
+                    "WHERE NOT EXISTS ( "
+                    "    SELECT 1 FROM expressions e "
+                    "    WHERE e.source_type = 'search_query' "
+                    "      AND e.source_id = sq.id "
+                    ") ORDER BY sq.id"
+                )
+            ).scalars().all()
+            queued_q = set(state.uningested_query_ids)
+            fresh_q = [i for i in new_queries if i not in queued_q]
+            if fresh_q:
+                state.push_queries(fresh_q)
+                logger.debug(
+                    "SweepState refresh: +%d new search query IDs", len(fresh_q)
+                )
+
+            # New uningested session summaries
+            new_summaries = session.execute(
+                sql_text(
+                    "SELECT ss.id FROM search_sessions ss "
+                    "WHERE ss.session_summary IS NOT NULL "
+                    "  AND NOT EXISTS ( "
+                    "      SELECT 1 FROM expressions e "
+                    "      WHERE e.source_type = 'search_session_summary' "
+                    "        AND e.source_id = ss.id "
+                    "  ) ORDER BY ss.id"
+                )
+            ).scalars().all()
+            queued_s = set(state.uningested_summary_session_ids)
+            fresh_s = [i for i in new_summaries if i not in queued_s]
+            if fresh_s:
+                for _sid in fresh_s:
+                    state.push_summary_session(_sid)
+                logger.debug(
+                    "SweepState refresh: +%d new session summary IDs", len(fresh_s)
+                )
     except Exception as exc:
         logger.warning("SweepState incremental refresh failed: %s", exc)
+
 
 
 # Circuit breaker threshold — how many consecutive sweep failures before the loop
@@ -1149,7 +1384,7 @@ def _rag_consistency_sweep_sync() -> None:
 
     # Initial delay — let the daemon become ready first.
     time.sleep(10)
-    
+
     settings = get_settings()
     from audiobench.daemon.lancedb_optimizer import _should_optimize_on_startup
     if _should_optimize_on_startup(settings.lancedb_optimize_interval_days):
@@ -1250,29 +1485,32 @@ async def _serve(socket_path: Path, pid_path: Path) -> None:
     await asyncio.get_running_loop().run_in_executor(None, get_autocomplete_index().build)
 
     from audiobench.daemon.intelligence import IntelligenceScheduler
-    from audiobench.daemon.intelligence.pattern_detector import PatternDetector
-    from audiobench.daemon.intelligence.drift_detector import DriftDetector
-    from audiobench.daemon.intelligence.connection_surfer import ConnectionSurfer
     from audiobench.daemon.intelligence.blind_spot_detector import BlindSpotDetector
-    from audiobench.daemon.intelligence.proposal_generator import ProposalGenerator
+    from audiobench.daemon.intelligence.connection_surfer import ConnectionSurfer
+    from audiobench.daemon.intelligence.drift_detector import DriftDetector
     from audiobench.daemon.intelligence.operator_registry import get_operator_registry
-    
+    from audiobench.daemon.intelligence.pattern_detector import PatternDetector
+    from audiobench.daemon.intelligence.proposal_generator import ProposalGenerator
+    from audiobench.daemon.intelligence.search_session_sweep import SearchSessionSweep
+
     # Load dynamic operators
     get_operator_registry().load_from_db(_get_store() if _memory_store else None)
-    
+
     scheduler = IntelligenceScheduler()
     scheduler.register(PatternDetector())
     scheduler.register(DriftDetector())
     scheduler.register(ConnectionSurfer())
     scheduler.register(BlindSpotDetector())
     scheduler.register(ProposalGenerator())
+    scheduler.register(SearchSessionSweep())   # search knowledge layer
     asyncio.create_task(scheduler.run_loop())
+
 
     _start_time = time.time()
     _write_pid_file(pid_path)
     server = await asyncio.start_unix_server(
-        _handle_connection, 
-        path=str(socket_path), 
+        _handle_connection,
+        path=str(socket_path),
         limit=104857600  # 100MB limit for massive transcript JSON payloads
     )
     logger.info("Daemon listening on %s (pid=%d)", socket_path, os.getpid())
@@ -1319,12 +1557,13 @@ async def _serve(socket_path: Path, pid_path: Path) -> None:
 def _handle_work_assigned(audio_file_id: int, work_id: int, **kwargs: Any) -> None:
     """Handle a work_assigned event (W3 stub / W4 queue insert)."""
     logger.info("Received work_assigned event for audio_file_id=%d -> work_id=%d", audio_file_id, work_id)
-    
+
+    import sqlite3
+
     from audiobench.core.db_session import get_session
-    from audiobench.storage.models import ExpressionRecord, TranscriptionRecord
     from audiobench.memory.enums import SourceType
     from audiobench.observatory.db import get_journal_db_path
-    import sqlite3
+    from audiobench.storage.models import ExpressionRecord
 
     try:
         with get_session() as session:
@@ -1344,7 +1583,7 @@ def _handle_work_assigned(audio_file_id: int, work_id: int, **kwargs: Any) -> No
         try:
             tuples = [(eid, work_id) for eid in expr_ids]
             conn.executemany(
-                "INSERT INTO reconciliation_queue (expression_id, work_id) VALUES (?, ?)", 
+                "INSERT INTO reconciliation_queue (expression_id, work_id) VALUES (?, ?)",
                 tuples
             )
             conn.commit()
@@ -1397,9 +1636,9 @@ def run() -> None:
     logger.info("Single-instance lock acquired (pid=%d, lock=%s).", os.getpid(), lock_path)
 
     # ── All clear — proceed with startup ──────────────────────────────────
+    from audiobench.events import get_bus
     from audiobench.observatory.db import init_journal_db
     from audiobench.observatory.subscriber import get_subscriber
-    from audiobench.events import get_bus
 
     init_journal_db()
     get_bus().on("*", get_subscriber().record)
