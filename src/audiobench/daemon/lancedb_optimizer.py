@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import random
 import time
 from pathlib import Path
 from typing import Any
@@ -36,7 +37,7 @@ def read_optimize_state() -> dict[str, Any]:
     if not state_file.exists():
         return state
     try:
-        with open(state_file, "r", encoding="utf-8") as f:
+        with open(state_file, encoding="utf-8") as f:
             data = json.load(f)
             last_opt = data.get("last_optimized_at")
             if last_opt:
@@ -54,19 +55,19 @@ def increment_unoptimized_writes(count: int) -> int:
     """Atomically increment the unoptimized writes counter and return the new total."""
     state_file = _get_state_file_path()
     temp_file = state_file.with_suffix(".json.tmp")
-    
+
     # Read existing
     data = {"unoptimized_writes": 0}
     if state_file.exists():
         try:
-            with open(state_file, "r", encoding="utf-8") as f:
+            with open(state_file, encoding="utf-8") as f:
                 data = json.load(f)
         except Exception:
             pass
-            
+
     new_total = data.get("unoptimized_writes", 0) + count
     data["unoptimized_writes"] = new_total
-    
+
     # Write back
     try:
         with open(temp_file, "w", encoding="utf-8") as f:
@@ -79,7 +80,7 @@ def increment_unoptimized_writes(count: int) -> int:
                 temp_file.unlink()
             except Exception:
                 pass
-                
+
     return new_total
 
 
@@ -110,12 +111,12 @@ def _should_optimize_on_startup(interval_days: int) -> bool:
     """Determine if optimization is needed based on the startup check policy."""
     if interval_days < 0:
         return False
-        
+
     state = read_optimize_state()
     last_optimized = state["last_optimized_at"]
     if last_optimized is None:
         return True
-        
+
     now = datetime.datetime.now(datetime.UTC)
     delta = now - last_optimized
     return delta.total_seconds() >= (interval_days * 86400)
@@ -135,6 +136,25 @@ def _get_dir_size(path: Path) -> int:
     return total_size
 
 
+def _optimize_with_retry(table: Any, table_name: str, max_attempts: int = 3) -> None:
+    """Optimize a table with exponential backoff on retryable commit conflicts."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            table.optimize(cleanup_older_than=datetime.timedelta(days=7))
+            return
+        except Exception as e:
+            if "Retryable commit conflict" in str(e) and attempt < max_attempts:
+                wait = 0.5 * (2 ** (attempt - 1)) + random.uniform(0, 0.2)
+                logger.warning(
+                    "Optimize '%s' hit retryable conflict (attempt %d/%d), "
+                    "retrying in %.2fs...",
+                    table_name, attempt, max_attempts, wait,
+                )
+                time.sleep(wait)
+            else:
+                raise
+
+
 def _do_optimize_all_tables(triggered_by: str = "cli_command") -> dict[str, Any]:
     """
     Run LanceDB optimization on all tables in the database.
@@ -143,11 +163,11 @@ def _do_optimize_all_tables(triggered_by: str = "cli_command") -> dict[str, Any]
     """
     settings = get_settings()
     lancedb_dir = settings.lancedb_path
-    
+
     # Read how many writes we are clearing
     state = read_optimize_state()
     cleared_writes = state["unoptimized_writes"]
-    
+
     if not lancedb_dir.exists():
         return {
             "tables_optimized": [],
@@ -155,15 +175,15 @@ def _do_optimize_all_tables(triggered_by: str = "cli_command") -> dict[str, Any]
             "last_optimized_at": datetime.datetime.now(datetime.UTC).isoformat(),
             "cleared_writes": cleared_writes,
         }
-        
+
     db = lancedb.connect(str(lancedb_dir))
     tables = db.table_names()
-    
+
     start_time = time.time()
     optimized_tables = []
-    
+
     bytes_before = _get_dir_size(lancedb_dir)
-    
+
     for table_name in tables:
         try:
             logger.info("Optimizing LanceDB table '%s'...", table_name)
@@ -181,25 +201,23 @@ def _do_optimize_all_tables(triggered_by: str = "cli_command") -> dict[str, Any]
             # That FTS index has been permanently dropped (repair_expressions_table.py)
             # and is no longer created (memory_store.py). Optimize is now safe on
             # all tables.
-            table.optimize(
-                cleanup_older_than=datetime.timedelta(days=7),
-            )
+            _optimize_with_retry(table, table_name)
             optimized_tables.append(table_name)
         except Exception as e:
             logger.error("Failed to optimize table '%s': %s", table_name, e, exc_info=True)
 
-            
+
     duration = time.time() - start_time
-    
+
     bytes_after = _get_dir_size(lancedb_dir)
     bytes_freed = max(0, bytes_before - bytes_after)
-    
+
     # Update state file
     write_last_optimized(triggered_by)
     now_str = datetime.datetime.now(datetime.UTC).isoformat()
-    
-    logger.info("LanceDB optimization complete in %.2fs for %d tables (Freed %d bytes, Cleared %d writes).", duration, len(optimized_tables), bytes_freed, cleared_writes)
-    
+
+    logger.info("LanceDB optimization complete in %.2fs for %d tables (Freed %.1f MiB, Cleared %d writes).", duration, len(optimized_tables), bytes_freed / 1024 / 1024, cleared_writes)
+
     return {
         "tables_optimized": optimized_tables,
         "duration_seconds": duration,

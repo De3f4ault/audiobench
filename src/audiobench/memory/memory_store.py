@@ -84,13 +84,20 @@ class MemoryStore:
         # Scalar index on expression_id is required for merge_insert performance.
         # Without it merge_insert does a full table scan and runs ~1.7x slower
         # than the old delete+add (measured: 22.7ms vs 12.9ms on 10k rows).
-        # create_scalar_index is idempotent — LanceDB treats it as a no-op if
-        # the index already exists, so this is safe to call on every startup.
-        # NOTE: Idempotency confirmed empirically against lancedb==0.25.2, not
-        # documented API guarantees — re-verify on version bump.
+        # NOTE: In lance-0.38.2, create_scalar_index is NOT idempotent — it always
+        # submits a CreateIndex transaction and bumps table version. Calling it
+        # unconditionally races concurrent Rewrite transactions (e.g. optimizer)
+        # leading to "Retryable commit conflict". We check existing indices first.
         try:
             tbl = self.db.open_table(self.table_name)
-            tbl.create_scalar_index("expression_id")
+            existing_indices = tbl.list_indices()
+            has_expr_idx = any(
+                getattr(idx, "name", "") == "expression_id_idx"
+                or "expression_id" in getattr(idx, "columns", [])
+                for idx in existing_indices
+            )
+            if not has_expr_idx:
+                tbl.create_scalar_index("expression_id")
         except Exception as _idx_exc:
             # Non-fatal: merge_insert still works without the index, just slower.
             logger.warning("Could not create scalar index on expression_id: %s", _idx_exc)
@@ -138,8 +145,9 @@ class MemoryStore:
         # Persist the inference_status flag if the column exists on the model
         if inference_status is not None:
             try:
-                from audiobench.core.db_session import get_session as _gs
                 from sqlalchemy import text as _t
+
+                from audiobench.core.db_session import get_session as _gs
                 with _gs() as _s:
                     _s.execute(
                         _t("UPDATE expressions SET inference_status = :status WHERE id = :id"),
@@ -354,6 +362,13 @@ class MemoryStore:
         """Delete an expression node from LanceDB."""
         self.table.delete(f"expression_id = {expression_id}")
 
+    def delete_node_batch(self, expression_ids: list[int]) -> None:
+        """Delete multiple expression nodes from LanceDB in a single operation."""
+        if not expression_ids:
+            return
+        ids_str = ", ".join(str(int(i)) for i in expression_ids)
+        self.table.delete(f"expression_id IN ({ids_str})")
+
     def get_vectors(self, expression_ids: list[int]) -> dict[int, list[float]]:
         """Retrieve vectors for a list of expression IDs."""
         if not expression_ids:
@@ -454,16 +469,16 @@ class SpeakerProfileStore:
         """
         if self.table.count_rows() == 0:
             return None
-            
+
         results = self.table.search(voice_print).limit(1).to_list()
-        
+
         if results:
             best_match = results[0]
             # LanceDB distance is typically 1 - cosine_similarity for vectors
             # So a cosine similarity of 0.82 means distance of 0.18
             distance = float(best_match.get("_distance", 1.0))
             max_distance = 1.0 - threshold
-            
+
             if distance <= max_distance:
                 logger.info(
                     "Voice matched! '%s' (dist: %.4f < %.4f)",
@@ -475,7 +490,7 @@ class SpeakerProfileStore:
                     "Voice NOT matched. Closest was '%s' (dist: %.4f > %.4f)",
                     best_match["name"], distance, max_distance
                 )
-                
+
         return None
 
     def save_speaker(self, profile_id: str, name: str, voice_print: list[float]) -> None:
@@ -707,16 +722,16 @@ class SegmentVectorStore:
         """
         if self.table.count_rows() == 0:
             return None
-            
+
         results = self.table.search(voice_print).limit(1).to_list()
-        
+
         if results:
             best_match = results[0]
             # LanceDB distance is typically 1 - cosine_similarity for vectors
             # So a cosine similarity of 0.82 means distance of 0.18
             distance = float(best_match.get("_distance", 1.0))
             max_distance = 1.0 - threshold
-            
+
             if distance <= max_distance:
                 logger.info(
                     "Voice matched! '%s' (dist: %.4f < %.4f)",
@@ -728,7 +743,7 @@ class SegmentVectorStore:
                     "Voice NOT matched. Closest was '%s' (dist: %.4f > %.4f)",
                     best_match["name"], distance, max_distance
                 )
-                
+
         return None
 
     def save_speaker(self, profile_id: str, name: str, voice_print: list[float]) -> None:

@@ -28,6 +28,7 @@ All expressions carry:
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from audiobench.core.db_session import get_session
 from audiobench.memory.enums import RelationType, SessionType, SourceType
@@ -39,8 +40,20 @@ logger = logging.getLogger("audiobench.memory.search_ingester")
 class SearchIngester:
     """Bridges completed search queries and session summaries into the expression graph."""
 
-    def __init__(self) -> None:
+    def __init__(self, store: Any | None = None) -> None:
         self._expr_repo = ExpressionRepository()
+        self._store = store
+
+    @property
+    def store(self) -> Any:
+        if self._store is None:
+            try:
+                from audiobench.daemon.server import _get_store
+                self._store = _get_store()
+            except Exception:
+                from audiobench.memory.memory_store import MemoryStore
+                self._store = MemoryStore()
+        return self._store
 
     # ------------------------------------------------------------------
     # Public API (called by the daemon sweep)
@@ -255,7 +268,11 @@ class SearchIngester:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _resolve_fragment_expression_id(self, segment_id: int) -> int | None:
+    def _resolve_fragment_expression_id(
+        self,
+        segment_id: int,
+        deferred_tx_ids: set[int] | None = None,
+    ) -> int | None:
         """
         Resolve a ``segment_id`` from ``search_query_fragments`` to the
         corresponding expression in the expression graph.
@@ -304,6 +321,10 @@ class SearchIngester:
             return None
 
         transcription_id: int = seg_row[0]
+        if deferred_tx_ids is not None and transcription_id in deferred_tx_ids:
+            # Short-circuit: already known to be unswept in this cycle
+            return None
+
         seg_text: str = (seg_row[1] or "").strip()
 
         # ── Step 2a: match sweep_chunk by content substring ────────────
@@ -352,11 +373,20 @@ class SearchIngester:
             return int(doc_row[0])
 
         # Transcription has never been swept — defer
-        logger.debug(
-            "SearchIngester: segment_id=%d transcription_id=%d has no "
-            "expression yet (not swept) — THEMATIC link deferred",
-            segment_id, transcription_id,
-        )
+        if deferred_tx_ids is not None:
+            if transcription_id not in deferred_tx_ids:
+                logger.debug(
+                    "SearchIngester: segment_id=%d transcription_id=%d has no "
+                    "expression yet (not swept) — THEMATIC link deferred",
+                    segment_id, transcription_id,
+                )
+                deferred_tx_ids.add(transcription_id)
+        else:
+            logger.debug(
+                "SearchIngester: segment_id=%d transcription_id=%d has no "
+                "expression yet (not swept) — THEMATIC link deferred",
+                segment_id, transcription_id,
+            )
         return None
 
     def _resolve_prior_query_expression(
@@ -398,9 +428,7 @@ class SearchIngester:
         Non-fatal — logs warning and continues if embedding fails.
         """
         try:
-            from audiobench.memory.memory_store import MemoryStore
-            store = MemoryStore()
-            store.write_node(
+            self.store.write_node(
                 expression_id=expression_id,
                 content=content,
                 source_type=source_type,

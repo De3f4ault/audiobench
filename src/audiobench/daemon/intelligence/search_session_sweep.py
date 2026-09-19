@@ -115,6 +115,7 @@ class SearchSessionSweep(IntelligenceTask):
         expr_repo = ExpressionRepository()
         repaired = 0
         deferred = 0
+        deferred_tx_ids: set[int] = set()
 
         for row in rows:
             synth_id = int(row["synth_id"])
@@ -131,7 +132,9 @@ class SearchSessionSweep(IntelligenceTask):
                 ).scalars().all()
 
             for seg_id in seg_ids:
-                frag_expr_id = ingester._resolve_fragment_expression_id(int(seg_id))
+                frag_expr_id = ingester._resolve_fragment_expression_id(
+                    int(seg_id), deferred_tx_ids=deferred_tx_ids
+                )
                 if frag_expr_id is not None:
                     try:
                         expr_repo.link(
@@ -148,11 +151,18 @@ class SearchSessionSweep(IntelligenceTask):
                 else:
                     deferred += 1
 
-        logger.info(
-            "SearchSessionSweep: THEMATIC repair complete — %d links created, "
-            "%d still deferred (transcriptions not yet swept)",
-            repaired, deferred,
-        )
+        if deferred_tx_ids:
+            logger.info(
+                "SearchSessionSweep: THEMATIC repair complete — %d links created, "
+                "%d still deferred across %d unswept transcriptions",
+                repaired, deferred, len(deferred_tx_ids),
+            )
+        else:
+            logger.info(
+                "SearchSessionSweep: THEMATIC repair complete — %d links created, "
+                "%d still deferred",
+                repaired, deferred,
+            )
 
 
 
