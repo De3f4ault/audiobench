@@ -10,10 +10,79 @@ Provides:
 
 from __future__ import annotations
 
-from unittest.mock import patch
-
+import os
 import pytest
 from click.testing import CliRunner
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_daemon_socket_for_tests():
+    """Redirect daemon socket to an isolated path for all tests.
+
+    Ensures no test ever connects to /tmp/audiobench-daemon.sock or touches
+    the running production daemon.
+    """
+    old_sock = os.environ.get("AUDIOBENCH_DAEMON_SOCKET_PATH")
+    os.environ["AUDIOBENCH_DAEMON_SOCKET_PATH"] = "/tmp/audiobench-test-isolated.sock"
+    from audiobench.core.settings import get_settings
+    get_settings.cache_clear()
+    yield
+    if old_sock is None:
+        os.environ.pop("AUDIOBENCH_DAEMON_SOCKET_PATH", None)
+    else:
+        os.environ["AUDIOBENCH_DAEMON_SOCKET_PATH"] = old_sock
+    get_settings.cache_clear()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_database_for_tests(tmp_path_factory):
+    """Session-wide database isolation fallback.
+
+    Redirects AUDIOBENCH_DATABASE_URL to an isolated temporary SQLite database
+    so that any test that does not explicitly request the `test_db` fixture
+    is guaranteed NEVER to connect to or pollute data/transcriptions.db.
+    """
+    from audiobench.core.settings import get_settings
+
+    tmp_dir = tmp_path_factory.mktemp("session_db")
+    tmp_db_file = tmp_dir / "session_fallback.db"
+
+    old_db_url = os.environ.get("AUDIOBENCH_DATABASE_URL")
+    old_data_dir = os.environ.get("AUDIOBENCH_DATA_DIR")
+
+    os.environ["AUDIOBENCH_DATABASE_URL"] = f"sqlite:///{tmp_db_file}"
+    os.environ["AUDIOBENCH_DATA_DIR"] = str(tmp_dir)
+    get_settings.cache_clear()
+
+    # Pre-create tables in the session fallback DB
+    import audiobench.core.db_engine as db_mod
+    import audiobench.core.db_session as dbs_mod
+    from audiobench.storage.models import Base
+
+    db_mod._engine = None
+    dbs_mod._SessionLocal = None
+
+    engine = db_mod.get_engine()
+    Base.metadata.create_all(bind=engine)
+    engine.dispose()
+    db_mod._engine = None
+    dbs_mod._SessionLocal = None
+
+    yield
+
+    if old_db_url is None:
+        os.environ.pop("AUDIOBENCH_DATABASE_URL", None)
+    else:
+        os.environ["AUDIOBENCH_DATABASE_URL"] = old_db_url
+
+    if old_data_dir is None:
+        os.environ.pop("AUDIOBENCH_DATA_DIR", None)
+    else:
+        os.environ["AUDIOBENCH_DATA_DIR"] = old_data_dir
+
+    get_settings.cache_clear()
+    db_mod._engine = None
+    dbs_mod._SessionLocal = None
 
 
 @pytest.fixture

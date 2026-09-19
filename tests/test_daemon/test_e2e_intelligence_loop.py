@@ -80,6 +80,7 @@ def live_daemon_client(test_db, tmp_data_dir):
     # We patch the module-level get_settings cache so client picks up the tmp path.
     from audiobench.core.settings import get_settings
     get_settings.cache_clear()
+    old_sock = os.environ.get("AUDIOBENCH_DAEMON_SOCKET_PATH")
     os.environ["AUDIOBENCH_DAEMON_SOCKET_PATH"] = str(socket_path)
     get_settings.cache_clear()
 
@@ -88,7 +89,10 @@ def live_daemon_client(test_db, tmp_data_dir):
     yield client
 
     # Restore env + teardown
-    os.environ.pop("AUDIOBENCH_DAEMON_SOCKET_PATH", None)
+    if old_sock is not None:
+        os.environ["AUDIOBENCH_DAEMON_SOCKET_PATH"] = old_sock
+    else:
+        os.environ.pop("AUDIOBENCH_DAEMON_SOCKET_PATH", None)
     get_settings.cache_clear()
 
     process.terminate()

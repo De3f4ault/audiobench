@@ -45,7 +45,47 @@ def _is_socket_alive(socket_path: Path) -> bool:
 
 
 def _clean_stale_socket(socket_path: Path) -> None:
-    """Remove socket if it exists but nobody is listening."""
+    """Remove socket if it exists but nobody is listening and daemon is dead."""
+    import fcntl
+    import os
+
+    settings = get_settings()
+    pid_path = Path(settings.daemon_pid_path)
+    lock_path = pid_path.with_suffix(".lock")
+
+    # If daemon lock file is locked by a live process, DO NOT unlink the socket!
+    if lock_path.exists():
+        try:
+            fd = os.open(str(lock_path), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except (BlockingIOError, OSError):
+                # Lock is actively held by running daemon!
+                logger.warning(
+                    "Socket %s ping timed out but daemon lock is held; not unlinking.",
+                    socket_path,
+                )
+                return
+            finally:
+                os.close(fd)
+        except Exception:
+            pass
+
+    # Check if PID is alive
+    if pid_path.exists():
+        try:
+            pid = int(pid_path.read_text().strip())
+            os.kill(pid, 0)
+            logger.warning(
+                "Socket %s ping timed out but daemon PID %d is alive; not unlinking.",
+                socket_path,
+                pid,
+            )
+            return
+        except (ValueError, ProcessLookupError, OSError):
+            pass
+
     try:
         socket_path.unlink()
         logger.debug("Removed stale socket at %s", socket_path)

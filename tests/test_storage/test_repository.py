@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -13,17 +14,23 @@ from audiobench.core.settings import AudioBenchSettings
 def repo(tmp_path):
     """Create a fresh repository with a temp database."""
     import audiobench.core.db_engine as db_mod
+    import audiobench.core.db_session as sess_mod
 
     db_path = tmp_path / "test_repo.db"
     settings = AudioBenchSettings(
         database_url=f"sqlite:///{db_path}",
         data_dir=tmp_path,
+        disable_memory=True,
+        daemon_socket_path=Path("/tmp/audiobench-test-isolated.sock"),
     )
 
     old_engine = db_mod._engine
+    old_session_factory = sess_mod._SessionLocal
     db_mod._engine = None
+    sess_mod._SessionLocal = None
 
-    with patch("audiobench.core.db_engine.get_settings", return_value=settings):
+    with patch("audiobench.core.db_engine.get_settings", return_value=settings), \
+         patch("audiobench.core.settings.get_settings", return_value=settings):
         from audiobench.core.db_engine import init_db
 
         init_db()
@@ -32,7 +39,10 @@ def repo(tmp_path):
 
         yield TranscriptionRepository()
 
+    if db_mod._engine is not None:
+        db_mod._engine.dispose()
     db_mod._engine = old_engine
+    sess_mod._SessionLocal = old_session_factory
 
 
 def _make_transcript(text="Hello world", file_name="test.mp3", duration=10.0):

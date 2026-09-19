@@ -35,6 +35,11 @@ def mock_user_types_exit(monkeypatch):
     import prompt_toolkit
     monkeypatch.setattr(prompt_toolkit, "PromptSession", MockPromptSession)
 
+@pytest.fixture(autouse=True)
+def _isolate_chat_db(test_db):
+    """Ensure all chat REPL tests run against isolated test_db."""
+    pass
+
 def test_chat_repl_accepts_preloaded_fragments(fused_results):
     from audiobench.chat.chat_repl import ChatREPL
     repl = ChatREPL(
