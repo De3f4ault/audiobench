@@ -40,6 +40,16 @@ PLAYBACK_COMMANDS: frozenset[str] = frozenset({
     "/status",
     "/explain",
     "/clip",
+    "/next",
+    "/n",
+    "/prev",
+    "/p",
+    "/back",
+    "/b",
+    "/lyrics",
+    "/lyric",
+    "/karaoke",
+    "/follow",
 })
 
 
@@ -93,21 +103,35 @@ def fmt_timestamp_slug(s: float) -> str:
 
 # ── Timestamp extraction from text ───────────────────────────
 
-# Matches (6:30), (06:30), (1:02:30), [6:30], etc.
-_TS_PATTERN = re.compile(r"[\[(](\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)[\])]")
+# Matches timestamp ranges like (03:19-03:28) or 03:19 - 03:28 or 03:19 → 03:28
+_RANGE_PATTERN = re.compile(
+    r"\b((?:\d{1,2}:)?\d{1,2}:[0-5]\d(?:\.\d+)?)\s*(?:[-–—→~]|to)\s*((?:\d{1,2}:)?\d{1,2}:[0-5]\d(?:\.\d+)?)\b",
+    re.IGNORECASE,
+)
+# Matches timestamps like 03:30, 0:33, 1:05:00, (03:30), [03:30], Timestamp 03:30, etc.
+# Ignores ISO dates (e.g. 2026-09-19 19:37:04), aspect ratios (16:9), and ports (localhost:8080).
+_GENERIC_TS_PATTERN = re.compile(
+    r"(?<!\d{4}-\d{2}-\d{2}[ T])(?<![:\w])((?:\d{1,2}:)?[0-5]?\d:[0-5]\d(?:\.\d+)?)(?![:\w])"
+)
 
 
 def extract_timestamps(text: str) -> list[tuple[str, float]]:
     """Extract cited timestamps from markdown text, sorted chronologically.
 
     Deduplicates citations that fall within a 3.0-second window.
+    For ranges like (03:19-03:28), extracts the start timestamp as the seek anchor.
     Returns list of (display_string, seconds) tuples sorted by seconds ascending.
     """
     if not text:
         return []
 
+    # Identify trailing ends of ranges so we jump to section/quote start anchors
+    end_spans = {m.span(2) for m in _RANGE_PATTERN.finditer(text)}
+
     parsed: list[tuple[str, float]] = []
-    for match in _TS_PATTERN.finditer(text):
+    for match in _GENERIC_TS_PATTERN.finditer(text):
+        if match.span(1) in end_spans:
+            continue
         ts_str = match.group(1)
         secs = parse_timestamp(ts_str)
         if secs is not None:
@@ -130,6 +154,92 @@ def extract_timestamps(text: str) -> list[tuple[str, float]]:
                 deduped.append(item)
 
     return deduped
+
+
+# ── Smart Timestamp Navigation & Progress Bar ────────────────
+
+
+def find_next_timestamp(
+    timestamps: list[tuple[str, float]],
+    current_pos: float,
+    tolerance: float = 1.0,
+) -> tuple[int, str, float] | None:
+    """Find the next upcoming timestamp after current_pos.
+
+    Returns:
+        (1-based index, display_string, seconds) or None if already at/past last citation.
+    """
+    for i, (ts_str, sec) in enumerate(timestamps, 1):
+        if sec > current_pos + tolerance:
+            return i, ts_str, sec
+    return None
+
+
+def find_prev_timestamp(
+    timestamps: list[tuple[str, float]],
+    current_pos: float,
+    rewind_threshold: float = 3.0,
+) -> tuple[int, str, float] | None:
+    """Find the previous timestamp before current_pos with standard media player rewind behavior.
+
+    If current_pos is > rewind_threshold (e.g. 3s) into a citation section, rewinds to the
+    start of that citation. If <= rewind_threshold, jumps to the previous citation before it.
+
+    Returns:
+        (1-based index, display_string, seconds) or None if timestamps is empty.
+    """
+    if not timestamps:
+        return None
+
+    if current_pos < timestamps[0][1]:
+        return 1, timestamps[0][0], timestamps[0][1]
+
+    active_idx = 0
+    for i, (_, sec) in enumerate(timestamps):
+        if current_pos >= sec - 0.5:
+            active_idx = i
+        else:
+            break
+
+    curr_sec = timestamps[active_idx][1]
+    if current_pos - curr_sec > rewind_threshold:
+        return active_idx + 1, timestamps[active_idx][0], curr_sec
+
+    if active_idx > 0:
+        prev_idx = active_idx - 1
+        return prev_idx + 1, timestamps[prev_idx][0], timestamps[prev_idx][1]
+
+    return 1, timestamps[0][0], timestamps[0][1]
+
+
+def render_progress_bar(pos: float, dur: float, width: int = 30) -> str:
+    """Render a colored unicode audio progress bar.
+
+    Example: [green]━━━━━━━━━━━━[/green][dim]░░░░░░░░░░░░░░░░░░[/dim]
+    """
+    if dur <= 0.0:
+        return f"[{DIM}]{'─' * width}[/]"
+    frac = max(0.0, min(1.0, pos / dur))
+    filled_len = int(frac * width)
+    empty_len = width - filled_len
+    filled = "━" * filled_len
+    empty = "░" * empty_len
+    return f"[{SUCCESS}]{filled}[/][{DIM}]{empty}[/]"
+
+
+def render_citations_banner(
+    target_console: Console,
+    timestamps: list[tuple[str, float]],
+) -> None:
+    """Render a permanent, non-erased citation list into the terminal scrollback."""
+    if not timestamps:
+        return
+    display_ts = timestamps[:9]
+    parts = [f"[{i}] {ts_str}" for i, (ts_str, _) in enumerate(display_ts, 1)]
+    bar_line = f"  [{ACCENT}][>] Timestamps:[/]  " + "  ".join(parts)
+    target_console.print(bar_line)
+    if len(timestamps) > 9:
+        target_console.print(f"  [{DIM}]+{len(timestamps) - 9} more citations — use /seek <ts> to navigate[/]")
 
 
 # ── Post-response jump bar ───────────────────────────────────
@@ -311,30 +421,147 @@ def handle_playback_command(
     transcript_resolver: Callable[[int], dict | None] | None = None,
     loaded_transcript_ids: list[int] | None = None,
     on_explain_context: Callable[[str], None] | None = None,
+    active_citations: list[tuple[str, float]] | None = None,
+    default_record: dict | None = None,
 ) -> bool:
     """Handle universal playback slash commands."""
     cmd = command.lower()
 
-    if cmd == "/play":
-        return _cmd_play(arg, client, target_console, transcript_resolver, loaded_transcript_ids)
-    elif cmd == "/seek":
-        return _cmd_seek(arg, client, target_console)
-    elif cmd in ("/pause", "/resume", "/toggle"):
-        return _cmd_toggle(cmd, client, target_console)
-    elif cmd == "/speed":
-        return _cmd_speed(arg, client, target_console)
-    elif cmd == "/stop":
-        client.playback_stop()
-        target_console.print(f"  [{SUCCESS}][DONE] Playback stopped[/]")
+    try:
+        if cmd == "/play":
+            return _cmd_play(arg, client, target_console, transcript_resolver, loaded_transcript_ids)
+        elif cmd == "/seek":
+            return _cmd_seek(arg, client, target_console)
+        elif cmd in ("/pause", "/resume", "/toggle"):
+            return _cmd_toggle(cmd, client, target_console)
+        elif cmd == "/speed":
+            return _cmd_speed(arg, client, target_console)
+        elif cmd == "/stop":
+            client.playback_stop()
+            target_console.print(f"  [{SUCCESS}][DONE] Playback stopped[/]")
+            return True
+        elif cmd in ("/np", "/nowplaying", "/status"):
+            return _cmd_status(client, target_console)
+        elif cmd in ("/next", "/n"):
+            return _cmd_next(client, active_citations, default_record, target_console)
+        elif cmd in ("/prev", "/p", "/back", "/b"):
+            return _cmd_prev(client, active_citations, default_record, target_console)
+        elif cmd.startswith("/") and cmd[1:].isdigit():
+            idx = int(cmd[1:])
+            return _cmd_jump_index(idx, client, active_citations, default_record, target_console)
+        elif cmd == "/explain":
+            return _cmd_explain(arg, client, target_console, on_explain_context)
+        elif cmd == "/clip":
+            return _cmd_clip(arg, client, target_console)
+        elif cmd in ("/lyrics", "/lyric", "/karaoke", "/follow"):
+            return _cmd_lyrics(client, target_console, transcript_resolver)
+        return False
+    except Exception as exc:
+        target_console.print(f"  [{WARNING}]Playback error: {exc}[/]")
         return True
-    elif cmd in ("/np", "/nowplaying", "/status"):
-        return _cmd_status(client, target_console)
-    elif cmd == "/explain":
-        return _cmd_explain(arg, client, target_console, on_explain_context)
-    elif cmd == "/clip":
-        return _cmd_clip(arg, client, target_console)
 
-    return False
+
+def _cmd_next(
+    client: Any,
+    citations: list[tuple[str, float]] | None,
+    default_record: dict | None,
+    target_console: Console,
+) -> bool:
+    if not citations:
+        target_console.print(f"  [{DIM}]No active citations from recent response[/]")
+        return True
+
+    st = client.playback_status()
+    pos = st.get("position", 0.0)
+    hit = find_next_timestamp(citations, pos)
+    if not hit:
+        last_ts = citations[-1][0]
+        target_console.print(f"  [{DIM}]Already at or past final citation [{len(citations)}/{len(citations)}] ({last_ts})[/]")
+        return True
+
+    idx, ts_str, sec = hit
+    if not st.get("playing") and default_record and default_record.get("file_path"):
+        client.playback_play(
+            default_record["file_path"],
+            start_pos=sec,
+            audio_file_id=default_record.get("audio_file_id"),
+            transcription_id=default_record.get("id"),
+        )
+    else:
+        client.playback_seek(sec)
+        if st.get("paused"):
+            client.playback_resume()
+
+    target_console.print(f"  [{SUCCESS}][DONE] Playing [{idx}/{len(citations)}] from {ts_str}[/]")
+    return True
+
+
+def _cmd_prev(
+    client: Any,
+    citations: list[tuple[str, float]] | None,
+    default_record: dict | None,
+    target_console: Console,
+) -> bool:
+    if not citations:
+        target_console.print(f"  [{DIM}]No active citations from recent response[/]")
+        return True
+
+    st = client.playback_status()
+    pos = st.get("position", 0.0)
+    hit = find_prev_timestamp(citations, pos)
+    if not hit:
+        first_ts = citations[0][0]
+        target_console.print(f"  [{DIM}]Already at first citation [1/{len(citations)}] ({first_ts})[/]")
+        return True
+
+    idx, ts_str, sec = hit
+    if not st.get("playing") and default_record and default_record.get("file_path"):
+        client.playback_play(
+            default_record["file_path"],
+            start_pos=sec,
+            audio_file_id=default_record.get("audio_file_id"),
+            transcription_id=default_record.get("id"),
+        )
+    else:
+        client.playback_seek(sec)
+        if st.get("paused"):
+            client.playback_resume()
+
+    target_console.print(f"  [{SUCCESS}][DONE] Playing [{idx}/{len(citations)}] from {ts_str}[/]")
+    return True
+
+
+def _cmd_jump_index(
+    idx: int,
+    client: Any,
+    citations: list[tuple[str, float]] | None,
+    default_record: dict | None,
+    target_console: Console,
+) -> bool:
+    if not citations:
+        target_console.print(f"  [{DIM}]No active citations from recent response[/]")
+        return True
+
+    if not (1 <= idx <= len(citations)):
+        target_console.print(f"  [{WARNING}]Citation index [{idx}] out of range (1–{len(citations)})[/]")
+        return True
+
+    ts_str, sec = citations[idx - 1]
+    st = client.playback_status()
+    if not st.get("playing") and default_record and default_record.get("file_path"):
+        client.playback_play(
+            default_record["file_path"],
+            start_pos=sec,
+            audio_file_id=default_record.get("audio_file_id"),
+            transcription_id=default_record.get("id"),
+        )
+    else:
+        client.playback_seek(sec)
+        if st.get("paused"):
+            client.playback_resume()
+
+    target_console.print(f"  [{SUCCESS}][DONE] Playing [{idx}/{len(citations)}] from {ts_str}[/]")
+    return True
 
 
 def _play_record(
@@ -494,7 +721,10 @@ def _cmd_status(client: Any, target_console: Console) -> bool:
         return True
 
     icon, pos, dur, spd_str, file_name = _parse_status_fields(st)
-    target_console.print(f"  [{ACCENT}]{icon}[/] {pos} / {dur}{spd_str} · [{DIM}]{file_name}[/]")
+    pos_sec = st.get("position", 0.0)
+    dur_sec = st.get("duration", 0.0)
+    bar = render_progress_bar(pos_sec, dur_sec, width=28)
+    target_console.print(f"  [{ACCENT}]{icon}[/]  {pos} {bar} {dur}{spd_str} · [{DIM}]{file_name}[/]")
     return True
 
 
@@ -630,11 +860,31 @@ def _cmd_clip(arg: str, client: Any, target_console: Console) -> bool:
     return True
 
 
+def _cmd_lyrics(
+    client: Any, target_console: Console, resolver: Any = None
+) -> bool:
+    """Launch universal interactive follow / lyrics HUD for daemon playback."""
+    try:
+        from audiobench.playback.lyrics_hud import show_daemon_lyrics
+
+        show_daemon_lyrics(client, target_console, tx_repo=resolver)
+    except Exception as exc:
+        target_console.print(f"  [{WARNING}]Lyrics follow error: {exc}[/]")
+    return True
+
+
 # ── Prompt Status Line ──────────────────────────────────────
 
 
-def render_playback_status_line(client: Any) -> str | None:
-    """Return a compact status line for prompt injection. Returns None if inactive."""
+def render_playback_status_line(
+    client: Any,
+    citations: list[tuple[str, float]] | None = None,
+) -> str | None:
+    """Return a compact status line for prompt injection. Returns None if inactive.
+
+    When active citations are passed, includes the current citation index [i/N]
+    and a short hint for available empty-buffer hotkeys.
+    """
     try:
         st = client.playback_status()
     except Exception:
@@ -644,4 +894,22 @@ def render_playback_status_line(client: Any) -> str | None:
         return None
 
     icon, pos, dur, spd_str, _ = _parse_status_fields(st)
-    return f"{icon} {pos}/{dur}{spd_str}"
+    base_line = f"{icon} {pos}/{dur}{spd_str}"
+
+    if not citations:
+        return base_line
+
+    # Determine which citation section the playhead is currently in
+    pos_sec = st.get("position", 0.0)
+    curr_idx = 1
+    for i, (_, sec) in enumerate(citations, 1):
+        if pos_sec >= sec - 0.5:
+            curr_idx = i
+        else:
+            break
+
+    total = len(citations)
+    cap_idx = min(9, total)
+    jump_hint = f"1-{cap_idx}:jump" if cap_idx > 1 else "1:jump"
+    hint = f"n:next · b:back · {jump_hint} · Space:pause"
+    return f"{base_line}  ·  [{curr_idx}/{total}]  ({hint})"

@@ -68,18 +68,43 @@ class MpvController:
             stderr=subprocess.DEVNULL,
         )
 
-        # Wait for socket to appear (mpv needs a moment)
-        for _ in range(50):  # 0.5 seconds total
+        # Wait for socket to appear (up to 3.0 seconds total, checking process health)
+        for _ in range(150):
+            if self._proc.poll() is not None:
+                self._cleanup()
+                raise RuntimeError(
+                    f"mpv process exited prematurely with return code {self._proc.returncode}"
+                )
             if Path(self._socket_path).exists():
                 break
-            time.sleep(0.01)
+            time.sleep(0.02)
         else:
+            self._cleanup()
             raise RuntimeError(f"mpv IPC socket not created at {self._socket_path}")
 
-        # Connect
-        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.connect(self._socket_path)
-        self._sock.settimeout(0.1)  # 100ms — fast enough for real-time sync
+        # Connect with retry (in case the socket file was created before mpv starts listening)
+        connected = False
+        connect_deadline = time.time() + 1.5
+        while time.time() < connect_deadline:
+            if self._proc.poll() is not None:
+                self._cleanup()
+                raise RuntimeError(
+                    f"mpv process exited prematurely with return code {self._proc.returncode}"
+                )
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(0.1)  # 100ms — fast enough for real-time sync
+            try:
+                sock.connect(self._socket_path)
+                self._sock = sock
+                connected = True
+                break
+            except (ConnectionRefusedError, FileNotFoundError, OSError):
+                sock.close()
+                time.sleep(0.02)
+
+        if not connected:
+            self._cleanup()
+            raise RuntimeError(f"Failed to connect to mpv IPC socket at {self._socket_path}")
 
         logger.info("Connected to mpv IPC at %s", self._socket_path)
 
@@ -116,6 +141,10 @@ class MpvController:
         Path(self._socket_path).unlink(missing_ok=True)
         if self._proc and self._proc.poll() is None:
             self._proc.kill()
+            try:
+                self._proc.wait(timeout=1)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
 
     # ── IPC Communication ──────────────────────────────────
 
@@ -242,6 +271,18 @@ class MpvController:
         """
         if not self.is_running() or not self._sock:
             return (0.0, 1.0, False)
+
+        # Drain any residual bytes in socket before querying to eliminate stale responses
+        try:
+            while True:
+                r, _, _ = select.select([self._sock], [], [], 0)
+                if not r:
+                    break
+                drained = self._sock.recv(4096)
+                if not drained:
+                    break
+        except Exception:
+            pass
 
         # Send all 3 queries in rapid succession with unique request_ids
         queries = [
