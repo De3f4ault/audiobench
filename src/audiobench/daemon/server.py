@@ -958,9 +958,27 @@ def _do_sweep_once() -> None:
                             })
 
                     if nodes:
-                        _get_store().batch_write_nodes(nodes)
+                        # Deduplicate by expression_id: when two child chunks in the same
+                        # transcript have identical text, `register()` returns the same
+                        # ExpressionRecord (content_hash deduplication).  Both get appended
+                        # to `nodes` with the same expression_id, which causes LanceDB's
+                        # merge_insert to raise "Ambiguous merge insert: multiple source rows
+                        # match the same target row on (expression_id = N)".
+                        seen_expr_ids: set[int] = set()
+                        unique_nodes: list[dict] = []
+                        for node in nodes:
+                            eid = node["expression_id"]
+                            if eid not in seen_expr_ids:
+                                seen_expr_ids.add(eid)
+                                unique_nodes.append(node)
+                            else:
+                                logger.debug(
+                                    "batch_write_nodes: skipping duplicate expression_id %d in batch for tx %d",
+                                    eid, tx["id"],
+                                )
+                        _get_store().batch_write_nodes(unique_nodes)
                         from audiobench.daemon.lancedb_optimizer import increment_unoptimized_writes
-                        increment_unoptimized_writes(len(nodes))
+                        increment_unoptimized_writes(len(unique_nodes))
                         _maybe_trigger_threshold_optimize()
 
                 success_ids.append(tx["id"])

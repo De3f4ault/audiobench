@@ -234,6 +234,24 @@ class MemoryStore:
         if not nodes:
             return
 
+        # Defensive deduplication: LanceDB merge_insert rejects batches where the
+        # same expression_id appears more than once ("Ambiguous merge insert").
+        # This can happen when two chunks in the same transcript have identical text
+        # and register() returns the same deduplicated expression_id for both.
+        # Keep the first occurrence (stable order) and discard subsequent duplicates.
+        seen_ids: set[int] = set()
+        unique_nodes: list[dict] = []
+        for n in nodes:
+            eid = int(n["expression_id"])
+            if eid not in seen_ids:
+                seen_ids.add(eid)
+                unique_nodes.append(n)
+            else:
+                logger.debug(
+                    "batch_write_nodes: deduplicated expression_id %d within batch (keeping first)", eid
+                )
+        nodes = unique_nodes
+
         texts = [n["content"] for n in nodes]
         vectors = self._engine.embed_batch_for_storage(texts, batch_size=batch_size)
 
