@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
-import re
 
 from rich.text import Text
-from textual.widgets import DataTable
 from textual.binding import Binding
-
+from textual.widgets import DataTable
 
 _STATUS_COLOR = {
     "processing": "#ffb300",  # amber
@@ -42,7 +41,7 @@ class OperationsPanel(DataTable):
     """Active + pending transcription jobs. Shows empty state gracefully."""
 
     COLUMNS = ("", "File", "Engine", "Phase", "Progress", "Started")
-    
+
     BINDINGS = [
         Binding("k", "kill_job", "Kill"),
     ]
@@ -71,13 +70,13 @@ class OperationsPanel(DataTable):
         jtype, jid = self._get_selected_job()
         if not jid:
             return
-            
+
         from audiobench.cli.tui.widgets.confirm_modal import ConfirmModal
-        
+
         def _on_confirm(confirm: bool) -> None:
             if not confirm:
                 return
-                
+
             if jtype == "cli":
                 from audiobench.jobs.repository import JobRepository
                 JobRepository().cancel_job(jid)
@@ -90,7 +89,7 @@ class OperationsPanel(DataTable):
                 conn.commit()
                 conn.close()
                 self.notify(f"Cancelled queued job #{jid}")
-                
+
             self._refresh()
 
         self.app.push_screen(ConfirmModal(f"Kill {jtype} job #{jid}?"), callback=_on_confirm)
@@ -163,5 +162,8 @@ class OperationsPanel(DataTable):
         if selected_key:
             for i, row_key in enumerate(self.rows):
                 if row_key.value == selected_key:
-                    self.cursor_row = i
+                    try:
+                        self.move_cursor(row=i)
+                    except Exception:
+                        pass
                     break
