@@ -33,11 +33,11 @@ logger = get_logger("engines.gemini")
 
 from audiobench.core.prompts import (
     GEMINI_DIARIZATION_PROMPT,
+    GEMINI_DIARIZATION_TEXT_ONLY_PROMPT,
     GEMINI_DIARIZATION_TRANSLATE_PROMPT,
     GEMINI_TRANSCRIPTION_PROMPT,
-    GEMINI_TRANSLATE_PROMPT,
     GEMINI_TRANSCRIPTION_TEXT_ONLY_PROMPT,
-    GEMINI_DIARIZATION_TEXT_ONLY_PROMPT,
+    GEMINI_TRANSLATE_PROMPT,
 )
 
 # Default inline upload threshold (100 MB).
@@ -184,12 +184,12 @@ class GeminiEngine(TranscriptionEngine):
 
         # Choose prompt based on task and diarization.
         diarize = kwargs.get("diarize", False)
-        
+
         # ── Auto-trigger logic for alignment ────────────────
         from audiobench.core.settings import get_settings
         settings = get_settings()
         align_threshold = getattr(settings, "align_threshold_min", 0.5) * 60
-        
+
         from audiobench.transcribe.audio_converter import probe
 
         try:
@@ -327,8 +327,9 @@ class GeminiEngine(TranscriptionEngine):
         """
 
         def is_retryable(exc):
-            from google.genai.errors import APIError
             import socket
+
+            from google.genai.errors import APIError
 
             if isinstance(exc, APIError):
                 return exc.code == 429 or exc.code >= 500
@@ -691,11 +692,11 @@ class GeminiEngine(TranscriptionEngine):
         """Deduplicate segments exactly matching at the boundary of two 15-minute chunks."""
         if not prev_segments or not next_segments:
             return next_segments
-            
+
         # Get the last 3 segments from previous chunk to compare against
         # first 3 segments of next chunk
         prev_tail = [s.text.strip().lower() for s in prev_segments[-3:]]
-        
+
         drop_count = 0
         for i in range(min(3, len(next_segments))):
             next_text = next_segments[i].text.strip().lower()
@@ -704,7 +705,7 @@ class GeminiEngine(TranscriptionEngine):
                 logger.info(f"Dropped duplicate boundary segment: '{next_text}'")
             else:
                 break
-                
+
         return next_segments[drop_count:]
 
     def _transcribe_chunked_text_only(
@@ -718,6 +719,7 @@ class GeminiEngine(TranscriptionEngine):
     ) -> Transcript:
         """Split long audio into 15-minute chunks and transcribe with text-only prompts."""
         import shutil
+
         from audiobench.transcribe.audio_converter import split_audio
 
         chunks = split_audio(
@@ -734,7 +736,7 @@ class GeminiEngine(TranscriptionEngine):
 
         all_segments: list[Segment] = []
         chunk_dir = chunks[0][0].parent if chunks else None
-        
+
         detected_language = language or "en"
         total_words = 0
 
@@ -778,15 +780,15 @@ class GeminiEngine(TranscriptionEngine):
                             None,  # No on_segment yet because timestamps are 0.0
                         )
                         self._save_chunk_to_cache(cache_key, chunk_transcript)
-                    
+
                     if chunk_transcript.language and chunk_transcript.language != "en":
                         detected_language = chunk_transcript.language
-                        
+
                     raw_segments = chunk_transcript.segments
-                    
+
                     if all_segments:
                         raw_segments = self._dedup_chunk_boundary(all_segments, raw_segments)
-                    
+
                     if not raw_segments:
                         continue
 
@@ -796,7 +798,7 @@ class GeminiEngine(TranscriptionEngine):
                         # The alignment pipeline will fix these.
                         seg.start = 0.0
                         seg.end = 0.0
-                        
+
                         all_segments.append(seg)
                         total_words += len(seg.text.split())
 
@@ -811,7 +813,7 @@ class GeminiEngine(TranscriptionEngine):
                         e,
                     )
                     raise
-                    
+
         finally:
             if chunk_dir and chunk_dir != audio_path.parent:
                 shutil.rmtree(chunk_dir, ignore_errors=True)
@@ -1116,6 +1118,9 @@ class GeminiEngine(TranscriptionEngine):
             try:
                 import json_repair
                 repaired = json_repair.repair_json(raw_text, return_objects=True)
+                # json_repair may return a bare list — normalise it first.
+                if isinstance(repaired, list):
+                    repaired = {"segments": repaired}
                 # json_repair returns {} or "" for completely unrecoverable input,
                 # and may return a dict with no segments on partial failure.
                 # Accept it only if it has at least one segment.
@@ -1148,6 +1153,15 @@ class GeminiEngine(TranscriptionEngine):
                         details=f"Invalid JSON: {e}. Raw response: {raw_text[:200]}...",
                     ) from e
 
+        # Gemini occasionally returns a bare JSON array instead of the expected
+        # {"language": ..., "segments": [...]} envelope.  Normalise it here so
+        # the rest of the parsing code can always call data.get(...) safely.
+        if isinstance(data, list):
+            logger.warning(
+                "Gemini returned a bare JSON array — wrapping into segments envelope"
+            )
+            data = {"segments": data}
+
         language = data.get("language", "en")
         raw_segments = data.get("segments", [])
 
@@ -1161,14 +1175,14 @@ class GeminiEngine(TranscriptionEngine):
             # Using a regex that splits after ., !, or ? followed by space(s).
             parts = re.split(r'(?<=[.!?])\s+', text.strip())
             sentences = [p.strip() for p in parts if p.strip()]
-            
+
             if not sentences:
                 return text
-                
+
             deduped = []
             current_sentence = None
             count = 0
-            
+
             for s in sentences:
                 s_lower = s.lower()
                 if s_lower == current_sentence:
@@ -1179,7 +1193,7 @@ class GeminiEngine(TranscriptionEngine):
                     current_sentence = s_lower
                     count = 1
                     deduped.append(s)
-                    
+
             # If the entire text was just one sentence repeated without punctuation,
             # this basic filter won't catch it, but most LLM loops include punctuation.
             return " ".join(deduped)
@@ -1209,13 +1223,13 @@ class GeminiEngine(TranscriptionEngine):
         last_seg_text = None
         for seg_data in raw_segments:
             seg_text = seg_data.get("text", "").strip()
-            
+
             if seg_text:
                 seg_text = _collapse_repetitions(seg_text)
-                
+
             if not seg_text or seg_text.lower() == last_seg_text:
                 continue
-                
+
             last_seg_text = seg_text.lower()
 
             words: list[Word] = []

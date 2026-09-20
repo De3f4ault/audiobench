@@ -28,10 +28,12 @@ from audiobench.core.settings import get_settings
 from audiobench.observatory.context import log_event
 from audiobench.storage.repository import TranscriptionRepository
 from audiobench.transcribe.audio_converter import AudioLoader
+from audiobench.transcribe.checkpoint_manager import CheckpointManager
 from audiobench.transcribe.engines.engine_protocol import TranscriptionEngine
 from audiobench.transcribe.engines.engine_registry import create_engine
 from audiobench.transcribe.transcription_result import AudioMetadata, Segment, Transcript
-from audiobench.transcribe.checkpoint_manager import CheckpointManager
+
+_POST_PROCESS_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="postproc")
 
 logger = get_logger("core.pipeline")
 
@@ -288,12 +290,12 @@ class TranscriptionPipeline:
             # Transcribe
             task = "translate" if translate else "transcribe"
             emit("transcribing", "Starting transcription pipeline...", 0.0)
-            
+
             try:
                 tx_id = self._repository.begin_transcription(
                     audio_metadata=metadata,
                     engine="gemini" if is_gemini else "faster-whisper",
-                    model_name=getattr(engine, "model_name", getattr(self._settings, "model", "default")),
+                    model_name=getattr(engine, "_model_name", None) or self._settings.model_name,
                     chapter_id=chapter_id,
                     overwrite=skip_cache,
                 )
@@ -302,10 +304,10 @@ class TranscriptionPipeline:
                     logger.info("Transcription already exists, skipping")
                     return None
                 raise
-                
+
             new_attempt_count = self._repository.increment_attempt_count(tx_id)
             logger.info("Starting attempt %d for tx_id %d", new_attempt_count, tx_id)
-            
+
             import time
             last_heartbeat = [time.time()]
             def _progress(pct: float) -> None:
@@ -353,9 +355,9 @@ class TranscriptionPipeline:
             diarize_device = self._settings.resolve_diarization_device()
             whisper_device_index = self._settings.resolve_device_index()
             whisper_dev = f"cuda:{whisper_device_index}" if isinstance(whisper_device_index, int) else f"cuda:{whisper_device_index[0]}"
-            
+
             is_concurrent_capable = (
-                enable_diarization 
+                enable_diarization
                 and not is_gemini
                 and diarize_mode == "accurate"
                 and diarize_device.startswith("cuda")
@@ -367,14 +369,14 @@ class TranscriptionPipeline:
                 try:
                     from audiobench.diarization.engine import PyannoteDiarizer
                     diarizer = PyannoteDiarizer(hf_token=self._settings.hf_token, device=diarize_device)
-                    
+
                     with ThreadPoolExecutor(max_workers=2) as ex:
                         ft = ex.submit(_do_transcribe)
                         fd = ex.submit(diarizer.get_speaker_turns, wav_path)
-                        
+
                         transcript = ft.result()
                         transcript.audio = metadata
-                        
+
                         try:
                             turns = fd.result()
                             transcript = diarizer.assign_speakers(transcript, turns, audio_path=wav_path)
@@ -388,7 +390,7 @@ class TranscriptionPipeline:
             else:
                 transcript = _do_transcribe()
                 transcript.audio = metadata
-                    
+
             self._repository.commit_transcript_text(tx_id, transcript, chapter_id, privacy_tier=3 if sensitive else 0)
             logger.info("Pipeline: transcript text committed")
 
@@ -453,7 +455,7 @@ class TranscriptionPipeline:
                 is_degraded=post_processing_degraded,
             )
             logger.info("Pipeline: saved as transcription #%d", tx_id)
-            
+
             # Fire plugin hook
             try:
                 from audiobench.events import get_bus
@@ -468,13 +470,10 @@ class TranscriptionPipeline:
             except Exception:
                 logger.warning("EventBus emit failed (non-fatal)", exc_info=True)
 
-            if transcript.segments:
-                self._spawn_refinement(
-                    tx_id, raw_text=transcript.text, segments=transcript.segments
-                )
-                if chapter_id is None and transcript.segments:
-                    from audiobench.transcribe.rename_service import spawn_auto_naming
-                    spawn_auto_naming(tx_id)
+            # Post-transcription naming (opt-in via --auto-name only)
+            if auto_name and chapter_id is None and transcript.segments:
+                from audiobench.transcribe.rename_service import spawn_auto_naming
+                spawn_auto_naming(tx_id)
 
             emit("done", "Complete!")
             self._emit_event(
@@ -534,10 +533,10 @@ class TranscriptionPipeline:
             chapters_to_process = all_chapters
         else:
             chapters_to_process = [c for c in all_chapters if c.index in target_chapters]
-        
+
         if skip_ghost:
             chapters_to_process = [c for c in chapters_to_process if not c.is_ghost]
-            
+
         if resume:
             chapters_to_process = [c for c in chapters_to_process if not cm.has_checkpoint(c.index)]
             if len(chapters_to_process) < len(all_chapters):
@@ -564,7 +563,7 @@ class TranscriptionPipeline:
             ) -> Transcript | None:
                 if chunk_path is None:
                     return None
-                
+
                 # Check checkpoint
                 if resume and cm.has_checkpoint(chap.index):
                     res = cm.load_checkpoint(chap.index)
@@ -572,7 +571,7 @@ class TranscriptionPipeline:
                         return res
 
                 emit("transcribing", f"Transcribing chapter {chap.index}...", float(i) / len(chapters_to_process))
-                
+
                 result = self.transcribe_file(
                     file_path=chunk_path,
                     language=language,
@@ -598,7 +597,7 @@ class TranscriptionPipeline:
                     sensitive=sensitive,
                     align=align,
                 )
-                
+
                 # Shift timestamps
                 offset = chap.start_time
                 for seg in result.segments:
@@ -607,19 +606,19 @@ class TranscriptionPipeline:
                     for word in seg.words:
                         word.start += offset
                         word.end += offset
-                
+
                 # Save checkpoint
                 cm.save_checkpoint(chap.index, result)
                 return result
 
             results = []
-            
+
             if strategy == "batch":
                 # Phase 1: Transcribe all
                 for i, (c, p) in enumerate(zip(chapters_to_process, chunk_paths)):
                     r = _process_chunk(i, c, p, do_diarize=False)
                     if r: results.append(r)
-                
+
                 # Phase 2: Diarize all
                 if enable_diarization:
                     emit("diarizing", "Diarizing all chapters...", 0.0)
@@ -630,17 +629,18 @@ class TranscriptionPipeline:
                             # Diarize and overwrite checkpoint
                             res = self._run_diarization(p, res, emit, diarize_mode, diarize_threshold)
                             cm.save_checkpoint(c.index, res)
-            
+
             elif strategy == "concurrent":
                 # Producer-Consumer pipeline for multi-GPU
                 import queue
                 import threading
+
                 import torch
-                
+
                 diarize_device = self._settings.resolve_diarization_device()
                 whisper_device_index = self._settings.resolve_device_index()
                 whisper_dev = f"cuda:{whisper_device_index}" if isinstance(whisper_device_index, int) else f"cuda:{whisper_device_index[0]}"
-                
+
                 is_concurrent = (
                     enable_diarization
                     and diarize_mode == "accurate"
@@ -652,13 +652,13 @@ class TranscriptionPipeline:
                     logger.info("Using true producer-consumer concurrent chapter pipeline")
                     q = queue.Queue()
                     results = [None] * len(chapters_to_process)
-                    
+
                     def producer():
                         for i, (c, p) in enumerate(zip(chapters_to_process, chunk_paths)):
                             r = _process_chunk(i, c, p, do_diarize=False)
                             q.put((i, c, p, r))
                         q.put(None)  # Sentinel
-                        
+
                     def consumer():
                         while True:
                             item = q.get()
@@ -672,7 +672,7 @@ class TranscriptionPipeline:
                                     cm.save_checkpoint(c.index, r)
                                 results[i] = r
                             q.task_done()
-                            
+
                     t1 = threading.Thread(target=producer)
                     t2 = threading.Thread(target=consumer)
                     t1.start()
@@ -683,23 +683,23 @@ class TranscriptionPipeline:
                 else:
                     # Single-GPU sequential fallback but using threads to share memory/IO efficiently
                     torch.set_num_threads(1)
-                    
+
                     def _process_concurrent(idx: int, c: ChapterInfo, p: Path) -> Transcript | None:
                         # Whisper
                         r = _process_chunk(idx, c, p, do_diarize=False)
                         if not r: return None
-                        
+
                         # Pyannote
                         if enable_diarization and p and p.exists() and not any(s.speaker for s in r.segments):
                             emit("diarizing", f"Diarizing chapter {c.index}...", float(idx) / len(chapters_to_process))
                             r = self._run_diarization(p, r, emit, diarize_mode, diarize_threshold)
                             cm.save_checkpoint(c.index, r)
                         return r
-                    
+
                     with ThreadPoolExecutor(max_workers=pipeline_workers) as ex:
                         futures = [ex.submit(_process_concurrent, i, c, p) for i, (c, p) in enumerate(zip(chapters_to_process, chunk_paths))]
                         results = [f.result() for f in futures if f.result() is not None]
-                    
+
             else:
                 # strategy == "chunk"
                 if parallel > 1:
@@ -847,7 +847,7 @@ class TranscriptionPipeline:
             else:
                 from audiobench.diarization.engine import LightweightDiarizer
                 diarizer = LightweightDiarizer(distance_threshold=diarize_threshold, device=self._settings.resolve_diarization_device())
-                
+
             result = diarizer.diarize(wav_path, transcript)
             logger.info("Pipeline: diarization complete")
             return result
@@ -1044,9 +1044,8 @@ class TranscriptionPipeline:
             except Exception as e:
                 logger.warning("Background refinement failed for #%d: %s", tx_id, e)
 
-        thread = threading.Thread(target=_refine, name=f"refine-{tx_id}", daemon=True)
-        thread.start()
-        logger.info("Spawned background refinement thread for #%d", tx_id)
+        _POST_PROCESS_POOL.submit(_refine)
+        logger.info("Submitted background refinement task for #%d", tx_id)
 
     def _reconstruct_transcript(self, data: dict, metadata: AudioMetadata) -> Transcript:
         """Reconstruct a Transcript from cached DB data."""
@@ -1070,4 +1069,5 @@ class TranscriptionPipeline:
             duration_seconds=data.get("duration", 0.0),
             engine=data.get("engine", "faster-whisper"),
             model_name=data.get("model", "large-v3-turbo"),
+            is_cached=True,
         )
