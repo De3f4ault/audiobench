@@ -11,7 +11,7 @@ from typing import Any
 from audiobench.core.logger_factory import get_logger
 from audiobench.cli.display.theme import console
 from audiobench.core.settings import get_settings
-from audiobench.storage.models import AudioFileRecord, JobQueueItem
+from audiobench.storage.models import AudioFileRecord, UnifiedJob
 
 logger = get_logger("youtube.fetcher")
 
@@ -44,7 +44,16 @@ def extract_video_id(url_or_id: str) -> str:
 def get_video_metadata(video_id: str) -> VideoMeta:
     """Fetch video metadata using yt-dlp --dump-json."""
     url = f"https://www.youtube.com/watch?v={video_id}"
-    cmd = ["yt-dlp", "--dump-json", "--no-warnings", "--playlist-items", "1", url]
+    cmd = [
+        "yt-dlp",
+        "--dump-json",
+        "--no-warnings",
+        "--playlist-items", "1",
+        # Explicitly avoid the android_vr client which YouTube frequently 403s.
+        # web + mweb are the most reliably unblocked clients.
+        "--extractor-args", "youtube:player_client=web,mweb",
+        url,
+    ]
 
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     data = json.loads(result.stdout)
@@ -77,6 +86,8 @@ def download_audio(video_id: str, output_dir: Path, progress_cb: Any = None) -> 
         "--output", outtmpl,
         "--newline",  # CRITICAL: Forces yt-dlp to output progress lines separated by newlines
         "--no-warnings",
+        # Explicitly avoid the android_vr client which YouTube frequently 403s.
+        "--extractor-args", "youtube:player_client=web,mweb",
         url
     ]
 
@@ -116,18 +127,28 @@ def download_audio(video_id: str, output_dir: Path, progress_cb: Any = None) -> 
     return expected_path
 
 
-def fetch_and_register(video_id: str, session: Any) -> tuple[AudioFileRecord | None, JobQueueItem | None]:
+def fetch_and_register(
+    video_id: str,
+    session: Any,
+    channel_id: str | None = None,
+) -> tuple[AudioFileRecord | None, UnifiedJob | None]:
     """Fetch a YouTube video and queue it for transcription.
     
     Atomic safety guarantees:
     1. Uniqueness check is performed first.
     2. File download is performed (non-transactional, may leave artifacts).
-    3. Both AudioFileRecord and JobQueueItem are inserted in a single DB commit.
+    3. Both AudioFileRecord and UnifiedJob are inserted in a single DB commit.
        This means if the process crashes mid-download, no orphaned DB rows are created.
        
     Note on race conditions: This function is safe for single-user CLI usage. Under heavy
     concurrent usage, a race exists between the uniqueness check and the final commit,
     which could result in duplicate downloads followed by a UNIQUE constraint failure.
+
+    Args:
+        video_id:   YouTube video ID (11-char string).
+        session:    SQLAlchemy session.
+        channel_id: YouTube channel ID (UC...) the video belongs to. When provided,
+                    get_library_count() can scope its query to this channel.
     """
     # 1. Uniqueness Check
     existing = session.query(AudioFileRecord).filter_by(youtube_video_id=video_id).first()
@@ -153,23 +174,25 @@ def fetch_and_register(video_id: str, session: Any) -> tuple[AudioFileRecord | N
             format=file_path.suffix.lstrip("."),
             duration_seconds=meta.duration,
             youtube_video_id=video_id,
+            youtube_channel_id=channel_id,  # enables per-channel library counting
             tags='["youtube"]',
         )
         session.add(audio_record)
+
         session.flush() # Get the ID
         
-        job_record = JobQueueItem(
-            file_path=str(file_path),
-            status="pending"
+        from audiobench.jobs.scheduler import enqueue, ensure_worker
+
+        job_id = enqueue(
+            job_type="transcribe",
+            args=["transcribe", str(file_path)],
+            slot="transcription",
+            file_label=file_path.name,
+            batch_label="YouTube",
         )
-        session.add(job_record)
-        
-        session.commit()
-        
-        # Now that transcription is queued, kick off the daemon worker
-        from audiobench.jobs.queue_worker import _spawn_daemon
-        _spawn_daemon()
-        
+        ensure_worker()
+
+        job_record = session.get(UnifiedJob, job_id)
         return audio_record, job_record
     except Exception as e:
         session.rollback()

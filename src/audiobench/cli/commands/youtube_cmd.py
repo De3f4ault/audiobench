@@ -25,25 +25,31 @@ def youtube_group(ctx, job_id):
     ctx.obj["job_id"] = job_id
     
     if ctx.invoked_subcommand is None:
-        from audiobench.youtube.repl import run_youtube_repl
-        run_youtube_repl()
+        from audiobench.youtube.workspace import run_channel_workspace
+        run_channel_workspace()
 
-def _resolve_fetch_target(arg: str) -> str:
-    """Return a canonical YouTube URL or ID from either a number (search result) or a URL."""
+def _resolve_fetch_target(arg: str) -> list[str]:
+    """Return a list of canonical YouTube URLs or IDs from numbers (search results), ranges, or URLs."""
+    from audiobench.youtube.search import parse_selection
+    
+    # Check if it's a selection expression like "1-5", "1,3,7", "all"
+    if any(c in arg for c in (",", "-")) and not ("youtube.com" in arg or "youtu.be" in arg or "http" in arg):
+        try:
+            indices = parse_selection(arg)
+            return [load_search_result(idx) for idx in indices]
+        except Exception as e:
+            raise click.BadParameter(f"Failed to resolve range '{arg}': {e}")
+
     if arg.isdigit():
         try:
-            return load_search_result(int(arg))
+            return [load_search_result(int(arg))]
         except SearchStateExpiredError as e:
             raise click.BadParameter(str(e))
     
-    if "youtube.com" in arg or "youtu.be" in arg:
-        return arg
+    if "youtube.com" in arg or "youtu.be" in arg or len(arg) == 11:
+        return [arg]
         
-    # Assume it's already an 11 char ID
-    if len(arg) == 11:
-        return arg
-        
-    raise click.BadParameter(f"'{arg}' is not a valid YouTube URL or video ID.")
+    raise click.BadParameter(f"'{arg}' is not a valid YouTube URL, video ID, or result index.")
 
 
 @youtube_group.command("_fetch_internal", hidden=True)
@@ -66,29 +72,65 @@ def fetch_internal_cmd(ctx, video_id: str):
 
 
 @youtube_group.command("fetch")
-@click.argument("target", type=str)
-def fetch_cmd(target: str):
-    """Fetch a YouTube video and queue it for transcription."""
-    from audiobench.jobs.runner import submit_job
+@click.argument("targets", nargs=-1, required=True)
+def fetch_cmd(targets: tuple[str, ...]):
+    """Fetch one or more YouTube videos and queue them for transcription."""
+    from audiobench.jobs.scheduler import enqueue, ensure_worker
     from audiobench.storage.models import AudioFileRecord
     
-    try:
-        resolved_url = _resolve_fetch_target(target)
-        video_id = extract_video_id(resolved_url)
-    except Exception as e:
-        console.print(error_panel("Error", str(e)))
-        return
-
-    # Uniqueness check before dispatching
-    with get_session() as session:
-        existing = session.query(AudioFileRecord).filter_by(youtube_video_id=video_id).first()
-        if existing:
-            console.print(f"[{DIM}]Already in library:[/] #{existing.id} — {existing.file_name}")
+    all_video_ids: list[str] = []
+    for target in targets:
+        try:
+            resolved_urls = _resolve_fetch_target(target)
+            for url in resolved_urls:
+                vid = extract_video_id(url)
+                if vid not in all_video_ids:
+                    all_video_ids.append(vid)
+        except Exception as e:
+            console.print(error_panel("Error", str(e)))
             return
 
-    job_id = submit_job(["youtube", "_fetch_internal", video_id])
-    console.print(f"[{SUCCESS}]Download queued[/] · Job #{job_id}")
-    console.print(f"\nRun [bold]audiobench jobs fg {job_id}[/bold] to follow progress")
+    if not all_video_ids:
+        console.print(f"[{WARNING}]No valid video targets specified.[/]")
+        return
+
+    queued_jobs = []
+    already_in_lib = []
+
+    with get_session() as session:
+        for vid in all_video_ids:
+            existing = session.query(AudioFileRecord).filter_by(youtube_video_id=vid).first()
+            if existing:
+                already_in_lib.append((vid, existing))
+            else:
+                job_id = enqueue(
+                    job_type="youtube_fetch",
+                    slot="network",
+                    args=["youtube", "_fetch_internal", vid],
+                    file_label=vid,
+                    command_display=f"youtube download {vid}",
+                )
+                queued_jobs.append((vid, job_id))
+
+    if queued_jobs:
+        ensure_worker()
+
+    if queued_jobs:
+        if len(queued_jobs) == 1:
+            vid, job_id = queued_jobs[0]
+            console.print(f"[{SUCCESS}]Download queued[/] · Job #{job_id} ({vid})")
+        else:
+            console.print(f"[{SUCCESS}]Queued {len(queued_jobs)} download(s):[/]")
+            for vid, job_id in queued_jobs:
+                console.print(f"  • Job [bold]#{job_id}[/bold]: {vid}")
+
+    if already_in_lib:
+        console.print(f"[{DIM}]Already in library ({len(already_in_lib)} skipped):[/]")
+        for vid, rec in already_in_lib:
+            console.print(f"  • #{rec.id} — {rec.file_name}")
+
+    if queued_jobs:
+        console.print(f"\n[{DIM}]Run[/] [bold]audiobench jobs list[/bold] [{DIM}]or[/] [bold]audiobench jobs fg <id>[/bold] [{DIM}]to follow progress.[/]")
 
 
 @youtube_group.command("search")
@@ -116,7 +158,7 @@ def search_cmd(
         if channel:
             try:
                 if "youtube.com" in channel or channel.startswith("UC"):
-                    channel_id = _resolve_fetch_target(channel)
+                    channel_id = _resolve_fetch_target(channel)[0]
                     channel_title = channel
                 else:
                     channel_id, channel_title = resolve_channel(channel, session, no_cache=no_cache)

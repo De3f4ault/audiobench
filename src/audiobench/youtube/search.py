@@ -30,6 +30,76 @@ class VideoResult:
     description: str
 
 
+@dataclass
+class SearchResultSet:
+    results: list[VideoResult]
+    next_page_token: str | None = None
+    prev_page_token: str | None = None
+    total_results: int | None = None
+
+    def __iter__(self):
+        return iter(self.results)
+
+    def __len__(self):
+        return len(self.results)
+
+    def __getitem__(self, index):
+        return self.results[index]
+
+    def __bool__(self):
+        return bool(self.results)
+
+
+def parse_selection(selection_str: str, max_count: int | None = None) -> list[int]:
+    """Parse selection string into a sorted list of 1-based unique integer indices.
+    
+    Examples:
+        "all" -> [1, 2, ..., max_count]
+        "1, 3, 5" -> [1, 3, 5]
+        "1-5" -> [1, 2, 3, 4, 5]
+        "1-3, 5, 8-10" -> [1, 2, 3, 5, 8, 9, 10]
+        "1 2 4" -> [1, 2, 4]
+    """
+    import re
+    cleaned = selection_str.strip().lower()
+    if cleaned in ("all", "*"):
+        if max_count is None or max_count <= 0:
+            raise ValueError("Cannot select 'all' when no items are available.")
+        return list(range(1, max_count + 1))
+
+    raw_tokens = re.split(r"[\s,]+", cleaned)
+    indices: set[int] = set()
+
+    for token in raw_tokens:
+        if not token:
+            continue
+        if "-" in token:
+            parts = token.split("-")
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                start, end = int(parts[0]), int(parts[1])
+                if start > end:
+                    start, end = end, start
+                for idx in range(start, end + 1):
+                    indices.add(idx)
+            else:
+                raise ValueError(f"Invalid range specification: '{token}'")
+        elif token.isdigit():
+            indices.add(int(token))
+        else:
+            raise ValueError(f"Invalid selection token: '{token}'")
+
+    if not indices:
+        raise ValueError("No valid indices specified.")
+
+    sorted_indices = sorted(indices)
+    if max_count is not None:
+        invalid = [idx for idx in sorted_indices if idx < 1 or idx > max_count]
+        if invalid:
+            raise ValueError(f"Indices out of range (1..{max_count}): {invalid}")
+
+    return sorted_indices
+
+
 def _get_api_key() -> str:
     key = get_settings().youtube_api_key
     if not key:
@@ -104,32 +174,38 @@ def _parse_duration(pt_duration: str) -> str:
 
 
 def search_videos(
-    query: str, 
+    query: str | None = None, 
     channel_id: str | None = None, 
     max_results: int = 15, 
     progress_callback=None,
     sort: str = "relevance",
     after: str | None = None,
-    before: str | None = None
-) -> list[VideoResult]:
-    """Search for videos via the YouTube Data API."""
+    before: str | None = None,
+    page_token: str | None = None,
+    start_n: int = 1,
+) -> SearchResultSet:
+    """Search or browse videos via the YouTube Data API."""
     api_key = _get_api_key()
     
     if progress_callback:
-        progress_callback("Searching YouTube...")
+        action_name = f"Browsing channel..." if not query else "Searching YouTube..."
+        progress_callback(action_name)
         
     # Step 1: Search for videos
     search_url = "https://www.googleapis.com/youtube/v3/search"
-    params = {
+    params: dict[str, Any] = {
         "part": "snippet",
-        "q": query,
         "type": "video",
-        "maxResults": max_results,
+        "maxResults": min(max(1, max_results), 50),
         "order": sort,
         "key": api_key,
     }
+    if query:
+        params["q"] = query
     if channel_id:
         params["channelId"] = channel_id
+    if page_token:
+        params["pageToken"] = page_token
     
     def _format_date(d: str) -> str:
         if len(d) == 10:
@@ -147,9 +223,18 @@ def search_videos(
         
     data = response.json()
     items = data.get("items", [])
+    next_page_token = data.get("nextPageToken")
+    prev_page_token = data.get("prevPageToken")
+    page_info = data.get("pageInfo", {})
+    total_results = page_info.get("totalResults")
     
     if not items:
-        return []
+        return SearchResultSet(
+            results=[],
+            next_page_token=next_page_token,
+            prev_page_token=prev_page_token,
+            total_results=total_results,
+        )
 
     if progress_callback:
         progress_callback("Fetching durations...")
@@ -174,7 +259,7 @@ def search_videos(
     import html
 
     results = []
-    for i, item in enumerate(items, 1):
+    for i, item in enumerate(items, start_n):
         vid = item["id"]["videoId"]
         snippet = item["snippet"]
         published = snippet["publishedAt"].split("T")[0]
@@ -188,7 +273,12 @@ def search_videos(
             description=html.unescape(snippet["description"])
         ))
         
-    return results
+    return SearchResultSet(
+        results=results,
+        next_page_token=next_page_token,
+        prev_page_token=prev_page_token,
+        total_results=total_results,
+    )
 
 
 def write_last_search(results: list[VideoResult]) -> None:
