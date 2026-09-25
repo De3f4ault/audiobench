@@ -16,9 +16,10 @@ Usage:
 
 from __future__ import annotations
 
-import os
+import json
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 # Detect non-interactive environments that need forced flushing
@@ -45,21 +46,23 @@ class PhaseTracker:
     summary appears at the very bottom when done.
     """
 
-    PHASES = ["loading", "converting", "uploading", "processing", "transcribing", "diarizing", "saving", "embedding"]
+    PHASES = ["loading", "converting", "uploading", "processing", "transcribing", "aligning", "diarizing", "saving", "embedding"]
     LABELS = {
         "loading": "Loading model",
         "converting": "Converting audio",
         "uploading": "Uploading",
         "processing": "Processing upload",
         "transcribing": "Transcribing",
+        "aligning": "Aligning timestamps",
         "diarizing": "Diarizing speakers",
         "saving": "Saving",
         "embedding": "Generating embeddings",
     }
     SPINNERS = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
-    def __init__(self, quiet: bool = False) -> None:
+    def __init__(self, quiet: bool = False, events_file: str | Path | None = None) -> None:
         self.quiet = quiet
+        self.events_file = Path(events_file) if events_file else None
         self.phase_times: dict[str, float] = {}
         self._current_phase: str | None = None
         self._phase_start: float = 0
@@ -72,14 +75,26 @@ class PhaseTracker:
         # Whether we've switched to streaming mode
         self._streaming: bool = False
 
+    def _emit_event(self, data: dict) -> None:
+        if not self.events_file:
+            return
+        data.setdefault("ts", datetime.now(UTC).isoformat())
+        try:
+            with open(self.events_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(data) + "\n")
+        except Exception:
+            pass
+
     @property
     def _visible_phases(self) -> list[str]:
         """Return phases to display, hiding optional phases if never used."""
-        hidden_unless_used = {"uploading", "processing", "diarizing"}
+        hidden_unless_used = {"uploading", "processing", "aligning", "diarizing"}
         return [
             p
             for p in self.PHASES
-            if p not in hidden_unless_used or p in self.phase_times or p == self._current_phase
+            if (p not in hidden_unless_used and (p != "loading" or "loading" in self.phase_times or p == self._current_phase))
+            or p in self.phase_times
+            or p == self._current_phase
         ]
 
     def start(self) -> None:
@@ -89,8 +104,10 @@ class PhaseTracker:
                 self._live = Live(
                     self,
                     console=console,
-                    refresh_per_second=10,
+                    refresh_per_second=4,
                     transient=True,  # Frame vanishes when stopped
+                    redirect_stdout=True,
+                    redirect_stderr=True,
                 )
                 self._live.start()
 
@@ -130,6 +147,13 @@ class PhaseTracker:
         On first call, switches to streaming mode (phases at top).
         Then prints each segment below, growing the transcript.
         """
+        self._emit_event({
+            "t": "segment",
+            "text": getattr(segment, "text", ""),
+            "start": getattr(segment, "start", 0.0),
+            "end": getattr(segment, "end", 0.0),
+            "speaker": getattr(segment, "speaker", None),
+        })
         self.segments.append(segment)
         if self.quiet:
             return
@@ -142,6 +166,12 @@ class PhaseTracker:
 
     def update(self, phase: str, message: str, progress: float | None) -> None:
         """Called by the pipeline on phase transitions."""
+        self._emit_event({
+            "t": "phase",
+            "phase": phase,
+            "message": message,
+            "progress": progress,
+        })
         if self.quiet:
             return
 
@@ -198,8 +228,19 @@ class PhaseTracker:
         """Rich renderable protocol — called every refresh cycle."""
         yield self._build_display()
 
+    def abort(self, error: str = "") -> None:
+        """Record failure event and stop display without emitting done event."""
+        self._emit_event({"t": "error", "message": error})
+        if self._live:
+            try:
+                self._live.stop()
+            except Exception:
+                pass
+            self._live = None
+
     def finalize(self) -> None:
         """Record final timing and print completion summary."""
+        self._emit_event({"t": "done"})
         if self.quiet:
             return
 
@@ -260,16 +301,17 @@ class PhaseTracker:
         """Save accumulated segments to a .partial.txt file."""
         if not self.segments:
             return None
-        from audiobench.core.settings import get_settings
         import hashlib
-        
+
+        from audiobench.core.settings import get_settings
+
         input_p = Path(input_path)
         key = str(input_p.absolute()).encode("utf-8")
         hash_prefix = hashlib.sha256(key).hexdigest()[:12]
-        
+
         checkpoints_dir = get_settings().data_dir / "checkpoints"
         checkpoints_dir.mkdir(parents=True, exist_ok=True)
-        
+
         partial_path = str(checkpoints_dir / f"{hash_prefix}.partial.txt")
         lines = []
         for seg in self.segments:

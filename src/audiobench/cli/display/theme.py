@@ -9,11 +9,13 @@ Provides a consistent look & feel across all CLI commands:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
+from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.theme import Theme
-from rich import box
 
 # Use SQUARE box style across the app because rounded corners often have gaps in some terminal fonts
 BOX_STYLE = box.SQUARE
@@ -114,6 +116,22 @@ def format_duration(seconds: float) -> str:
     if secs:
         parts.append(f"{secs}s")
     return " ".join(parts)
+
+
+def format_elapsed(started_at: datetime | None, ended_at: datetime | None = None) -> str:
+    """Format elapsed execution duration.
+
+    Normalizes timezone awareness between timestamps and formats total elapsed duration.
+    """
+    if not started_at:
+        return "—"
+    end = ended_at or datetime.now(UTC)
+    if started_at.tzinfo is None and end.tzinfo is not None:
+        started_at = started_at.replace(tzinfo=UTC)
+    elif started_at.tzinfo is not None and end.tzinfo is None:
+        end = end.replace(tzinfo=UTC)
+    delta = (end - started_at).total_seconds()
+    return format_duration(max(0.0, delta))
 
 
 def format_size(bytes_: int) -> str:

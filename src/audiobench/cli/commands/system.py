@@ -22,8 +22,7 @@ from audiobench.core.settings import get_settings
 # ── Info Command ────────────────────────────────────────────
 
 
-@click.command()
-def info() -> None:
+def render_system_info() -> None:
     """Show system info and current settings."""
     settings = get_settings()
 
@@ -276,7 +275,7 @@ def status() -> None:
     table.add_row("Total Audio", f"{hours:.1f} hours")
     table.add_row("Total Words", f"{total_words:,}")
     table.add_row("Database Size", format_size(db_size))
-    
+
     # LanceDB stats
     lancedb_size = dir_size(settings.lancedb_path)
     from audiobench.daemon.lancedb_optimizer import read_optimize_state
@@ -284,10 +283,10 @@ def status() -> None:
     unopt_writes = opt_state.get("unoptimized_writes", 0)
     thresh = settings.lancedb_optimize_write_threshold
     frag_status = f"{unopt_writes} / {thresh} writes" if thresh > 0 else f"{unopt_writes} writes"
-    
+
     table.add_row("LanceDB Size", format_size(lancedb_size))
     table.add_row("LanceDB Fragmentation", frag_status)
-    
+
     table.add_row("Model Cache", format_size(models_size))
     table.add_row("Voice Cache", format_size(voices_size))
     table.add_row("Saved Presets", str(presets_count))
@@ -301,9 +300,10 @@ def status() -> None:
 
     # Process registry
     try:
-        from audiobench.supervisor.registry import get_all as get_all_processes
-        from audiobench.observatory.db import get_journal_session
         import datetime as _dt
+
+        from audiobench.observatory.db import get_journal_session
+        from audiobench.supervisor.registry import get_all as get_all_processes
 
         processes = get_all_processes()
         if processes:
@@ -329,7 +329,7 @@ def status() -> None:
                 state_style = state_styles.get(p["state"], "white")
                 pid_str = str(p["pid"]) if p["pid"] else "—"
                 state_str = p['state'].upper()
-                
+
                 # Check for stale state
                 if p["state"] == "running" and p["pid"]:
                     try:
@@ -339,13 +339,13 @@ def status() -> None:
                             state_style = "red"
                     except ImportError:
                         pass
-                
+
                 # Relative time
                 updated = "—"
                 if p["updated_at"]:
                     try:
                         then = _dt.datetime.fromisoformat(p["updated_at"].replace("Z", "+00:00"))
-                        now = _dt.datetime.now(_dt.timezone.utc)
+                        now = _dt.datetime.now(_dt.UTC)
                         diff = now - then
                         secs = int(diff.total_seconds())
                         if secs < 60:
@@ -520,9 +520,10 @@ def cleanup(
     # Log Rotation
     if rotate_logs:
         import time
-        from zipfile import ZipFile, ZIP_DEFLATED
+        from zipfile import ZIP_DEFLATED, ZipFile
+
         from audiobench.cli.display.theme import format_size
-        
+
         log_dir = settings.data_dir / "logs"
         if log_dir.exists():
             # Archive old logs
@@ -531,7 +532,7 @@ def cleanup(
                 if path.exists() and path.stat().st_size > 0:
                     ts_str = time.strftime("%Y%m%d_%H%M%S")
                     zip_path = log_dir / f"{log_file}.{ts_str}.zip"
-                    
+
                     if dry_run:
                         actions.append(f"Would compress {log_file} ({format_size(path.stat().st_size)}) to {zip_path.name}")
                     else:
