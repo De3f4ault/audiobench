@@ -153,3 +153,47 @@ def test_jobs_tail_command(runner, test_db, tmp_path):
     assert "converting..." in result.output
     assert "Hello world" in result.output
     assert "Completed successfully" in result.output
+
+
+def test_jobs_tail_falls_back_to_log(runner, test_db, tmp_path):
+    log_file = tmp_path / "test.log"
+    log_file.write_text("2026-09-17 [INFO] Biometric worker started\n2026-09-17 [INFO] Processed 10 segments\n")
+
+    # Job has no events file, only log file
+    jid = enqueue(job_type="biometric_pass", args=["_biometric_worker", "1", "a.mp3", "[]"])
+    with get_session() as session:
+        j = session.get(UnifiedJob, jid)
+        j.log_path = str(log_file)
+        j.events_path = None
+        j.status = "done"
+        session.commit()
+
+    result = runner.invoke(jobs, ["tail", str(jid)])
+    assert result.exit_code == 0
+    assert "streaming execution log instead" in result.output
+    assert "Biometric worker started" in result.output
+    assert "Processed 10 segments" in result.output
+
+
+def test_jobs_diff_command(runner, test_db):
+    id1 = enqueue(
+        job_type="transcribe",
+        args=["transcribe", "meeting.mp3", "--model", "base"],
+        file_label="meeting.mp3",
+    )
+    id2 = enqueue(
+        job_type="transcribe",
+        args=["transcribe", "meeting.mp3", "--model", "large-v3-turbo"],
+        file_label="meeting.mp3",
+        allow_duplicate=True,
+    )
+
+    result = runner.invoke(jobs, ["diff", str(id1), str(id2)])
+    assert result.exit_code == 0
+    assert "Comparison: Job #" in result.output
+    assert "meeting.mp3" in result.output
+    assert "base" in result.output
+    assert "large-v3-turbo" in result.output
+    assert "SIMILAR" in result.output
+
+

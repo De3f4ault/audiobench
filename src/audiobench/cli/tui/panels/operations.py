@@ -11,19 +11,19 @@ from textual.binding import Binding
 from textual.widgets import DataTable
 
 _STATUS_COLOR = {
-    "processing": "#ffb300",  # amber
     "running":    "#00e676",  # green
     "pending":    "#64b5f6",  # blue
     "failed":     "#ef5350",  # red
     "done":       "#00e676",  # green
+    "cancelled":  "#90a4ae",  # grey
 }
 
 _STATUS_ICON = {
-    "processing": "⟳",
     "running":    "⟳",
     "pending":    "⏳",
     "failed":     "✖",
     "done":       "✔",
+    "cancelled":  "⊘",
 }
 
 
@@ -77,36 +77,30 @@ class OperationsPanel(DataTable):
             if not confirm:
                 return
 
-            if jtype == "cli":
-                from audiobench.jobs.repository import JobRepository
-                JobRepository().cancel_job(jid)
-                self.notify(f"Cancelled CLI background job #{jid}")
-            elif jtype == "queue":
-                from audiobench.core.settings import get_settings
-                db_path = Path(get_settings().database_url.replace("sqlite:///", ""))
-                conn = sqlite3.connect(str(db_path))
-                conn.execute("UPDATE job_queue SET status = 'failed' WHERE id = ?", (jid,))
-                conn.commit()
-                conn.close()
-                self.notify(f"Cancelled queued job #{jid}")
+            if jtype == "unified":
+                from audiobench.jobs.scheduler import cancel_job
+                cancel_job(jid)
+                self.notify(f"Cancelled job #{jid}")
 
             self._refresh()
 
-        self.app.push_screen(ConfirmModal(f"Kill {jtype} job #{jid}?"), callback=_on_confirm)
+        self.app.push_screen(ConfirmModal(f"Kill job #{jid}?"), callback=_on_confirm)
 
     def _refresh(self) -> None:
         try:
             from audiobench.core.settings import get_settings
-            from audiobench.jobs.runner import get_job_phase
 
             db_path = Path(get_settings().database_url.replace("sqlite:///", ""))
             conn = sqlite3.connect(str(db_path))
 
+            # Query unified_jobs directly — all live job state lives here since 2026-09-17.
+            # The old `all_jobs` view (jobs ∪ job_queue) is dropped by migration 022 and
+            # never included unified_jobs entries.
             rows = conn.execute(
-                "SELECT id, source, label, engine, status, started_at "
-                "FROM all_jobs "
-                "WHERE status IN ('running', 'pending', 'processing') "
-                "ORDER BY started_at ASC LIMIT 20"
+                "SELECT id, job_type, file_label, slot, status, started_at, command_display "
+                "FROM unified_jobs "
+                "WHERE status IN ('running', 'pending') "
+                "ORDER BY priority ASC, id ASC LIMIT 20"
             ).fetchall()
 
             conn.close()
@@ -128,34 +122,30 @@ class OperationsPanel(DataTable):
         if not rows:
             return
 
-        for job_id, source, label, engine, status, started_at in rows:
+        for job_id, job_type, file_label, slot, status, started_at, command_display in rows:
             color = _STATUS_COLOR.get(status, "white")
             icon  = _STATUS_ICON.get(status, "?")
 
-            short_label = label or "—"
-            p = Path(short_label)
-            display_label = p.name if len(str(p)) > 38 else short_label
+            raw_label = file_label or command_display or job_type or "—"
+            p = Path(raw_label)
+            display_label = p.name if len(str(p)) > 38 else raw_label
             short_ts = (started_at or "")[:16] if started_at else "—"
 
-            phase_raw = get_job_phase(job_id) if source == "jobs" else status
-            phase = phase_raw
-            progress_bar = Text("—", style="dim")
+            # Engine comes from the slot suffix (e.g. "transcription:local" → "local")
+            slot_parts = (slot or "").split(":")
+            engine_label = slot_parts[-1] if len(slot_parts) > 1 else (slot or "—")
 
-            if "%" in phase_raw:
-                match = re.search(r'(\d+)%', phase_raw)
-                if match:
-                    pct = float(match.group(1)) / 100.0
-                    progress_bar = _bar(pct)
-                    phase = phase_raw.split()[0]
+            phase = status
+            progress_bar = Text("—", style="dim")
 
             self.add_row(
                 Text(icon, style=f"bold {color}"),
                 Text(display_label, style="#cfd8dc"),
-                Text(engine or ("cli" if source == "jobs" else "—"), style="bold #90a4ae"),
+                Text(engine_label, style="bold #90a4ae"),
                 Text(phase, style=color),
                 progress_bar,
                 Text(short_ts, style="dim"),
-                key=f"{source}:{job_id}",
+                key=f"unified:{job_id}",
             )
 
         # Restore selection

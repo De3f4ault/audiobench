@@ -18,6 +18,7 @@ from audiobench.cli.display.theme import (
     console,
     error_panel,
     format_duration,
+    format_elapsed,
     make_table,
 )
 from audiobench.core.db_session import get_session
@@ -50,6 +51,10 @@ def jobs(ctx: click.Context, interactive: bool) -> None:
         sys.exit(1)
 
     startup_recovery()
+    with get_session() as session:
+        has_pending = session.query(UnifiedJob).filter_by(status="pending").count() > 0
+    if has_pending:
+        ensure_worker()
 
     if ctx.invoked_subcommand is None:
         if interactive or sys.stdout.isatty():
@@ -62,19 +67,6 @@ def jobs(ctx: click.Context, interactive: bool) -> None:
 def list_cmd() -> None:
     """List active and recent jobs."""
     _list_jobs()
-
-
-def _format_elapsed(started_at: datetime | None, ended_at: datetime | None = None) -> str:
-    """Format elapsed execution duration."""
-    if not started_at:
-        return "—"
-    end = ended_at or datetime.now(UTC)
-    if started_at.tzinfo is None and end.tzinfo is not None:
-        started_at = started_at.replace(tzinfo=UTC)
-    elif started_at.tzinfo is not None and end.tzinfo is None:
-        end = end.replace(tzinfo=UTC)
-    delta = (end - started_at).total_seconds()
-    return format_duration(max(0.0, delta))
 
 
 def _list_jobs() -> None:
@@ -148,12 +140,12 @@ def _list_jobs() -> None:
             shown = 0
             for item in b_jobs:
                 if item.status == "running" or shown < 3:
-                    st_disp = (
-                        f"[{ACCENT}]● running[/]"
-                        if item.status == "running"
-                        else f"[{DIM}]○ pending[/]"
-                    )
-                    elapsed = _format_elapsed(item.started_at) if item.status == "running" else "—"
+                    is_prio = item.priority < 100
+                    if item.status == "running":
+                        st_disp = f"[{ACCENT}]● running [P][/]" if is_prio else f"[{ACCENT}]● running[/]"
+                    else:
+                        st_disp = f"[{ACCENT}]○ [P] pending[/]" if is_prio else f"[{DIM}]○ pending[/]"
+                    elapsed = format_elapsed(item.started_at) if item.status == "running" else "—"
                     name = item.file_label or item.command_display
                     if len(name) > 40:
                         name = name[:37] + "..."
@@ -171,18 +163,18 @@ def _list_jobs() -> None:
                 [
                     ("ID", {"width": 6, "justify": "right"}),
                     ("Type", {"width": 14}),
-                    ("Status", {"width": 12}),
+                    ("Status", {"width": 14}),
                     ("Item / Command", {}),
                     ("Elapsed", {"width": 10}),
                 ],
             )
             for item in standalone:
-                st_disp = (
-                    f"[{ACCENT}]● running[/]"
-                    if item.status == "running"
-                    else f"[{DIM}]○ pending[/]"
-                )
-                elapsed = _format_elapsed(item.started_at) if item.status == "running" else "—"
+                is_prio = item.priority < 100
+                if item.status == "running":
+                    st_disp = f"[{ACCENT}]● running [P][/]" if is_prio else f"[{ACCENT}]● running[/]"
+                else:
+                    st_disp = f"[{ACCENT}]○ [P] pending[/]" if is_prio else f"[{DIM}]○ pending[/]"
+                elapsed = format_elapsed(item.started_at) if item.status == "running" else "—"
                 cmd = item.file_label or item.command_display
                 if len(cmd) > 40:
                     cmd = cmd[:37] + "..."
@@ -204,13 +196,16 @@ def _list_jobs() -> None:
         )
         for item in recent_jobs:
             if item.status == "done":
-                st_disp = f"[{SUCCESS}]✓ done[/]"
+                if item.error_summary == "Retrieved from cache":
+                    st_disp = f"[{SUCCESS}]✓ cached[/]"
+                else:
+                    st_disp = f"[{SUCCESS}]✓ done[/]"
             elif item.status == "failed":
                 st_disp = f"[{WARNING}]✗ failed[/]"
             else:
                 st_disp = f"[{DIM}]⊘ cancelled[/]"
 
-            dur = _format_elapsed(item.started_at, item.ended_at)
+            dur = format_elapsed(item.started_at, item.ended_at)
             cmd = item.file_label or item.command_display
             if len(cmd) > 40:
                 cmd = cmd[:37] + "..."
@@ -266,7 +261,7 @@ def _status_jobs() -> None:
             f"#{item.id}",
             item.job_type,
             cmd,
-            _format_elapsed(item.started_at),
+            format_elapsed(item.started_at),
         )
     console.print(table)
     console.print(
@@ -299,7 +294,7 @@ def _ls_jobs() -> None:
 
     for item in running_jobs:
         name = item.file_label or item.command_display or "?"
-        elapsed = _format_elapsed(item.started_at)
+        elapsed = format_elapsed(item.started_at)
         console.print(f"    [{ACCENT}]#[/][bold]{item.id}[/]  [{DIM}]{item.job_type}[/]  {name}  [{DIM}]{elapsed}[/]")
 
 
@@ -307,73 +302,9 @@ def _ls_jobs() -> None:
 @click.argument("job_id", type=int)
 def tail(job_id: int) -> None:
     """Stream live events or logs from a job in real-time (like journalctl -f)."""
-    with get_session() as session:
-        job = session.get(UnifiedJob, job_id)
-        if not job:
-            console.print(error_panel("Not Found", f"Job #{job_id} does not exist"))
-            return
-        events_path_str = job.events_path
-        log_path_str = job.log_path
-        status = job.status
+    from audiobench.cli.display.job_stream import wait_and_stream_job
 
-    events_path = Path(events_path_str) if events_path_str else None
-    has_events = events_path and events_path.exists() and events_path.stat().st_size > 0
-
-    # If no structured events file exists or it is empty, fall back directly to streaming the log
-    if not has_events:
-        if log_path_str and Path(log_path_str).exists():
-            console.print(f"  [{DIM}][No event stream found for Job #{job_id} — streaming execution log instead][/]\n")
-            fg.callback(job_id=str(job_id))
-            return
-        console.print(
-            error_panel("No Output Available", f"No live events or log file found for Job #{job_id}.")
-        )
-        return
-
-    console.print(f"  [{ACCENT}][Tailing events for Job #{job_id}][/] [{DIM}]Ctrl+C to detach[/]\n")
-
-    def _render_event(evt: dict) -> None:
-        etype = evt.get("t")
-        if etype == "phase":
-            console.print(f"  [{ACCENT}]◐[/]  {evt.get('phase', '')}...")
-        elif etype == "segment":
-            text = evt.get("text", "").strip()
-            s = int(evt.get("start", 0))
-            e = int(evt.get("end", 0))
-            ts = f"[{s // 60}:{s % 60:02d} → {e // 60}:{e % 60:02d}]"
-            console.print(f"  [{DIM}]{ts}[/]  {text}")
-        elif etype == "done":
-            console.print(f"\n  [{SUCCESS}]✓ Completed successfully[/]")
-
-    try:
-        with open(events_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    try:
-                        _render_event(json.loads(line))
-                    except Exception:
-                        pass
-
-            if status != "running":
-                return
-
-            while True:
-                line = f.readline()
-                if line:
-                    if line.strip():
-                        try:
-                            _render_event(json.loads(line))
-                        except Exception:
-                            pass
-                else:
-                    with get_session() as session:
-                        j = session.get(UnifiedJob, job_id)
-                        if j and j.status != "running":
-                            console.print(f"\n  [{SUCCESS if j.status == 'done' else WARNING}][Job {j.status}][/]")
-                            break
-                    time.sleep(0.2)
-    except KeyboardInterrupt:
-        console.print(f"\n  [{DIM}][Detached from Job #{job_id}][/]")
+    wait_and_stream_job(job_id)
 
 
 @jobs.command(name="fg")
@@ -478,6 +409,96 @@ def prune_cmd(prune_all: bool) -> None:
         console.print(f"  [{DIM}]Nothing to prune.[/]")
 
 
+@jobs.command(name="diff")
+@click.argument("job_id_1", type=int)
+@click.argument("job_id_2", type=int)
+def diff_cmd(job_id_1: int, job_id_2: int) -> None:
+    """Compare two jobs side-by-side to detect duplicates and parameter differences."""
+    render_jobs_diff(job_id_1, job_id_2)
+
+
+def render_jobs_diff(job_id_1: int, job_id_2: int) -> None:
+    """Render side-by-side comparison of two jobs."""
+    from rich.table import Table
+    from audiobench.cli.display.theme import BOX_STYLE
+    from audiobench.jobs.scheduler import compute_job_fingerprint
+
+    with get_session() as session:
+        j1 = session.get(UnifiedJob, job_id_1)
+        j2 = session.get(UnifiedJob, job_id_2)
+
+    if not j1:
+        console.print(error_panel("Not Found", f"Job #{job_id_1} does not exist."))
+        return
+    if not j2:
+        console.print(error_panel("Not Found", f"Job #{job_id_2} does not exist."))
+        return
+
+    table = Table(
+        title=f"Comparison: Job #{j1.id} vs Job #{j2.id}",
+        box=BOX_STYLE,
+        show_header=True,
+    )
+    table.add_column("Property", style=BOLD)
+    table.add_column(f"Job #{j1.id}")
+    table.add_column(f"Job #{j2.id}")
+    table.add_column("Match", style=DIM)
+
+    def add_row(prop: str, val1: str, val2: str):
+        match = f"[{SUCCESS}]✓ identical[/]" if str(val1) == str(val2) else f"[{WARNING}]≠ different[/]"
+        table.add_row(prop, str(val1), str(val2), match)
+
+    add_row("Job Type", j1.job_type, j2.job_type)
+    add_row("File Label", j1.file_label or "—", j2.file_label or "—")
+    add_row("Status", j1.status, j2.status)
+    add_row("Slot", j1.slot, j2.slot)
+
+    # Parse arguments
+    try:
+        args1 = json.loads(j1.args_json)
+    except Exception:
+        args1 = []
+    try:
+        args2 = json.loads(j2.args_json)
+    except Exception:
+        args2 = []
+
+    def get_arg_val(args: list[str], flag: str) -> str:
+        for i, a in enumerate(args):
+            if a == flag and i + 1 < len(args):
+                return args[i + 1]
+        return "default"
+
+    m1 = get_arg_val(args1, "--model")
+    m2 = get_arg_val(args2, "--model")
+    add_row("Model", m1, m2)
+
+    e1 = get_arg_val(args1, "--engine")
+    e2 = get_arg_val(args2, "--engine")
+    add_row("Engine", e1, e2)
+
+    lang1 = get_arg_val(args1, "--language")
+    lang2 = get_arg_val(args2, "--language")
+    add_row("Language", lang1, lang2)
+
+    fp1 = j1.fingerprint or compute_job_fingerprint(j1.job_type, args1, j1.file_label)
+    fp2 = j2.fingerprint or compute_job_fingerprint(j2.job_type, args2, j2.file_label)
+    add_row("Fingerprint", fp1[:12] + "...", fp2[:12] + "...")
+
+    console.print()
+    console.print(table)
+
+    # Overall verdict
+    if fp1 == fp2:
+        console.print(f"\n  [{SUCCESS}]Verdict: EXACT DUPLICATE (100% Identity)[/]\n")
+    elif (j1.file_label and j1.file_label == j2.file_label) or (
+        j1.job_type == j2.job_type and (m1 != m2 or e1 != e2)
+    ):
+        console.print(f"\n  [{WARNING}]Verdict: SIMILAR (Same target audio, different options)[/]\n")
+    else:
+        console.print(f"\n  [{DIM}]Verdict: DIFFERENT (Distinct target audio or task)[/]\n")
+
+
 # ── Interactive Jobs REPL ───────────────────────────────────────────────────
 
 
@@ -576,6 +597,22 @@ def _interactive_jobs_repl() -> None:
                 continue
             clean_id = args_str.split()[0]
             fg.callback(job_id=clean_id)
+
+        elif cmd in ("/diff", "/compare"):
+            parts = args_str.split()
+            if len(parts) < 2:
+                console.print(error_panel("Missing Argument", "Usage: /diff <job_id_1> <job_id_2>"))
+                continue
+            try:
+                j1_id = int(parts[0].lstrip("#Q"))
+                j2_id = int(parts[1].lstrip("#Q"))
+                render_jobs_diff(j1_id, j2_id)
+            except ValueError:
+                console.print(error_panel("Invalid ID", f"Could not parse job IDs: {args_str}"))
+
+        elif cmd in ("/resume", "/start"):
+            ensure_worker()
+            console.print(f"  [{SUCCESS}]Worker daemon signaled. Checking and running pending queue...[/]")
 
         elif cmd in ("/retry", "/re-run", "/rerun"):
             parts = args_str.split()

@@ -1,9 +1,9 @@
-"""Tests for StagingCartItem and JobQueueItem models."""
+"""Tests for StagingCartItem model."""
 
 from __future__ import annotations
 
 from audiobench.core.db_session import get_session
-from audiobench.storage.models import AudioFileRecord, JobQueueItem, StagingCartItem
+from audiobench.storage.models import AudioFileRecord, StagingCartItem
 
 
 def test_staging_cart_item_lifecycle(test_db):
@@ -43,27 +43,5 @@ def test_staging_cart_item_lifecycle(test_db):
         # Cart item should be deleted
         assert session.query(StagingCartItem).count() == 0
 
-
-def test_job_queue_item_lifecycle(test_db):
-    """Test creating and updating JobQueueItem records."""
-    with get_session() as session:
-        job = JobQueueItem(
-            file_path="/fake/path/job.mp3",
-            engine="whisper",
-            model_name="large-v3",
-            speed_preset="balanced",
-        )
-        session.add(job)
-        session.commit()
-
-        job_id = job.id
-
-        fetched = session.query(JobQueueItem).get(job_id)
-        assert fetched is not None
-        assert fetched.status == "pending"
-        assert fetched.file_path == "/fake/path/job.mp3"
-
-        fetched.status = "processing"
-        session.commit()
-
-        assert session.query(JobQueueItem).get(job_id).status == "processing"
+# test_job_queue_item_lifecycle removed 2026-09-29: JobQueueItem (System 2)
+# retired — job_queue table had zero writes since 2026-08-08.

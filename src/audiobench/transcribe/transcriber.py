@@ -181,18 +181,13 @@ class TranscriptionPipeline:
                 self._write_output(transcript, fmt, output_path)
                 logger.info("Pipeline: wrote %s output to %s", fmt, output_path)
 
-            if job_id:
-                from audiobench.jobs.repository import JobRepository
-
-                JobRepository().mark_job_done(job_id)
+            # NOTE: job_id here is a UnifiedJob.id. Completion is recorded by
+            # worker_daemon polling the subprocess exit code — no write back needed.
 
             return transcript
 
         except Exception:
-            if job_id:
-                from audiobench.jobs.repository import JobRepository
-
-                JobRepository().mark_job_failed(job_id, exit_code=1)
+            # Re-raise: worker_daemon records the job as failed via non-zero exit code.
             raise
 
     # ── Private: Single-file pipeline ────────────────────────────────────────
@@ -272,7 +267,7 @@ class TranscriptionPipeline:
                             transcript=transcript,
                         )
                         # Re-read aligned transcript from DB
-                        refreshed = self._repository.get_by_id(cached_record.id)
+                        refreshed = self._repository.get_by_id(cached_record.id, session=None)
                         if refreshed:
                             transcript = self._reconstruct_transcript_from_record(refreshed, metadata)
 
@@ -420,19 +415,32 @@ class TranscriptionPipeline:
             )
 
             if should_align:
-                emit("aligning", "Aligning timestamps...", 0.0)
-                self._run_alignment_worker(
-                    tx_id=tx_id,
-                    audio_path=file_path,
-                    on_progress=on_segment,
-                    transcript=transcript,
-                )
-                # Re-read the aligned transcript from DB so segment objects
-                # have the updated timestamps for the rest of the pipeline.
-                refreshed = self._repository.get_by_id(tx_id)
-                if refreshed:
-                    transcript = self._reconstruct_transcript_from_record(refreshed, metadata)
-                logger.info("Pipeline: forced alignment committed")
+                if job_id:
+                    # In background queue execution, decouple alignment into its own scheduled job
+                    # so the cloud slot is freed immediately and alignment coordinates CPU usage.
+                    from audiobench.jobs import scheduler
+                    emit("saving", "Transcript committed. Enqueuing alignment...")
+                    scheduler.enqueue_alignment(
+                        tx_id=tx_id,
+                        audio_path=str(file_path),
+                        parent_job_id=job_id,
+                        file_label=metadata.file_name if metadata else Path(file_path).name,
+                    )
+                    logger.info("Pipeline: enqueued alignment job for tx_id %d", tx_id)
+                else:
+                    emit("aligning", "Aligning timestamps...", 0.0)
+                    self._run_alignment_worker(
+                        tx_id=tx_id,
+                        audio_path=file_path,
+                        on_progress=on_segment,
+                        transcript=transcript,
+                    )
+                    # Re-read the aligned transcript from DB so segment objects
+                    # have the updated timestamps for the rest of the pipeline.
+                    refreshed = self._repository.get_by_id(tx_id, session=None)
+                    if refreshed:
+                        transcript = self._reconstruct_transcript_from_record(refreshed, metadata)
+                    logger.info("Pipeline: forced alignment committed")
             elif on_segment and is_gemini and align is not False and transcript.duration_seconds > align_threshold:
                 # If align was false but we chunked, fire the segments now
                 for seg in transcript.segments:
@@ -771,7 +779,7 @@ class TranscriptionPipeline:
         if not cached:
             return None
         logger.info("Pipeline: cache hit for hash %s", metadata.file_hash[:12])
-        data = self._repository.get_by_id(cached.id)
+        data = self._repository.get_by_id(cached.id, session=None)
         return self._reconstruct_transcript(data, metadata) if data else None
 
     def _run_alignment_worker(

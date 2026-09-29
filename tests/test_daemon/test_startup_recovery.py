@@ -6,47 +6,32 @@ The contract:
   - StartupRecovery.run() returns {step_name: recovered_count}
   - Results are logged as structured journal events (one per step)
   - Steps execute in registration order
-  - GhostJobRecovery marks dead PIDs as 'failed', leaves live PIDs untouched
   - UnindexedExpressionRecovery queues expressions missing from LanceDB
   - WorkAssignedBackfill is idempotent (run twice → same queue depth)
+
+GhostJobRecovery tests were removed 2026-09-29: the function monitored the
+legacy 'jobs' table (System 1, last write 2026-08-31) for dead PIDs.
 
 All DB-touching tests use test_db for isolation.
 """
 
-import os
-import pytest
-from unittest.mock import MagicMock, patch, call
-from sqlalchemy import text as sql_text
+from unittest.mock import patch
 
 from audiobench.core.db_session import get_session
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _insert_job(session, job_id: int, pid: int, status: str = "running") -> None:
-    session.execute(
-        sql_text("""
-        INSERT INTO jobs (id, command, pid, status, started_at)
-        VALUES (:id, 'test', :pid, :status, CURRENT_TIMESTAMP)
-        """),
-        {"id": job_id, "pid": pid, "status": status}
-    )
-    session.commit()
-
-
-def _get_job_status(session, job_id: int) -> str | None:
-    row = session.execute(
-        sql_text("SELECT status FROM jobs WHERE id = :id"),
-        {"id": job_id}
-    ).fetchone()
-    return row[0] if row else None
-
 
 # ---------------------------------------------------------------------------
-# RecoveryStep contract
+# GhostJobRecovery tests removed 2026-09-29.
+# GhostJobRecovery monitored the legacy 'jobs' table (System 1) for dead PIDs.
+# System 3 (worker_daemon + scheduler.startup_recovery) handles unified_jobs
+# orphan detection independently. The function and its helpers are deleted.
 # ---------------------------------------------------------------------------
+
+
 
 def test_recovery_step_has_name_and_returns_count():
     """
@@ -65,7 +50,7 @@ def test_startup_recovery_run_returns_name_to_count_dict():
     StartupRecovery.run() must return a dict mapping each step name to the
     count it returned. This is the structured result that gets logged.
     """
-    from audiobench.daemon.startup_recovery import StartupRecovery, RecoveryStep
+    from audiobench.daemon.startup_recovery import RecoveryStep, StartupRecovery
 
     recovery = StartupRecovery()
     recovery.register(RecoveryStep(name="step_a", fn=lambda: 2))
@@ -82,7 +67,7 @@ def test_steps_execute_in_registration_order():
     that lets 1E's GhostJobRecovery run before UnindexedExpressionRecovery
     (ghost jobs produce failed-state expressions that shouldn't be re-queued).
     """
-    from audiobench.daemon.startup_recovery import StartupRecovery, RecoveryStep
+    from audiobench.daemon.startup_recovery import RecoveryStep, StartupRecovery
 
     execution_order = []
     recovery = StartupRecovery()
@@ -101,8 +86,8 @@ def test_recovery_results_logged_to_journal():
     We patch the logger to avoid real I/O — the point is that the structured
     result reaches the logging layer, not that a specific SQLite row exists.
     """
-    from audiobench.daemon.startup_recovery import StartupRecovery, RecoveryStep
     import audiobench.daemon.startup_recovery as sr_mod
+    from audiobench.daemon.startup_recovery import RecoveryStep, StartupRecovery
 
     recovery = StartupRecovery()
     recovery.register(RecoveryStep(name="ghost_jobs", fn=lambda: 5))
@@ -121,7 +106,7 @@ def test_failing_step_does_not_abort_subsequent_steps():
     A step that raises must be caught so subsequent steps still run.
     The result for the failed step must indicate 0 (safe default).
     """
-    from audiobench.daemon.startup_recovery import StartupRecovery, RecoveryStep
+    from audiobench.daemon.startup_recovery import RecoveryStep, StartupRecovery
 
     def _bad():
         raise RuntimeError("disk exploded")
@@ -138,43 +123,6 @@ def test_failing_step_does_not_abort_subsequent_steps():
     assert result["good_step"] == 1
 
 
-# ---------------------------------------------------------------------------
-# GhostJobRecovery
-# ---------------------------------------------------------------------------
-
-def test_ghost_job_recovery_marks_dead_jobs_failed(test_db):
-    """
-    GhostJobRecovery must mark jobs whose PID is no longer alive as 'failed'.
-    Uses PID 1 as a guaranteed-alive sentinel and a guaranteed-dead PID (999999).
-    """
-    with get_session() as session:
-        _insert_job(session, job_id=1, pid=999999, status="running")  # dead
-
-    from audiobench.daemon.startup_recovery import GhostJobRecovery
-    count = GhostJobRecovery()
-
-    assert count == 1
-
-    with get_session() as session:
-        assert _get_job_status(session, 1) == "failed"
-
-
-def test_alive_job_not_touched_by_ghost_recovery(test_db):
-    """
-    GhostJobRecovery must not modify jobs whose PID is still alive.
-    Uses os.getpid() — guaranteed alive for the duration of this test.
-    """
-    live_pid = os.getpid()
-    with get_session() as session:
-        _insert_job(session, job_id=1, pid=live_pid, status="running")
-
-    from audiobench.daemon.startup_recovery import GhostJobRecovery
-    count = GhostJobRecovery()
-
-    assert count == 0
-
-    with get_session() as session:
-        assert _get_job_status(session, 1) == "running"
 
 
 # ---------------------------------------------------------------------------
@@ -189,17 +137,15 @@ def test_unindexed_recovery_queues_missing_expressions(test_db):
     """
     from audiobench.daemon.startup_recovery import UnindexedExpressionRecovery
     from audiobench.daemon.sweep_state import SweepState
+    from audiobench.storage.models import ExpressionRecord, TranscriptionRecord
 
     # Seed two expressions
     with get_session() as session:
         for eid in [10, 11]:
-            session.execute(
-                sql_text("""
-                INSERT INTO expressions (id, source_type, content, inference_status, created_at)
-                VALUES (:id, 'audio_transcript', 'content', 'none', CURRENT_TIMESTAMP)
-                """),
-                {"id": eid}
-            )
+            t = TranscriptionRecord(id=eid, is_indexed=1, file_name="", full_text="sample text", pipeline_phase="complete")
+            e = ExpressionRecord(id=eid, source_type='audio_transcript', source_id=eid, content='content', graph_role='sweep_chunk')
+            session.add(t)
+            session.add(e)
         session.commit()
 
     sweep = SweepState()
@@ -222,9 +168,10 @@ def test_work_assigned_backfill_idempotent(test_db):
     Since the test DB starts empty and there are no work_assigned system_events
     to backfill, both runs return 0 — idempotency is the invariant.
     """
-    from audiobench.daemon.startup_recovery import WorkAssignedBackfill
-    from audiobench.observatory.db import init_journal_db, get_journal_db_path
     import sqlite3
+
+    from audiobench.daemon.startup_recovery import WorkAssignedBackfill
+    from audiobench.observatory.db import get_journal_db_path, init_journal_db
 
     # The journal DB (journal.db) is separate from the SQLAlchemy test DB.
     # init_journal_db creates it (with reconciliation_queue) in the tmp data_dir.

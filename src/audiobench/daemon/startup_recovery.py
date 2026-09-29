@@ -82,32 +82,10 @@ class StartupRecovery:
 # Concrete steps
 # ---------------------------------------------------------------------------
 
-def GhostJobRecovery() -> int:
-    """Mark running jobs whose PID is no longer alive as 'failed'.
-
-    Uses JobRepository which opens its own sqlite3 connection so that this
-    step works correctly even before the SQLAlchemy session factory is ready.
-    Returns the count of jobs marked failed.
-    """
-    import os
-
-    from audiobench.jobs.repository import JobRepository
-
-    repo = JobRepository()
-    running = repo.get_running_jobs()
-    count = 0
-    for job in running:
-        pid = job.get("pid")
-        if pid and pid > 0:
-            try:
-                os.kill(pid, 0)
-            except (ProcessLookupError, PermissionError):
-                # pid 0 → dead; PermissionError on some systems means the
-                # process exists but is owned by another user — treat as alive.
-                repo.mark_job_failed(job["id"], exit_code=-1)
-                count += 1
-                logger.info("Ghost job #%d (PID %d) marked failed.", job["id"], pid)
-    return count
+# GhostJobRecovery was removed 2026-09-29.
+# It used JobRepository (now deleted) to read the legacy 'jobs' table.
+# The 'jobs' table (System 1) had its last write on 2026-08-31.
+# startup_recovery() in scheduler.py handles unified_jobs orphan detection.
 
 
 def UnindexedExpressionRecovery(sweep_state=None) -> int:
@@ -297,10 +275,16 @@ def WorkAssignedBackfill() -> int:
 # ---------------------------------------------------------------------------
 
 def get_startup_recovery(sweep_state=None) -> StartupRecovery:
-    """Return a StartupRecovery with all three steps registered in order."""
+    """Return a StartupRecovery with active steps registered in order.
+
+    GhostJobRecovery was removed 2026-09-29: it monitored the legacy 'jobs'
+    table (System 1) for dead PIDs. That table had its last write on 2026-08-31.
+    System 3 (worker_daemon + scheduler.startup_recovery) handles unified_jobs
+    orphan detection independently at daemon startup.
+    """
     recovery = StartupRecovery()
-    recovery.register(RecoveryStep(name="ghost_jobs",   fn=GhostJobRecovery))
     recovery.register(RecoveryStep(name="unindexed_expressions",
                                    fn=lambda: UnindexedExpressionRecovery(sweep_state)))
     recovery.register(RecoveryStep(name="work_assigned_backfill", fn=WorkAssignedBackfill))
     return recovery
+

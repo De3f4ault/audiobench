@@ -5,10 +5,12 @@ from __future__ import annotations
 import signal
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import click
 
+from audiobench.cli.display import job_stream
 from audiobench.cli.display.phase_tracker import PhaseTracker
 from audiobench.cli.display.theme import (
     ACCENT,
@@ -26,7 +28,117 @@ from audiobench.cli.display.theme import (
 )
 from audiobench.cli.io.file_collector import collect_files
 from audiobench.cli.io.output_resolver import parse_formats, resolve_output
+from audiobench.core.platform import SUPPORTS_BACKGROUND_JOBS
 from audiobench.core.settings import get_settings
+from audiobench.jobs import scheduler
+
+
+def _detect_explicit_source(raw_files: tuple, is_recursive: bool, from_f: str | None) -> bool:
+    """Check if inputs are explicitly specified filenames (not directories or recursive/file lists)."""
+    if is_recursive or from_f:
+        return False
+    if not raw_files:
+        return False
+    for f in raw_files:
+        try:
+            if Path(str(f)).is_dir():
+                return False
+        except Exception:
+            pass
+    return True
+
+
+def _build_extra_flags(
+    *,
+    output_format: str | None = None,
+    output_path: str | None = None,
+    language: str | None = None,
+    model: str | None = None,
+    speed_preset: str | None = None,
+    no_cache: bool = False,
+    no_timestamps: bool = False,
+    quiet: bool = False,
+    enhance: bool = False,
+    trim: bool = False,
+    denoise: bool = False,
+    audio_filter: str | None = None,
+    initial_prompt: str | None = None,
+    translate: bool = False,
+    diarize: bool = False,
+    diarize_mode: str | None = None,
+    diarize_threshold: float = 0.65,
+    collision: str | None = None,
+    mirror: bool = False,
+    preset_name: str | None = None,
+    id_only: bool = False,
+    engine_name: str | None = None,
+    align: bool | None = None,
+    map_speakers: str | None = None,
+    auto_name: bool = False,
+    target_chapters: str | None = None,
+    resume: bool = False,
+    sensitive: bool = False,
+) -> list[str]:
+    """Serialize transcribe options to forwarded CLI flags."""
+    extra_flags: list[str] = []
+    if output_format:
+        extra_flags += ["-f", output_format]
+    if output_path:
+        extra_flags += ["-o", output_path]
+    if language:
+        extra_flags += ["--language", language]
+    if model:
+        extra_flags += ["--model", model]
+    if speed_preset and speed_preset != "balanced":
+        extra_flags.append(f"--{speed_preset}")
+    if no_cache:
+        extra_flags.append("--no-cache")
+    if no_timestamps:
+        extra_flags.append("--no-timestamps")
+    if quiet:
+        extra_flags.append("--quiet")
+    if enhance:
+        extra_flags.append("--enhance")
+    if trim:
+        extra_flags.append("--trim")
+    if denoise:
+        extra_flags.append("--denoise")
+    if audio_filter:
+        extra_flags += ["--audio-filter", audio_filter]
+    if initial_prompt:
+        extra_flags += ["--initial-prompt", initial_prompt]
+    if translate:
+        extra_flags.append("--translate")
+    if diarize:
+        extra_flags.append("--diarize")
+    if diarize_mode and diarize_mode != "fast":
+        extra_flags += ["--diarize-mode", diarize_mode]
+    if diarize_threshold != 0.65:
+        extra_flags += ["--diarize-threshold", str(diarize_threshold)]
+    if collision and collision != "skip":
+        extra_flags += ["--collision", collision]
+    if mirror:
+        extra_flags.append("--mirror")
+    if preset_name:
+        extra_flags += ["--preset", preset_name]
+    if id_only:
+        extra_flags.append("--id-only")
+    if engine_name:
+        extra_flags += ["--engine", engine_name]
+    if align is not None:
+        extra_flags.append("--align" if align else "--no-align")
+    if map_speakers:
+        extra_flags += ["--map-speakers", map_speakers]
+    if auto_name:
+        extra_flags.append("--auto-name")
+    if target_chapters:
+        extra_flags += ["--target-chapters", target_chapters]
+    if resume:
+        extra_flags.append("--resume")
+    if sensitive:
+        extra_flags.append("--sensitive")
+    return extra_flags
+
 
 # ── Transcribe Command ──────────────────────────────────────
 
@@ -183,7 +295,7 @@ from audiobench.core.settings import get_settings
     "-b",
     "--background",
     is_flag=True,
-    help="Run the transcription in the background",
+    help="Force queuing to background without attaching/streaming live output",
 )
 @click.option(
     "--chapters",
@@ -214,6 +326,13 @@ from audiobench.core.settings import get_settings
     default=None,
     hidden=True,
     help="Internal: ID of the background job for status reporting",
+)
+@click.option(
+    "--events-file",
+    type=click.Path(),
+    default=None,
+    hidden=True,
+    help="Internal: path to events file for live NDJSON streaming",
 )
 @click.option(
     "--strategy",
@@ -284,6 +403,7 @@ def transcribe(
     auto_name: bool,
     background: bool,
     job_id: int | None,
+    events_file: str | None,
     interactive_mode: bool,
     target_chapters: str | None,
     resume: bool,
@@ -336,7 +456,6 @@ def transcribe(
       audiobench transcribe file.m4a --preset meeting    Use saved preset
       audiobench transcribe dir/ --id-only               Output IDs only (piping)
     """
-    from audiobench.core.platform import SUPPORTS_BACKGROUND_JOBS
     from audiobench.transcribe.transcriber import TranscriptionPipeline
 
     # ── Interactive wizard ──────────────────────────────────
@@ -354,7 +473,7 @@ def transcribe(
                 ],
                 default_idx=0,
             )
-            
+
             if source_action == "exit":
                 return
             elif source_action == "path":
@@ -382,7 +501,7 @@ def transcribe(
                 with get_session() as session:
                     rec = session.query(AudioFileRecord).get(selected_ids[0])
                     if rec: files = (rec.file_path,)
-            
+
             if not files:
                 return
 
@@ -400,8 +519,9 @@ def transcribe(
         except Exception:
             pass
 
-        from audiobench.cli.display.theme import BOX_STYLE
         from rich.panel import Panel
+
+        from audiobench.cli.display.theme import BOX_STYLE
 
         console.print(
             Panel(
@@ -563,94 +683,11 @@ def transcribe(
             console.print()
             return
 
-    if background:
-        if not SUPPORTS_BACKGROUND_JOBS:
-            console.print(
-                f"  [{WARNING}]Background jobs are only supported on Linux/macOS. Running in foreground...[/]"
-            )
-            background = False
-        else:
-            from audiobench.jobs.runner import submit_job
-
-            # Reconstruct the command from Click's parsed parameters rather than
-            # sys.argv. This works correctly whether called from CLI or the REPL,
-        # where sys.argv would only contain ['repl'] and be useless.
-        ctx = click.get_current_context()
-        clean_args = ["transcribe"]
-
-        # Re-add every flag that was explicitly set by the user
-        params = ctx.params
-        for f in files:
-            clean_args.append(f)
-        if output_format:
-            clean_args += ["-f", output_format]
-        if output_path:
-            clean_args += ["-o", output_path]
-        if language:
-            clean_args += ["--language", language]
-        if model:
-            clean_args += ["--model", model]
-        if speed_preset and speed_preset != "balanced":
-            clean_args.append(f"--{speed_preset}")
-        if no_cache:
-            clean_args.append("--no-cache")
-        if no_timestamps:
-            clean_args.append("--no-timestamps")
-        if quiet:
-            clean_args.append("--quiet")
-        if enhance:
-            clean_args.append("--enhance")
-        if trim:
-            clean_args.append("--trim")
-        if denoise:
-            clean_args.append("--denoise")
-        if audio_filter:
-            clean_args += ["--audio-filter", audio_filter]
-        if initial_prompt:
-            clean_args += ["--initial-prompt", initial_prompt]
-        if translate:
-            clean_args.append("--translate")
-        if diarize:
-            clean_args.append("--diarize")
-        if diarize_mode and diarize_mode != "fast":
-            clean_args += ["--diarize-mode", diarize_mode]
-        if diarize_threshold != 0.65:
-            clean_args += ["--diarize-threshold", str(diarize_threshold)]
-        if recursive:
-            clean_args.append("--recursive")
-        if extensions:
-            clean_args += ["--extensions", extensions]
-        if from_file:
-            clean_args += ["--from-file", from_file]
-        if exclude:
-            clean_args += ["--exclude", exclude]
-        if collision and collision != "skip":
-            clean_args += ["--collision", collision]
-        if mirror:
-            clean_args.append("--mirror")
-        if preset_name:
-            clean_args += ["--preset", preset_name]
-        if id_only:
-            clean_args.append("--id-only")
-        if engine_name:
-            clean_args += ["--engine", engine_name]
-        if align is not None:
-            clean_args.append("--align" if align else "--no-align")
-        if map_speakers:
-            clean_args += ["--map-speakers", map_speakers]
-        if auto_name:
-            clean_args.append("--auto-name")
-        # NOTE: --background is intentionally omitted to avoid infinite loop
-
-        audio_file = None
-        if files:
-            audio_file = str(files[0])
-            if len(files) > 1:
-                audio_file += f" (+{len(files) - 1} more)"
-
-        job_id = submit_job(clean_args, audio_file=audio_file)
-        console.print(f"  [{SUCCESS}][{job_id}][/] Background job submitted")
-        return
+    if background and not SUPPORTS_BACKGROUND_JOBS:
+        console.print(
+            f"  [{WARNING}]Background jobs are only supported on Linux/macOS. Running in foreground...[/]"
+        )
+        background = False
 
     # E1: Load preset defaults (CLI flags override)
     if preset_name:
@@ -723,16 +760,17 @@ def transcribe(
                 return
 
             if action == "path":
-                from audiobench.cli.wizard import prompt_file
                 import os
+
+                from audiobench.cli.wizard import prompt_file
                 p = prompt_file("Enter file path")
                 if not os.path.exists(p):
                     console.print(f"  [{WARNING}]File does not exist: {p}[/]")
                     continue
-                
+
                 # Import it invisibly so it has an audio_file_id
-                from audiobench.transcribe.audio_converter import probe
                 from audiobench.storage.repository import AudioFileRepository
+                from audiobench.transcribe.audio_converter import probe
                 try:
                     info = probe(p)
                     repo = AudioFileRepository()
@@ -795,23 +833,30 @@ def transcribe(
                     edit_cart_items()
                     continue
                 elif checkout_action in ("now", "later"):
-                    from audiobench.jobs.queue_worker import _spawn_daemon, process_queue
-                    from audiobench.storage.models import JobQueueItem
-
                     with get_session() as session:
                         items = session.query(StagingCartItem).all()
                         count = len(items)
-                        for item in items:
+                        batch_id = f"cart_{uuid.uuid4().hex[:8]}" if count > 1 else None
+                        for idx, item in enumerate(items):
                             file_path = item.audio_file.file_path if item.audio_file else None
                             if file_path:
-                                session.add(
-                                    JobQueueItem(
-                                        file_path=file_path,
-                                        engine=item.engine,
-                                        model_name=item.model_name,
-                                        speed_preset=item.speed_preset,
-                                        status="pending",
-                                    )
+                                item_args = ["transcribe", file_path]
+                                if item.engine:
+                                    item_args.extend(["--engine", item.engine])
+                                if item.model_name:
+                                    item_args.extend(["--model", item.model_name])
+                                if item.speed_preset:
+                                    item_args.append(f"--{item.speed_preset}")
+
+                                scheduler.enqueue(
+                                    job_type="transcribe",
+                                    args=item_args,
+                                    slot="transcription",
+                                    file_label=Path(file_path).name,
+                                    batch_id=batch_id,
+                                    batch_label="Staging Cart",
+                                    batch_index=idx + 1,
+                                    batch_total=count,
                                 )
                         session.query(StagingCartItem).delete()
                         session.commit()
@@ -824,10 +869,10 @@ def transcribe(
                         console.print(
                             f"\n  [{ACCENT}]Processing {count} files sequentially in foreground...[/]"
                         )
-                        process_queue(foreground=True)
+                        scheduler.drain_slot("transcription")
                         return
                     elif checkout_action == "later":
-                        _spawn_daemon()
+                        scheduler.ensure_worker()
                         console.print(
                             f"\n  [{ACCENT}]✓ Added {count} files to background queue.[/]"
                         )
@@ -860,7 +905,7 @@ def transcribe(
         console.print(
             error_panel("No files found", "No supported audio/video files matched the input.")
         )
-        return
+        raise click.exceptions.Exit(1)
 
     if not quiet and len(resolved_files) != len(files or ()):
         # Show discovery summary when directory/glob expanded the input
@@ -928,7 +973,7 @@ def transcribe(
 
     if parallel_gpus:
         from audiobench.transcription.parallel import ParallelTranscriber
-        
+
         opts = {
             "output_path": output_path,
             "primary_format": primary_format,
@@ -958,10 +1003,131 @@ def transcribe(
             "sensitive": sensitive,
             "align": align,
         }
-        
+
         pt = ParallelTranscriber()
         pt.run(resolved_files, opts)
         return
+
+    # ── Unified Intelligent Dispatcher & Deduplication ─────────
+    if not parallel_gpus and not job_id and not check:
+        skip_done = not (no_cache or (collision and collision == "overwrite"))
+        files_to_process = scheduler.deduplicate_files(resolved_files, skip_done=skip_done)
+
+        if not files_to_process:
+            console.print(
+                f"  [{SUCCESS}]All {len(resolved_files)} file(s) are already completed or queued.[/]"
+            )
+            return
+
+        if len(files_to_process) < len(resolved_files):
+            console.print(
+                f"  [{DIM}]Skipping {len(resolved_files) - len(files_to_process)} already completed or queued file(s).[/]"
+            )
+
+        if SUPPORTS_BACKGROUND_JOBS:
+            is_explicit = _detect_explicit_source(files, recursive, from_file)
+            extra_flags = _build_extra_flags(
+                output_format=output_format,
+                output_path=output_path,
+                language=language,
+                model=model,
+                speed_preset=speed_preset,
+                no_cache=no_cache,
+                no_timestamps=no_timestamps,
+                quiet=quiet,
+                enhance=enhance,
+                trim=trim,
+                denoise=denoise,
+                audio_filter=audio_filter,
+                initial_prompt=initial_prompt,
+                translate=translate,
+                diarize=diarize,
+                diarize_mode=diarize_mode,
+                diarize_threshold=diarize_threshold,
+                collision=collision,
+                mirror=mirror,
+                preset_name=preset_name,
+                id_only=id_only,
+                engine_name=engine_name,
+                align=align,
+                map_speakers=map_speakers,
+                auto_name=auto_name,
+                target_chapters=target_chapters,
+                resume=resume,
+                sensitive=sensitive,
+            )
+
+            resolved_engine = engine_name or getattr(settings, "engine", "faster-whisper")
+            is_cloud = (resolved_engine == "gemini")
+            target_slot = "transcription:cloud" if is_cloud else "transcription:local"
+
+            PRIORITY_THRESHOLD = 5
+            is_priority = is_explicit and len(files_to_process) <= PRIORITY_THRESHOLD and not background
+
+            if is_priority:
+                batch_id = f"batch_{uuid.uuid4().hex[:8]}" if len(files_to_process) > 1 else None
+                batch_label = Path(str(files_to_process[0])).name if len(files_to_process) > 1 else None
+                total_count = len(files_to_process)
+                queued_ids: list[int] = []
+
+                for idx, f in enumerate(files_to_process):
+                    file_args = ["transcribe", str(f.resolve()), *extra_flags]
+                    jid = scheduler.enqueue_priority(
+                        job_type="transcribe",
+                        args=file_args,
+                        slot=target_slot,
+                        file_label=f.name,
+                        batch_id=batch_id,
+                        batch_label=batch_label,
+                        batch_index=idx + 1 if batch_id else None,
+                        batch_total=total_count if batch_id else None,
+                    )
+                    queued_ids.append(jid)
+
+                scheduler.ensure_worker()
+
+                lane_label = "cloud lane" if is_cloud else "local lane"
+                if len(queued_ids) == 1:
+                    console.print(f"  [{ACCENT}][P][/] Queued Job #{queued_ids[0]} at priority ({lane_label}, next in queue)")
+                else:
+                    console.print(
+                        f"  [{ACCENT}][P][/] Queued {len(queued_ids)} jobs at priority ({lane_label}: #{queued_ids[0]}..#{queued_ids[-1]})"
+                    )
+
+                job_stream.stream_jobs_sequence(queued_ids)
+                return
+
+            else:
+                # Normal queue path: bulk, folder, recursive, >5 files, or --background
+                batch_id = f"batch_{uuid.uuid4().hex[:8]}"
+                batch_label = str(files[0]) if files else "Batch"
+                total_count = len(files_to_process)
+
+                for idx, f in enumerate(files_to_process):
+                    file_args = ["transcribe", str(f.resolve()), *extra_flags]
+                    scheduler.enqueue(
+                        job_type="transcribe",
+                        args=file_args,
+                        slot=target_slot,
+                        file_label=f.name,
+                        batch_id=batch_id,
+                        batch_label=batch_label,
+                        batch_index=idx + 1,
+                        batch_total=total_count,
+                        priority=100,
+                    )
+
+                scheduler.ensure_worker()
+                lane_label = "cloud queue" if is_cloud else "background queue"
+                console.print(
+                    f"  [{SUCCESS}]Queued {total_count} file(s) into {lane_label}.[/]\n"
+                    f"  [{DIM}]The background worker will process them sequentially.[/]\n"
+                    f"  [{DIM}]Use [bold]audiobench jobs[/bold] to monitor progress.[/]"
+                )
+                return
+        else:
+            # Fallback for platforms without background worker support (e.g. Windows)
+            resolved_files = files_to_process
 
     pipeline = TranscriptionPipeline()
     results: list[dict] = []
@@ -1008,7 +1174,7 @@ def transcribe(
             console.print(f"  [{DIM}]{'─' * 44}[/]")
 
         start_time = time.perf_counter()
-        tracker = PhaseTracker(quiet=quiet)
+        tracker = PhaseTracker(quiet=quiet, events_file=events_file)
         tracker.start()
 
         # SIGINT handler for graceful partial save
@@ -1062,10 +1228,10 @@ def transcribe(
                 align=align,
             )
 
-            if job_id:
-                from audiobench.jobs.repository import JobRepository
-
-                JobRepository().mark_job_done(job_id)
+            # NOTE: job_id here is a UnifiedJob.id. Completion is recorded by
+            # worker_daemon polling the subprocess exit code — no write back needed.
+            # JobRepository().mark_job_done(job_id) was a no-op here since
+            # 2026-09-17: it targeted the legacy 'jobs' table, not unified_jobs.
 
             # For non-streaming engines (Gemini), segments aren't always emitted
             # during generation, so force a final update to show them if missing.
@@ -1104,11 +1270,18 @@ def transcribe(
 
                 # ── Summary ──
                 console.print()
+                if getattr(transcript, "is_cached", False):
+                    status_line = f"  [{SUCCESS}]✓ Retrieved from cache[/]  [{DIM}]•  existing transcript[/]"
+                else:
+                    status_line = (
+                        f"  [{SUCCESS}]✓ Done in {format_duration(elapsed)}[/]"
+                        f"  [{DIM}]•  {speed_ratio:.1f}x real-time[/]"
+                    )
+
                 console.print(
                     summary_panel(
                         [
-                            f"  [{SUCCESS}]✓ Done in {format_duration(elapsed)}[/]"
-                            f"  [{DIM}]•  {speed_ratio:.1f}x real-time[/]",
+                            status_line,
                             "",
                             f"  Language   [{BOLD}]{transcript.language}[/] "
                             f"({transcript.language_probability * 100:.0f}%)"
@@ -1166,11 +1339,16 @@ def transcribe(
             )
 
         except Exception as e:
+            tracker.abort(str(e))
             if not quiet:
-                tracker.finalize()
                 console.print(error_panel(f"Failed: {input_p.name}", str(e)))
             else:
                 print(f"Error: {input_p.name}: {e}", file=sys.stderr)
+            if job_id:
+                sys.exit(1)
+
+    if not results and resolved_files:
+        raise click.exceptions.Exit(1)
 
     # ── Batch summary ──
     if len(results) > 1 and not quiet:

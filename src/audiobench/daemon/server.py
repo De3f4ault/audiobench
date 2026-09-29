@@ -409,7 +409,7 @@ def _handle_autocomplete(args: dict[str, Any]) -> dict[str, Any]:
     if expression_ids:
         from audiobench.storage.expression_repository import ExpressionRepository
         repo = ExpressionRepository()
-        expr_map = repo.get_by_ids(expression_ids)
+        expr_map = repo.get_by_ids(expression_ids, session=None)
 
         enriched_results = []
         for r in results:
@@ -736,13 +736,13 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
             return
         raw_str = raw.decode("utf-8").strip()
 
-        # Before logging, check if it's autocomplete (high-frequency, low-signal)
+        # Before logging, check if it's autocomplete or playback_status (high-frequency, low-signal)
         try:
             parsed_cmd = json.loads(raw_str).get("cmd", "") if raw_str else ""
         except json.JSONDecodeError:
             parsed_cmd = ""
 
-        if parsed_cmd != "autocomplete":
+        if parsed_cmd not in ("autocomplete", "playback_status"):
             logger.debug("Received from %s: %s", peer, raw_str[:120])
 
         async for response_str in _dispatch(raw_str):
@@ -905,6 +905,12 @@ def _do_sweep_once() -> None:
                     success_ids.append(tx["id"])
                     continue
 
+                # Compute the max privacy tier across all segments of this transcript
+                # so sweep-generated expressions inherit the correct tier at write time.
+                from audiobench.storage.repository import TranscriptionRepository
+                tx_repo = TranscriptionRepository()
+                tx_privacy_tier = tx_repo.get_max_privacy_tier_for_transcriptions([tx["id"]])
+
                 chunks = content_aware_router(text)
                 if chunks:
                     from audiobench.memory.chunking import _clean_text, parent_child_grouper
@@ -921,6 +927,7 @@ def _do_sweep_once() -> None:
                         source_id=tx["id"],
                         work_id=tx["work_id"],
                         graph_role="sweep_document",
+                        privacy_tier=tx_privacy_tier,
                     )
 
                     for pg in parent_groups:
@@ -931,6 +938,7 @@ def _do_sweep_once() -> None:
                             source_id=tx["id"],
                             work_id=tx["work_id"],
                             graph_role="sweep_passage",
+                            privacy_tier=tx_privacy_tier,
                         )
                         expr_repo.link(t2_expr.id, t1_expr.id, RelationType.SOURCE.value)
 
@@ -943,6 +951,7 @@ def _do_sweep_once() -> None:
                                 speaker=child.speaker,
                                 work_id=tx["work_id"],
                                 graph_role="sweep_chunk",
+                                privacy_tier=tx_privacy_tier,
                             )
                             expr_repo.link(t3_expr.id, t2_expr.id, RelationType.SOURCE.value)
 
@@ -956,6 +965,8 @@ def _do_sweep_once() -> None:
                                 "original_language": tx["language"],
                                 "work_id": t3_expr.work_id,
                             })
+
+
 
                     if nodes:
                         # Deduplicate by expression_id: when two child chunks in the same
@@ -1496,8 +1507,10 @@ async def _serve(socket_path: Path, pid_path: Path) -> None:
     recovery = get_startup_recovery()
     await asyncio.get_running_loop().run_in_executor(None, recovery.run)
 
-    from audiobench.jobs.runner import start_pid_watcher
-    start_pid_watcher()
+    # start_pid_watcher() was removed 2026-09-29: it monitored the legacy 'jobs'
+    # table (System 1) for dead PIDs. System 3 (worker_daemon) handles orphan
+    # detection for unified_jobs in its own main loop.
+
 
     from audiobench.daemon.autocomplete import get_autocomplete_index
     await asyncio.get_running_loop().run_in_executor(None, get_autocomplete_index().build)

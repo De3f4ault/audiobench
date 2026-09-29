@@ -22,6 +22,8 @@ from audiobench.jobs.scheduler import (
     acquire_os_lock,
     claim_next_pending,
     get_slot_capacity,
+    has_active_local_compute,
+    has_active_transcription,
     is_alive,
     startup_recovery,
 )
@@ -29,7 +31,14 @@ from audiobench.storage.models import UnifiedJob
 
 logger = get_logger("jobs.worker_daemon")
 
-SLOT_ORDER = ["transcription", "network", "indexing"]
+SLOT_ORDER = [
+    "transcription:local",
+    "transcription:cloud",
+    "transcription:align",
+    "transcription",
+    "network",
+    "indexing",
+]
 
 
 def run_daemon(max_idle_seconds: float = 3.0) -> None:
@@ -64,9 +73,47 @@ def run_daemon(max_idle_seconds: float = 3.0) -> None:
                     with get_session() as session:
                         j = session.get(UnifiedJob, job_id)
                         if j:
+                            if j.status == "pending":
+                                logger.info("Preempted job #%d process yielded cleanly.", job_id)
+                                continue
                             if ret == 0:
-                                j.status = "done"
-                                j.exit_code = 0
+                                failed_msg = None
+                                if log_path.exists():
+                                    try:
+                                        content = log_path.read_text().strip()
+                                        if "✗ No files found" in content or "No supported audio/video files" in content:
+                                            failed_msg = "No supported audio/video files matched input"
+                                        elif "is already running for" in content or "is already pending for" in content:
+                                            failed_msg = "Self-interception duplicate loop detected"
+                                        elif "✗ Failed:" in content:
+                                            failed_msg = "Execution failed (see log)"
+                                        elif "Retrieved from cache" in content:
+                                            j.error_summary = "Retrieved from cache"
+                                    except Exception:
+                                        pass
+
+                                if failed_msg:
+                                    j.status = "failed"
+                                    j.exit_code = 1
+                                    j.error_summary = failed_msg
+                                else:
+                                    j.status = "done"
+                                    j.exit_code = 0
+
+                                if j.job_type == "align":
+                                    try:
+                                        raw_args = json.loads(j.args_json)
+                                        if len(raw_args) > 1:
+                                            tx_id = int(raw_args[1])
+                                            from audiobench.storage.models import TranscriptionRecord
+                                            tx_rec = session.get(TranscriptionRecord, tx_id)
+                                            if tx_rec:
+                                                if failed_msg:
+                                                    tx_rec.pipeline_phase = "degraded"
+                                                elif tx_rec.pipeline_phase != "degraded":
+                                                    tx_rec.pipeline_phase = "complete"
+                                    except Exception:
+                                        pass
                             else:
                                 j.status = "failed"
                                 j.exit_code = ret
@@ -79,6 +126,18 @@ def run_daemon(max_idle_seconds: float = 3.0) -> None:
                                     except Exception:
                                         pass
                                 j.error_summary = err
+
+                                if j.job_type == "align":
+                                    try:
+                                        raw_args = json.loads(j.args_json)
+                                        if len(raw_args) > 1:
+                                            tx_id = int(raw_args[1])
+                                            from audiobench.storage.models import TranscriptionRecord
+                                            tx_rec = session.get(TranscriptionRecord, tx_id)
+                                            if tx_rec:
+                                                tx_rec.pipeline_phase = "degraded"
+                                    except Exception:
+                                        pass
                             j.ended_at = datetime.now(UTC)
                             session.commit()
                     processed_count += 1
@@ -89,9 +148,9 @@ def run_daemon(max_idle_seconds: float = 3.0) -> None:
                     try:
                         if os.name == "posix":
                             os.killpg(proc.pid, signal.SIGTERM)
-                            time.sleep(0.5)
-                            if is_alive(proc.pid):
-                                os.killpg(proc.pid, signal.SIGKILL)
+                        time.sleep(0.5)
+                        if is_alive(proc.pid):
+                            os.killpg(proc.pid, signal.SIGKILL)
                         else:
                             proc.kill()
                     except Exception:
@@ -120,9 +179,51 @@ def run_daemon(max_idle_seconds: float = 3.0) -> None:
                         job.error_summary = f"Process died unexpectedly (PID {job.pid})"
                         session.commit()
 
+            # 2.5 Preempt running indexing processes ONLY if urgent local transcription is active
+            with get_session() as session:
+                has_urgent_local = (
+                    session.query(UnifiedJob)
+                    .filter(
+                        UnifiedJob.slot.in_(["transcription", "transcription:local"]),
+                        UnifiedJob.status.in_(["pending", "running"]),
+                    )
+                    .count()
+                    > 0
+                )
+            if has_urgent_local:
+                for jid in list(running_procs.keys()):
+                    with get_session() as session:
+                        j = session.get(UnifiedJob, jid)
+                        if j and j.slot == "indexing":
+                            proc, _, _, _ = running_procs.pop(jid)
+                            logger.info("Worker daemon preempting indexing job #%d for transcription priority", jid)
+                            try:
+                                if os.name == "posix":
+                                    os.killpg(proc.pid, signal.SIGTERM)
+                                else:
+                                    proc.terminate()
+                                proc.wait(timeout=1.0)
+                            except Exception:
+                                try:
+                                    if os.name == "posix":
+                                        os.killpg(proc.pid, signal.SIGKILL)
+                                    else:
+                                        proc.kill()
+                                except Exception:
+                                    pass
+                            j.status = "pending"
+                            j.pid = None
+                            j.started_at = None
+                            j.ended_at = None
+                            j.exit_code = None
+                            j.error_summary = "Preempted by transcription workload"
+                            session.commit()
+
             # 3. Schedule next pending jobs for each slot
             spawned_any = False
             for slot in SLOT_ORDER:
+                if slot == "indexing" and has_active_local_compute():
+                    continue
                 capacity = get_slot_capacity(slot)
                 with get_session() as session:
                     running_count = (
@@ -150,6 +251,9 @@ def run_daemon(max_idle_seconds: float = 3.0) -> None:
 
                     if raw_args and raw_args[0] == "_biometric_worker":
                         cmd = [sys.executable, "-m", "audiobench._biometric_worker", *raw_args[1:]]
+                    elif raw_args and raw_args[0] == "align":
+                        worker_script = Path(__file__).parent.parent / "daemon" / "alignment_worker.py"
+                        cmd = [sys.executable, str(worker_script), *raw_args[1:]]
                     elif raw_args and raw_args[0].startswith("audiobench."):
                         cmd = [sys.executable, "-m", raw_args[0], *raw_args[1:]]
                     elif raw_args and raw_args[0] == "audiobench":
@@ -157,8 +261,8 @@ def run_daemon(max_idle_seconds: float = 3.0) -> None:
                     else:
                         cmd = [sys.executable, "-m", "audiobench", *raw_args]
 
-                    if job.job_type == "transcribe":
-                        if "--job-id" not in cmd:
+                    if job.job_type in ("transcribe", "align"):
+                        if "--job-id" not in cmd and job.job_type == "transcribe":
                             cmd.extend(["--job-id", str(job_id)])
                         if "--events-file" not in cmd:
                             cmd.extend(["--events-file", str(events_path)])
@@ -169,6 +273,22 @@ def run_daemon(max_idle_seconds: float = 3.0) -> None:
                         kwargs["start_new_session"] = True
                     else:
                         kwargs["creationflags"] = 0x00000200
+
+                    env = os.environ.copy()
+                    settings = get_settings()
+                    if job.slot == "indexing":
+                        n_threads = str(settings.resolve_indexing_threads())
+                        env["OMP_NUM_THREADS"] = n_threads
+                        env["MKL_NUM_THREADS"] = n_threads
+                    elif job.slot == "transcription:align":
+                        n_threads = str(settings.resolve_alignment_threads())
+                        env["OMP_NUM_THREADS"] = n_threads
+                        env["MKL_NUM_THREADS"] = n_threads
+                    elif job.slot == "transcription:local":
+                        n_threads = str(settings.resolve_cpu_threads())
+                        env["OMP_NUM_THREADS"] = n_threads
+                        env["MKL_NUM_THREADS"] = n_threads
+                    kwargs["env"] = env
 
                     log_out = open(log_path, "a", buffering=1)
                     try:

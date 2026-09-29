@@ -134,6 +134,20 @@ JOBS_COMMAND_REGISTRY: list[CommandMeta] = [
         example="/clear",
     ),
     CommandMeta(
+        name="/diff",
+        aliases=["/compare"],
+        summary="Compare two jobs side-by-side to detect duplicates and option differences",
+        synopsis="<id1> <id2>",
+        example="/diff 80 81",
+    ),
+    CommandMeta(
+        name="/resume",
+        aliases=["/start"],
+        summary="Ensure background worker is running to process pending queue",
+        synopsis="",
+        example="/resume",
+    ),
+    CommandMeta(
         name="/help",
         aliases=["/?"],
         summary="Show interactive commands and usage guide",

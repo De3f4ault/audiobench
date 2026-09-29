@@ -208,17 +208,12 @@ class ReplSession:
         """
         job_badge = ""
         try:
-            from pathlib import Path
+            from audiobench.jobs.scheduler import count_pending_jobs
 
-            from audiobench.core.settings import get_settings
-
-            active_file = Path(get_settings().data_dir) / "jobs.active"
-            if active_file.exists():
-                count = active_file.read_text().strip()
-                if count.isdigit() and int(count) > 0:
-                    n = int(count)
-                    label = "job" if n == 1 else "jobs"
-                    job_badge = f"<ansiyellow>[{n} {label}]</ansiyellow> "
+            n = count_pending_jobs()
+            if n > 0:
+                label = "job" if n == 1 else "jobs"
+                job_badge = f"<ansiyellow>[{n} {label}]</ansiyellow> "
         except Exception:
             pass
 
@@ -302,7 +297,7 @@ class ReplSession:
     def set_context(self, record_id: int) -> None:
         """Set the current context using a transcript ID."""
         repo = self._get_repo()
-        record = repo.get_by_id(record_id)
+        record = repo.get_by_id(record_id, session=self)
 
         if not record:
             console.print(f"  [{WARNING}]Transcript #{record_id} not found[/]")
@@ -358,11 +353,32 @@ class ReplSession:
                                     per-query (no TTL, re-auth each time).
 
         Tier 3 can never get a session_unlock_tier — it is always per-query.
+
+        Synchronous idle check: fires at read-time so wake-from-sleep can't
+        outpace the 15-second background watcher thread.  If the wall-clock
+        elapsed since last_keystroke_at exceeds idle_lock_seconds, the
+        session is locked right here, before returning any tier value.
         """
+        # ── Synchronous idle check (closes the wake-from-sleep race) ─────────
+        if self.session_unlock_tier > 0 or self.unlocked_tier > 0:
+            from audiobench.core.settings import get_settings as _get_settings
+            _idle_secs = _get_settings().idle_lock_seconds
+            if _idle_secs > 0:
+                idle = (datetime.now(UTC) - self.last_keystroke_at).total_seconds()
+                if idle >= _idle_secs:
+                    self.unlocked_tier = 0
+                    self.tier1_unlocked_at = None
+                    self.session_unlock_tier = 0
+                    self._idle_lock_fired = True
+                    logger.debug(
+                        "effective_tier(): sync idle-lock fired after %.0fs idle", idle
+                    )
+
         # Session unlock wins if it's higher than the per-query unlock
         if self.session_unlock_tier > 0:
             return max(self.session_unlock_tier, self._per_query_tier())
         return self._per_query_tier()
+
 
     def _per_query_tier(self) -> int:
         """Evaluate the per-query unlock tier with TTL logic."""
