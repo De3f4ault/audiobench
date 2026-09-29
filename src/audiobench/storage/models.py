@@ -64,6 +64,9 @@ class AudioFileRecord(Base):
     youtube_video_id: Mapped[str | None] = mapped_column(
         String(11), unique=True, nullable=True, index=True
     )
+    youtube_channel_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )  # UC... ID — allows get_library_count() to scope to a specific channel
 
     # Relationships
     work: Mapped[WorkRecord | None] = relationship(back_populates="audio_files")
@@ -122,9 +125,7 @@ class ChapterRecord(Base):
     bookmarks: Mapped[list[BookmarkRecord]] = relationship(
         back_populates="chapter", cascade="all, delete-orphan"
     )
-    jobs: Mapped[list[JobRecord]] = relationship(
-        back_populates="chapter", cascade="all, delete-orphan"
-    )
+    # jobs relationship removed 2026-09-29: JobRecord (System 1 'jobs' table) retired.
 
     @property
     def is_real(self) -> bool:
@@ -339,32 +340,10 @@ class BookmarkRecord(Base):
         return f"<Bookmark(id={self.id}, {kind}, t={self.timestamp:.1f}, name='{self.name[:30]}')>"
 
 
-class JobRecord(Base):
-    """Persisted background job state."""
 
-    __tablename__ = "jobs"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    command: Mapped[str] = mapped_column(Text, nullable=False)
-    pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    status: Mapped[str] = mapped_column(
-        String(20), default="running"
-    )  # running, done, failed, cancelled
-    log_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
-    events_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
-    audio_file: Mapped[str | None] = mapped_column(String(1024), nullable=True)
-    chapter_id: Mapped[int | None] = mapped_column(
-        Integer, ForeignKey("chapters.id", ondelete="CASCADE"), nullable=True
-    )
-    started_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
-    ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
-
-    # Relationships
-    chapter: Mapped[ChapterRecord | None] = relationship(back_populates="jobs")
-
-    def __repr__(self) -> str:
-        return f"<Job(id={self.id}, status='{self.status}', cmd='{self.command[:30]}')>"
+# JobRecord (jobs table, System 1) was removed 2026-09-29.
+# Introduced 2026-05-31; last write 2026-08-31 (56 rows, all status='failed').
+# runner.py (its only writer) had zero callers in src/. Data preserved in DB.
 
 
 class ExpressionRecord(Base):
@@ -595,24 +574,70 @@ class StagingCartItem(Base):
         return f"<StagingCartItem(id={self.id}, audio_id={self.audio_file_id}, engine='{self.engine}')>"
 
 
-class JobQueueItem(Base):
-    """A persistent background job for sequential execution."""
+# JobQueueItem (job_queue table, System 2) was removed 2026-09-29.
+# The table had its last write on 2026-08-08; queue_worker.py was its only
+# writer and had zero callers in src/. Data is preserved in the DB.
 
-    __tablename__ = "job_queue"
+
+class UnifiedJob(Base):
+    """A single unit of work with a persistent lifecycle."""
+
+    __tablename__ = "unified_jobs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    file_path: Mapped[str] = mapped_column(String(1024), nullable=False)
-    engine: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    model_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    speed_preset: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    strategy: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    job_type: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # What to execute
+    command_display: Mapped[str] = mapped_column(String(1024), default="", nullable=False)
+    args_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+
+    # Lifecycle
     status: Mapped[str] = mapped_column(
-        String(20), default="pending"
-    )  # pending, processing, done, failed
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+        String(20), default="pending", nullable=False, index=True
+    )  # pending, running, done, failed, cancelled
+
+    # Concurrency control
+    slot: Mapped[str] = mapped_column(
+        String(32), default="transcription", nullable=False, index=True
+    )  # transcription, network, indexing
+
+    # Batch identity
+    batch_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    batch_label: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    batch_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    batch_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Process tracking
+    pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    log_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    events_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+
+    # Display
+    file_label: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
+    # Deduplication fingerprint
+    fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+
+    # Timing
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(UTC), index=True
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # Outcome
+    exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Retry
+    attempt: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+    # Priority
+    priority: Mapped[int] = mapped_column(Integer, default=100, nullable=False, index=True)
 
     def __repr__(self) -> str:
-        return f"<JobQueueItem(id={self.id}, status='{self.status}')>"
+        return f"<UnifiedJob(id={self.id}, type='{self.job_type}', status='{self.status}', slot='{self.slot}')>"
 
 
 class CommandEvent(Base):
@@ -779,3 +804,96 @@ class YouTubeChannel(Base):
     def __repr__(self) -> str:
         return f"<YouTubeChannel(query='{self.query}', id='{self.channel_id}')>"
 
+
+class YouTubeChannelNode(Base):
+    """A first-class channel node — a standing relationship with an invited voice.
+
+    IMPORTANT:
+    - whiteboard_text is NEVER sent to LanceDB. Enforced in channel_store.py.
+      It is an operational note (orients the user on return), not corpus content.
+    - engagement_weight is NOT stored here. It is computed on read by
+      channel_store.compute_engagement_weight() from last_visited_at.
+      Storing it would create a stale number that never decays — the absence of
+      events would not lower it, only new events would move it.
+    """
+
+    __tablename__ = "youtube_channel_nodes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    channel_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(512), nullable=False)
+    thumbnail_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # The channel whiteboard — operational note, never embedded, never in LanceDB.
+    whiteboard_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    whiteboard_updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # Only stored engagement signal. Weight is derived from this on read, not stored.
+    last_visited_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+
+    # Relationship to playlist cache (one-to-one)
+    playlist_cache: Mapped[YouTubePlaylistCache | None] = relationship(
+        back_populates="channel_node", uselist=False, cascade="all, delete-orphan"
+    )
+
+    def __repr__(self) -> str:
+        return f"<YouTubeChannelNode(id='{self.channel_id}', title='{self.title[:40]}')>"
+
+
+class YouTubePlaylistCache(Base):
+    """Cached uploads playlist for a channel.
+
+    Filled by Phase 2 (playlist.py). Schema locked here in Phase 1.
+
+    videos_json is a JSON array of objects with this exact shape:
+        {
+            "video_id":    "vcrv2Sr988M",
+            "title":       "We spend little time studying ourselves",
+            "published_at": "2026-08-29",
+            "duration_pt": "PT14M20S",
+            "availability": "public"        # public | unlisted | private_or_removed
+        }
+
+    availability is captured at fetch time from the API response — NOT derived
+    from the title string. "Private video" as a title is not a reliable signal.
+
+    video_count_available (public + unlisted) is the denominator for the UI
+    progress display ("89/312"). video_count_total is the raw API count and
+    includes private/removed placeholders — it is NOT shown to the user as
+    the target number.
+    """
+
+    __tablename__ = "youtube_playlist_cache"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    channel_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("youtube_channel_nodes.channel_id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+    )
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+    # Raw count from API pageInfo.totalResults — includes private placeholders.
+    video_count_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # Fetchable count only (availability = public | unlisted). UI denominator.
+    video_count_available: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # JSON array — see class docstring for entry shape.
+    videos_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+
+    # nextPageToken from the last API call. None = fully fetched, token = partial.
+    next_page_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Relationship back to channel node
+    channel_node: Mapped[YouTubeChannelNode] = relationship(back_populates="playlist_cache")
+
+    def __repr__(self) -> str:
+        return (
+            f"<YouTubePlaylistCache(channel_id='{self.channel_id}', "
+            f"available={self.video_count_available}/{self.video_count_total}, "
+            f"fetched={self.fetched_at.date() if self.fetched_at else None})>"
+        )

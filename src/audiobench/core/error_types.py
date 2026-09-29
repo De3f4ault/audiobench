@@ -117,3 +117,11 @@ class OutputFormatError(AudioBenchError):
             message=f"Output format error ({format_name})",
             details=reason,
         )
+
+
+# --- AI / LLM ---
+
+
+class AIError(AudioBenchError):
+    """AI/LLM inference or provider failure."""
+

@@ -89,7 +89,15 @@ class AudioBenchSettings(BaseSettings):
     )
     cpu_threads: int = Field(
         default=0,
-        description="CPU threads for CTranslate2 (0 = auto-detect physical cores)",
+        description="CPU threads for CTranslate2 (0 = utilize all available cores)",
+    )
+    indexing_threads: int | None = Field(
+        default=None,
+        description="CPU threads for biometric indexing (None/0 = utilize all available cores)",
+    )
+    alignment_threads: int | None = Field(
+        default=None,
+        description="CPU threads for forced alignment (None/0 = utilize all available cores)",
     )
     beam_size: int = Field(default=3, ge=1, le=10, description="Beam search size")
 
@@ -231,6 +239,20 @@ class AudioBenchSettings(BaseSettings):
     summary_min_turns: int = Field(
         default=3, description="Minimum chat turns required to trigger session summary"
     )
+    chat_autocomplete_verbosity: str = Field(
+        default="brief",
+        description="Chat autocomplete popup verbosity: minimal, brief, detailed",
+    )
+    chat_search_default_k: int = Field(
+        default=8,
+        ge=1,
+        le=50,
+        description="Default number of search fragments to show in chat /search",
+    )
+    pause_on_exit: bool = Field(
+        default=True,
+        description="Automatically pause daemon audio playback when exiting interactive sessions (chat, show)",
+    )
     lancedb_path: Path = Field(
         default_factory=lambda: _DATA_DIR / "lancedb",
         description="Path to embedded LanceDB directory",
@@ -320,6 +342,12 @@ class AudioBenchSettings(BaseSettings):
             "Uses exponential backoff with jitter (2s → 60s). "
             "Applies to both the primary and fallback model calls."
         ),
+    )
+    transcription_cloud_slots: int = Field(
+        default=1,
+        ge=1,
+        le=10,
+        description="Maximum concurrent transcription jobs when using cloud engine (Gemini).",
     )
 
     # --- Logging ---
@@ -423,6 +451,16 @@ class AudioBenchSettings(BaseSettings):
             )
         return v
 
+    @field_validator("chat_autocomplete_verbosity")
+    @classmethod
+    def validate_chat_autocomplete_verbosity(cls, v: str) -> str:
+        valid = {"minimal", "brief", "detailed"}
+        if v.lower() not in valid:
+            raise ValueError(
+                f"Invalid chat_autocomplete_verbosity: {v}. Choose from: {', '.join(sorted(valid))}"
+            )
+        return v.lower()
+
     def ensure_dirs(self) -> None:
         """Create data and model directories if they don't exist."""
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -524,11 +562,29 @@ class AudioBenchSettings(BaseSettings):
             return f"cuda:{n_gpus - 1}"
 
     def resolve_cpu_threads(self) -> int:
-        """Resolve CPU thread count (0 = auto-detect physical cores)."""
+        """Resolve CPU thread count (0 = utilize all available cores)."""
         if self.cpu_threads > 0:
             return self.cpu_threads
         try:
-            return max(1, (os.cpu_count() or 4) // 2)
+            return max(1, os.cpu_count() or 4)
+        except Exception:
+            return 4
+
+    def resolve_indexing_threads(self) -> int:
+        """Resolve CPU thread count for indexing (0 or None = all available cores)."""
+        if self.indexing_threads and self.indexing_threads > 0:
+            return self.indexing_threads
+        try:
+            return max(1, os.cpu_count() or 4)
+        except Exception:
+            return 4
+
+    def resolve_alignment_threads(self) -> int:
+        """Resolve CPU thread count for alignment (0 or None = all available cores)."""
+        if self.alignment_threads and self.alignment_threads > 0:
+            return self.alignment_threads
+        try:
+            return max(1, os.cpu_count() or 4)
         except Exception:
             return 4
 

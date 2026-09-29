@@ -27,6 +27,8 @@ Rules:
 - Include word-level timestamps if possible.
 - Detect the spoken language automatically.
 - Preserve the original language — do NOT translate unless asked.
+- CRITICAL: Do NOT hallucinate speech on silence or background noise.
+- CRITICAL: If a phrase repeats endlessly, STOP transcribing it after 2 repetitions.
 - Return raw JSON only. No explanation, no markdown fences.
 """
 
@@ -58,6 +60,8 @@ Rules:
 - Include word-level timestamps if possible.
 - Detect the spoken language automatically.
 - Preserve the original language — do NOT translate unless asked.
+- CRITICAL: Do NOT hallucinate speech on silence or background noise.
+- CRITICAL: If a phrase repeats endlessly, STOP transcribing it after 2 repetitions.
 - Return raw JSON only. No explanation, no markdown fences.
 """
 
@@ -81,6 +85,8 @@ Return ONLY a valid JSON object with this exact structure (no markdown, no fence
 Rules:
 - Translate ALL speech to English.
 - Split into natural segments (sentences or clauses).
+- CRITICAL: Do NOT hallucinate speech on silence or background noise.
+- CRITICAL: If a phrase repeats endlessly, STOP transcribing it after 2 repetitions.
 - Return raw JSON only. No explanation, no markdown fences.
 """
 
@@ -107,6 +113,8 @@ Rules:
 - Start a new segment when the speaker changes OR at natural sentence boundaries.
 - Translate ALL speech to English.
 - Split into natural segments (sentences or clauses).
+- CRITICAL: Do NOT hallucinate speech on silence or background noise.
+- CRITICAL: If a phrase repeats endlessly, STOP transcribing it after 2 repetitions.
 - Return raw JSON only. No explanation, no markdown fences.
 """
 
@@ -129,6 +137,8 @@ Rules:
 - Detect the spoken language automatically.
 - Preserve the original language — do NOT translate unless asked.
 - Do NOT include any timestamps.
+- CRITICAL: Do NOT hallucinate speech on silence or background noise.
+- CRITICAL: If a phrase repeats endlessly, STOP transcribing it after 2 repetitions.
 - Return raw JSON only. No explanation, no markdown fences.
 """
 
@@ -153,5 +163,27 @@ Rules:
 - Detect the spoken language automatically.
 - Preserve the original language — do NOT translate unless asked.
 - Do NOT include any timestamps.
+- CRITICAL: Do NOT hallucinate speech on silence or background noise.
+- CRITICAL: If a phrase repeats endlessly, STOP transcribing it after 2 repetitions.
 - Return raw JSON only. No explanation, no markdown fences.
+"""
+
+SESSION_SUMMARY_PROMPT = """\
+You are a research assistant. Below is a transcript of a research session: a series of searches and the AI-synthesized answers for each.
+
+Write a concise executive summary using EXACTLY this structure (use these headings verbatim):
+
+**Session Overview**
+2-3 sentences describing the overarching theme and how the inquiry evolved across searches.
+
+**Key Insights**
+A bullet list of the most important conclusions or ideas that emerged. Each bullet should be a statement of something learned, not a question.
+
+**Open Threads**
+A bullet list of unresolved tensions, contradictions, or gaps that the session raised but did not close. Write each as a declarative statement naming the tension — do NOT pose follow-up questions or suggest directions. Example: "The boundary between productive pattern-use and rigid conditioning was raised but not resolved."
+
+Constraints: 300-500 words total. No title line. No preamble. Start directly with **Session Overview**.
+
+---
+{transcript}
 """

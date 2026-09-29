@@ -10,8 +10,14 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import desc
+
+if TYPE_CHECKING:
+    # Imported only for type annotations; never executed at runtime.
+    # This avoids a circular import: storage.repository → cli.repl.session.
+    from audiobench.cli.repl.session import ReplSession
 
 from audiobench.core.db_session import get_session
 from audiobench.core.logger_factory import get_logger
@@ -143,10 +149,10 @@ class TranscriptionRepository:
                 if existing_txs:
                     if not overwrite:
                         raise ValueError("Transcription already exists for this audio file.")
-                    
+
                     # Delete old transcriptions and their semantic vectors
-                    from audiobench.storage.expression_repository import ExpressionRepository
                     from audiobench.memory.enums import SourceType
+                    from audiobench.storage.expression_repository import ExpressionRepository
 
                     expr_repo = ExpressionRepository()
                     for old_tx in existing_txs:
@@ -303,10 +309,14 @@ class TranscriptionRepository:
 
             def _run() -> None:
                 try:
-                    from audiobench.security.voiceprint import (
-                        is_enrolled, tag_segments_batch, _load_audio, _load_ecapa,
-                    )
                     from pathlib import Path
+
+                    from audiobench.security.voiceprint import (
+                        _load_audio,
+                        _load_ecapa,
+                        is_enrolled,
+                        tag_segments_batch,
+                    )
 
                     if not is_enrolled() or not audio_path or not Path(audio_path).exists():
                         return
@@ -360,38 +370,33 @@ class TranscriptionRepository:
                 return
 
             import json
-            import subprocess
-            import sys
-            from audiobench.core.settings import get_settings
+            from pathlib import Path
 
-            log_dir = get_settings().data_dir / "logs"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log_file = log_dir / "biometric_worker.log"
+            from audiobench.jobs.scheduler import enqueue, ensure_worker
 
             try:
-                with open(log_file, "a") as lf:
-                    subprocess.Popen(
-                        [
-                            sys.executable,
-                            "-m",
-                            "audiobench._biometric_worker",
-                            str(tx_id),
-                            audio_path or "",
-                            json.dumps(segment_ids),
-                        ],
-                        stdout=lf,
-                        stderr=lf,
-                        start_new_session=True,  # detach from parent's process group
-                        close_fds=True,
-                    )
-                logger.info(
-                    "Biometric pass queued as detached subprocess for tx #%d "
-                    "(log: %s)",
-                    tx_id, log_file,
+                fname = Path(audio_path).name if audio_path else f"tx #{tx_id}"
+                enqueue(
+                    job_type="biometric_pass",
+                    args=[
+                        "_biometric_worker",
+                        str(tx_id),
+                        audio_path or "",
+                        json.dumps(segment_ids),
+                    ],
+                    slot="indexing",
+                    file_label=fname,
+                    command_display=f"biometric analysis {fname}",
+                    # max_attempts=3: allows recovery across 2 preemptions before
+                    # permanent failure. A preempted job is reset to pending by
+                    # preempt_indexing_jobs() — startup_recovery checks attempt < max_attempts.
+                    max_attempts=3,
                 )
+                ensure_worker()
+                logger.info("Biometric pass queued via scheduler for tx #%d", tx_id)
             except Exception as exc:
                 logger.warning(
-                    "Failed to launch biometric worker subprocess for tx #%d: %s",
+                    "Failed to queue biometric worker for tx #%d: %s",
                     tx_id, exc,
                 )
 
@@ -648,13 +653,17 @@ class TranscriptionRepository:
             session.commit()
             return new_rec.id
 
-    def get_latest_transcript_for_file(self, audio_file_id: int) -> dict | None:
+    def get_latest_transcript_for_file(
+        self,
+        audio_file_id: int,
+        session: "ReplSession | None" = None,
+    ) -> dict | None:
         """Find the most recent completed transcription for a file."""
-        with get_session() as session:
+        with get_session() as db_session:
             rec = (
-                session.query(TranscriptionRecord)
+                db_session.query(TranscriptionRecord)
                 .filter(
-                    TranscriptionRecord.audio_file_id == audio_file_id, 
+                    TranscriptionRecord.audio_file_id == audio_file_id,
                     TranscriptionRecord.pipeline_phase.in_(["complete", "completed"])
                 )
                 .order_by(desc(TranscriptionRecord.created_at))
@@ -662,50 +671,262 @@ class TranscriptionRepository:
             )
             if not rec:
                 return None
-            return self.get_by_id(rec.id)
+            return self.get_by_id(rec.id, session=session)
 
-    def search(self, query: str, limit: int = 10) -> list[dict]:
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        session: "ReplSession | None" = None,
+    ) -> list[dict]:
         """Search transcriptions by text content.
 
         Args:
             query: Search string (case-insensitive LIKE).
             limit: Maximum number of results.
+            session: The active ReplSession, or None.  When None (or locked at
+                Tier 0), text_preview is replaced with "[REDACTED]" for any
+                transcript that contains segments with privacy_tier >= 2.
+                Uses a single EXISTS subquery per result — no N+1 penalty.
 
         Returns:
             List of matching transcription dicts.
         """
-        with get_session() as session:
-            from sqlalchemy import and_
-            
+        with get_session() as db_session:
+            from sqlalchemy import and_, exists
+
+            effective_tier: int = session.effective_tier() if session is not None else 0
+
             tokens = [t.strip() for t in query.split() if t.strip()]
             filters = [TranscriptionRecord.full_text.ilike(f"%{t}%") for t in tokens]
-            
+
             records = (
-                session.query(TranscriptionRecord)
+                db_session.query(TranscriptionRecord)
                 .filter(and_(*filters) if filters else True)
                 .order_by(desc(TranscriptionRecord.created_at))
                 .limit(limit)
                 .all()
             )
 
-            return [
-                {
-                    "id": rec.id,
-                    "file_name": rec.file_name
-                    or (rec.audio_file.file_name if rec.audio_file else "unknown"),
-                    "language": rec.language,
-                    "text_preview": rec.full_text[:200],
-                    "created_at": rec.created_at.isoformat() if rec.created_at else "",
-                }
-                for rec in records
-            ]
+            # Pre-compute which transcript IDs have protected segments.
+            # One EXISTS query per candidate — still O(N) but each is a fast
+            # index scan on segments.privacy_tier (indexed column).
+            if effective_tier < 2:
+                protected_ids: set[int] = set()
+                for rec in records:
+                    has_protected = db_session.query(
+                        exists().where(
+                            SegmentRecord.transcription_id == rec.id,
+                            SegmentRecord.privacy_tier >= 2,
+                        )
+                    ).scalar()
+                    if has_protected:
+                        protected_ids.add(rec.id)
+            else:
+                protected_ids = set()
 
-    def get_by_id(self, transcription_id: int) -> dict | None:
-        """Get full transcription by ID including all segments."""
+            results = []
+            for rec in records:
+                if rec.id in protected_ids:
+                    preview = "[REDACTED]"
+                else:
+                    preview = (rec.full_text or "")[:200]
+                results.append(
+                    {
+                        "id": rec.id,
+                        "file_name": rec.file_name
+                        or (rec.audio_file.file_name if rec.audio_file else "unknown"),
+                        "language": rec.language,
+                        "text_preview": preview,
+                        "created_at": rec.created_at.isoformat() if rec.created_at else "",
+                    }
+                )
+            return results
+
+
+    def search_transcripts(self, query: str = "", limit: int = 15) -> list[dict]:
+        """Search transcripts by filename and full text for the /load picker.
+
+        Only returns completed, non-empty transcripts.  When *query* is empty
+        (or whitespace-only) the most-recent *limit* records are returned —
+        the same behaviour as get_history() but lighter (no chapter filtering).
+
+        Args:
+            query: Free-text search string; matched against file_name and
+                   full_text with case-insensitive LIKE.  Multiple words are
+                   OR-combined on file_name and AND-combined on full_text so
+                   a filename hit is always surfaced.
+            limit: Maximum rows to return.
+
+        Returns:
+            List of dicts with id, file_name, language, model, word_count,
+            duration, status, created_at — same shape as get_history() rows.
+        """
         with get_session() as session:
-            rec = session.query(TranscriptionRecord).filter_by(id=transcription_id).first()
+            from sqlalchemy import and_, or_
+
+            base = (
+                session.query(TranscriptionRecord)
+                .filter(
+                    TranscriptionRecord.pipeline_phase.in_(["complete", "completed"]),
+                    TranscriptionRecord.word_count > 0,
+                )
+            )
+
+            tokens = [t.strip() for t in query.split() if t.strip()]
+            if tokens:
+                # Filename: any token matches (OR)
+                name_filters = or_(
+                    *[TranscriptionRecord.file_name.ilike(f"%{t}%") for t in tokens]
+                )
+                # Full-text: all tokens present (AND — more precise)
+                text_filters = and_(
+                    *[TranscriptionRecord.full_text.ilike(f"%{t}%") for t in tokens]
+                )
+                base = base.filter(or_(name_filters, text_filters))
+
+            records = (
+                base.order_by(desc(TranscriptionRecord.created_at))
+                .limit(limit)
+                .all()
+            )
+
+            results = []
+            for rec in records:
+                if rec.file_name:
+                    label = rec.file_name
+                elif rec.source == "live":
+                    label = "🎤 Live session"
+                elif rec.source == "reimport":
+                    audio = rec.audio_file
+                    label = "📥 " + (audio.file_name if audio else "Imported transcript")
+                else:
+                    audio = rec.audio_file
+                    label = audio.file_name if audio else "unknown"
+
+                results.append(
+                    {
+                        "id": rec.id,
+                        "file_name": label,
+                        "language": rec.language,
+                        "model": rec.model_name,
+                        "word_count": rec.word_count,
+                        "duration": rec.duration_seconds,
+                        "status": rec.pipeline_phase,
+                        "created_at": rec.created_at.isoformat() if rec.created_at else "",
+                    }
+                )
+            return results
+
+    # ── Privacy-tier resolution helpers ───────────────────────────────────────
+    # Used by derived-expression ingest sites (knowledge_ingester, memoir_writer,
+    # search_ingester) to inherit the correct tier from source segments.
+    # Both helpers are single-table, fully parameterized queries — no string
+    # interpolation — so the pattern stays safe if copy-pasted to future sites.
+
+    def get_max_privacy_tier_for_transcriptions(self, tx_ids: list[int]) -> int:
+        """Return MAX(segments.privacy_tier) across all segments of the given
+        transcription IDs.  Returns 0 when *tx_ids* is empty or no segments exist.
+
+        Single indexed query — O(1) round-trips, no joins.
+
+        Args:
+            tx_ids: List of transcription primary-key IDs.
+        """
+        if not tx_ids:
+            return 0
+        from sqlalchemy import func
+        with get_session() as db_session:
+            result = (
+                db_session.query(func.max(SegmentRecord.privacy_tier))
+                .filter(SegmentRecord.transcription_id.in_(tx_ids))
+                .scalar()
+            )
+            return int(result) if result else 0
+
+    def get_max_privacy_tier_for_segments(self, segment_ids: list[int]) -> int:
+        """Return MAX(segments.privacy_tier) for a specific list of segment IDs.
+        Used by search_ingester, which works at segment-ID granularity directly.
+
+        Returns 0 when *segment_ids* is empty or no segments exist.
+
+        Single indexed query — O(1) round-trips, no joins.
+
+        Args:
+            segment_ids: List of segment primary-key IDs.
+        """
+        if not segment_ids:
+            return 0
+        from sqlalchemy import func
+        with get_session() as db_session:
+            result = (
+                db_session.query(func.max(SegmentRecord.privacy_tier))
+                .filter(SegmentRecord.id.in_(segment_ids))
+                .scalar()
+            )
+            return int(result) if result else 0
+
+    def get_by_id(
+        self,
+        transcription_id: int,
+        session: "ReplSession | None" = None,
+    ) -> dict | None:
+        """Get full transcription by ID including all segments.
+
+        Args:
+            transcription_id: Primary key of the transcription.
+            session: The active ReplSession, or None.  When None (all standalone
+                CLI commands, API routes, daemon workers, and AI chat), the caller
+                is treated as locked at Tier 0.  Segments whose privacy_tier >= 2
+                have their text replaced with "[REDACTED]" and the top-level
+                full_text / raw_text fields are fully replaced when any such
+                segment exists — full replacement is deliberate (surgical splicing
+                leaks structure/context even without the literal content).
+        """
+        with get_session() as db_session:
+            rec = db_session.query(TranscriptionRecord).filter_by(id=transcription_id).first()
             if rec is None:
                 return None
+
+            # Compute effective tier once — 0 when no session (always locked).
+            effective_tier: int = session.effective_tier() if session is not None else 0
+
+            # Build the segment list with per-segment redaction.
+            sorted_segs = sorted(rec.segments, key=lambda s: s.segment_index)
+            segments_out = []
+            has_protected = False
+            for seg in sorted_segs:
+                is_protected = seg.privacy_tier >= 2 and seg.privacy_tier > effective_tier
+                if is_protected:
+                    has_protected = True
+                segments_out.append(
+                    {
+                        "index":        seg.segment_index,
+                        "text":         "[REDACTED]" if is_protected else seg.text,
+                        "start":        seg.start_time,
+                        "end":          seg.end_time,
+                        "speaker":      seg.speaker,
+                        "chapter_id":   seg.chapter_id,
+                        # Always expose tier so callers can know *something* exists,
+                        # and the redacted flag so callers don't need to recompute.
+                        "privacy_tier": seg.privacy_tier,
+                        "redacted":     is_protected,
+                    }
+                )
+
+            # Redact full_text / raw_text if any segment was protected.
+            # Full replacement (not surgical splicing) — a topic-shaped hole in the
+            # full text leaks structure.  If the transcript contains any owner-voice
+            # content and the caller is locked, the whole field becomes unusable.
+            if has_protected:
+                full_text_out = (
+                    "[REDACTED: transcript contains protected segments. "
+                    r"\unlock 2 to view.]"
+                )
+                raw_text_out = ""
+            else:
+                full_text_out = rec.full_text
+                raw_text_out = rec.raw_text or ""
 
             data = {
                 "id": rec.id,
@@ -722,8 +943,8 @@ class TranscriptionRepository:
                 "file_path": (rec.audio_file.file_path if rec.audio_file else None),
                 "audio_file_id": rec.audio_file_id,
                 "source": rec.source,
-                "full_text": rec.full_text,
-                "raw_text": rec.raw_text or "",
+                "full_text": full_text_out,
+                "raw_text": raw_text_out,
                 "language": rec.language,
                 "language_probability": rec.language_probability,
                 "engine": rec.engine,
@@ -734,17 +955,7 @@ class TranscriptionRepository:
                 "status": rec.pipeline_phase,
                 "refined_at": rec.refined_at.isoformat() if rec.refined_at else None,
                 "created_at": rec.created_at.isoformat() if rec.created_at else "",
-                "segments": [
-                    {
-                        "index": seg.segment_index,
-                        "text": seg.text,
-                        "start": seg.start_time,
-                        "end": seg.end_time,
-                        "speaker": seg.speaker,
-                        "chapter_id": seg.chapter_id,
-                    }
-                    for seg in sorted(rec.segments, key=lambda s: s.segment_index)
-                ],
+                "segments": segments_out,
                 "speaker_map": json.loads(rec.speaker_map) if rec.speaker_map else {},
                 "chapters": [],
             }
@@ -757,6 +968,7 @@ class TranscriptionRepository:
                 data["chapters"] = [c.to_dict() for c in chapter_records]
 
             return data
+
 
     def update_text(self, transcription_id: int, new_text: str) -> bool:
         """Update the full text of a transcription (used by REPL .edit).
@@ -880,8 +1092,8 @@ class TranscriptionRepository:
             rec = session.query(TranscriptionRecord).filter_by(id=transcription_id).first()
             if rec is None:
                 return False
-            from audiobench.storage.expression_repository import ExpressionRepository
             from audiobench.memory.enums import SourceType
+            from audiobench.storage.expression_repository import ExpressionRepository
 
             ExpressionRepository().delete_by_source(
                 SourceType.AUDIO_TRANSCRIPT.value, transcription_id
@@ -895,8 +1107,8 @@ class TranscriptionRepository:
         """Delete all transcriptions. Returns number deleted."""
         with get_session() as session:
             tx_ids = [r[0] for r in session.query(TranscriptionRecord.id).all()]
-            from audiobench.storage.expression_repository import ExpressionRepository
             from audiobench.memory.enums import SourceType
+            from audiobench.storage.expression_repository import ExpressionRepository
 
             expr_repo = ExpressionRepository()
             for tx_id in tx_ids:
@@ -939,21 +1151,25 @@ class TranscriptionRepository:
             # --- DEDUPLICATION ENFORCEMENT ---
             if audio_record and not chapter_id:
                 existing_txs = session.query(TranscriptionRecord).filter_by(audio_file_id=audio_record.id).all()
-                # Only *completed* records count as a duplicate worth blocking.
-                # Failed / in-progress records are silently overwritten so the user
-                # can retry without needing --collision overwrite.
+                # Separate completed records from incomplete/stuck ones.
+                # Incomplete stubs (transcribing / failed / degraded) are ALWAYS
+                # purged so that a re-run never accumulates ghost 0-word rows.
+                # A completed record only blocks if the caller did not pass overwrite.
                 has_completed = any(t.pipeline_phase in ("complete", "completed") for t in existing_txs)
-                if existing_txs and (has_completed or overwrite):
-                    # Block only if there is a completed record and the caller
-                    # did not explicitly request an overwrite.
-                    if has_completed and not overwrite:
-                        raise ValueError("Transcription already exists for this audio file.")
-                    
-                    from audiobench.storage.expression_repository import ExpressionRepository
+                incomplete_txs = [t for t in existing_txs if t.pipeline_phase not in ("complete", "completed")]
+
+                if has_completed and not overwrite:
+                    raise ValueError("Transcription already exists for this audio file.")
+
+                # Delete ALL existing records (completed only when overwrite=True,
+                # incomplete stubs always) so we start with a clean slate.
+                txs_to_delete = existing_txs if (has_completed and overwrite) else incomplete_txs
+                if txs_to_delete:
                     from audiobench.memory.enums import SourceType
+                    from audiobench.storage.expression_repository import ExpressionRepository
 
                     expr_repo = ExpressionRepository()
-                    for old_tx in existing_txs:
+                    for old_tx in txs_to_delete:
                         expr_repo.delete_by_source(SourceType.AUDIO_TRANSCRIPT.value, old_tx.id)
                         session.delete(old_tx)
                     session.commit()
@@ -976,6 +1192,7 @@ class TranscriptionRepository:
                 session.flush()
 
                 from pathlib import Path
+
                 from audiobench.chapters.detector import ChapterDetector
                 try:
                     detector = ChapterDetector()
@@ -1061,13 +1278,23 @@ class TranscriptionRepository:
                     privacy_tier=privacy_tier,
                 )
                 session.add(seg_record)
-                
+
             session.commit()
-            
-    def commit_alignment(self, tx_id: int, transcript: Transcript) -> None:
+
+    def commit_alignment(self, tx_id: int, transcript: Transcript, phase: str = "aligned") -> None:
         """
         After align_transcript() completes: UPDATE segment start_time/end_time.
-        Atomic UPDATE status='aligned', attempt_count=0.
+        Atomic UPDATE pipeline_phase=phase, attempt_count=0.
+
+        Args:
+            phase: The pipeline phase to stamp on this record.
+                   Use ``"aligned_proportional"`` after Phase 1 (proportional
+                   timestamps — subprocess still running).
+                   Use ``"aligned"`` (default) after Phase 2 (faster-whisper
+                   timestamps — subprocess about to exit).
+                   This distinction lets the sweep and stuck-detection logic
+                   distinguish "in progress" from "fully done" without timing
+                   heuristics.
         """
         with get_session() as session:
             tx_record = session.query(TranscriptionRecord).get(tx_id)
@@ -1083,8 +1310,12 @@ class TranscriptionRepository:
                     "end_time": seg.end,
                 })
 
-            tx_record.pipeline_phase = "aligned"
+            tx_record.pipeline_phase = phase
             tx_record.attempt_count = 0
+            # Persist the corrected duration so get_by_id, summaries, and
+            # embed queries all reflect the real audio length (Gemini stores 0.0).
+            if transcript.duration_seconds > 0.0:
+                tx_record.duration_seconds = transcript.duration_seconds
             session.commit()
 
     def commit_diarization(self, tx_id: int, transcript: Transcript) -> None:
@@ -1116,6 +1347,7 @@ class TranscriptionRepository:
         privacy_tier: int = 0,
         audio_metadata: AudioMetadata | None = None,
         run_inline: bool = False,
+        is_degraded: bool = False,
     ) -> None:
         """
         After speaker naming: UPDATE status='complete', attempt_count=0.
@@ -1132,7 +1364,9 @@ class TranscriptionRepository:
                 return
 
             tx_record.speaker_map = json.dumps(transcript.speaker_map)
-            tx_record.pipeline_phase = "complete"
+            if not is_degraded:
+                tx_record.pipeline_phase = "complete"
+                tx_record.failure_reason = None
             tx_record.attempt_count = 0
 
             if chapter_id:
@@ -1201,7 +1435,7 @@ class TranscriptionRepository:
 
     def touch_transcription(self, tx_id: int) -> None:
         """Update the updated_at timestamp on a TranscriptionRecord as a heartbeat."""
-        from datetime import datetime, UTC
+        from datetime import UTC, datetime
         with get_session() as session:
             tx_record = session.query(TranscriptionRecord).get(tx_id)
             if tx_record:
@@ -1211,23 +1445,38 @@ class TranscriptionRepository:
     def get_incomplete_transcriptions(self, max_age_minutes: int = 5) -> list[TranscriptionRecord]:
         """
         Returns all records where pipeline_phase NOT IN ('complete', 'completed', 'degraded', 'failed')
-        AND updated_at < now() - max_age_minutes (with 60m grace for 'transcribing').
+        AND updated_at < now() - max_age_minutes, with phase-specific grace periods:
+          - 'transcribing': 60 min (Gemini API uploads can be slow)
+          - 'aligned_proportional': 45 min (Phase 2 faster-whisper alignment ceiling
+            is 30 min per the 1800s subprocess hard cap; 45 min adds buffer for slow
+            machines — NOT measured against real Phase 2 timing data, revisit if
+            false-positive stuck-detections occur on long files)
+          - everything else: max_age_minutes (default 5 min)
         """
-        from datetime import datetime, UTC, timedelta
-        from sqlalchemy import or_, and_
+        from datetime import UTC, datetime, timedelta
+
+        from sqlalchemy import and_, or_
         cutoff_default = datetime.now(UTC) - timedelta(minutes=max_age_minutes)
         cutoff_transcribing = datetime.now(UTC) - timedelta(minutes=max(60, max_age_minutes))
+        # 45min = 30min alignment hard cap (subprocess timeout) + 15min buffer.
+        # Not derived from measured Phase 2 duration distribution — revisit if
+        # false-positive stuck-detections occur on legitimately long alignments.
+        cutoff_aligning = datetime.now(UTC) - timedelta(minutes=max(45, max_age_minutes))
         with get_session() as session:
             return session.query(TranscriptionRecord).filter(
                 ~TranscriptionRecord.pipeline_phase.in_(["complete", "completed", "degraded", "failed"]),
                 or_(
                     and_(
-                        TranscriptionRecord.pipeline_phase != "transcribing",
-                        TranscriptionRecord.updated_at < cutoff_default,
-                    ),
-                    and_(
                         TranscriptionRecord.pipeline_phase == "transcribing",
                         TranscriptionRecord.updated_at < cutoff_transcribing,
+                    ),
+                    and_(
+                        TranscriptionRecord.pipeline_phase == "aligned_proportional",
+                        TranscriptionRecord.updated_at < cutoff_aligning,
+                    ),
+                    and_(
+                        ~TranscriptionRecord.pipeline_phase.in_(["transcribing", "aligned_proportional"]),
+                        TranscriptionRecord.updated_at < cutoff_default,
                     ),
                 )
             ).all()
@@ -1235,14 +1484,21 @@ class TranscriptionRepository:
     def get_degraded_for_backfill(self, max_backfill_attempts: int = 3) -> list[TranscriptionRecord]:
         """
         Returns degraded records eligible for background re-alignment or re-diarization.
+
+        Records with ``failure_reason='timeline_clamped'`` are intentionally excluded.
+        The Whisper timeline anomaly that caused the clamp is unidentified and deterministic —
+        retrying the same audio would clamp again, and ``mark_backfill_exhausted`` would
+        overwrite the diagnostic label with ``'alignment_exhausted'``, destroying the signal.
+        These records remain readable and searchable but are never touched by the sweep.
         """
-        from datetime import datetime, UTC
+        from datetime import UTC, datetime
+
         from sqlalchemy import or_
         now = datetime.now(UTC)
         with get_session() as session:
             return session.query(TranscriptionRecord).filter(
                 TranscriptionRecord.pipeline_phase == "degraded",
-                TranscriptionRecord.failure_reason.in_(["alignment_failed", "diarization_failed"]),
+                TranscriptionRecord.failure_reason != "timeline_clamped",
                 TranscriptionRecord.backfill_attempt_count < max_backfill_attempts,
                 or_(
                     TranscriptionRecord.backfill_next_attempt_at == None,
@@ -1252,7 +1508,7 @@ class TranscriptionRepository:
 
     def increment_backfill_attempt(self, tx_id: int, next_attempt_delay_seconds: int) -> None:
         """Increment backfill_attempt_count and set backfill_next_attempt_at."""
-        from datetime import datetime, UTC, timedelta
+        from datetime import UTC, datetime, timedelta
         with get_session() as session:
             rec = session.query(TranscriptionRecord).get(tx_id)
             if rec:

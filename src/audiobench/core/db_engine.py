@@ -34,6 +34,20 @@ def get_engine() -> Engine:
         settings = get_settings()
         url = settings.database_url
 
+        # Strict firewall: Prevent tests from ever connecting to or modifying the production database
+        import os, sys
+        if "pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST") or "PYTEST_VERSION" in os.environ:
+            prod_db = (Path(__file__).resolve().parent.parent.parent.parent / "data" / "transcriptions.db").resolve()
+            if url.startswith("sqlite"):
+                raw_path = url.replace("sqlite:///", "")
+                if raw_path and not raw_path.startswith(":"):
+                    resolved_path = Path(raw_path).resolve()
+                    if resolved_path == prod_db:
+                        raise RuntimeError(
+                            f"SAFETY BLOCK: Test environment attempted to connect to production database '{resolved_path}'! "
+                            "All tests must use an isolated test database (e.g. via 'test_db' fixture or AUDIOBENCH_DATABASE_URL)."
+                        )
+
         # For SQLite, ensure the parent directory exists
         if url.startswith("sqlite"):
             db_path = url.replace("sqlite:///", "")
@@ -191,7 +205,7 @@ def init_db() -> None:
 
                 from audiobench.storage.migrate import run_migrations
 
-                run_migrations(Path(db_path))
+                run_migrations(Path(db_path), allow_path_mismatch=True)
             except Exception as e:
                 logger.error("SQL migrations failed: %s", e)
                 raise
