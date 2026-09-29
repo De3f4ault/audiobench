@@ -47,6 +47,26 @@ class NavigationFrame:
     resumed: bool = False
     intent: str = ""
 
+
+@dataclass
+class RelatedThought:
+    """A semantic thought fragment retrieved by \\related."""
+
+    index: int
+    transcript_id: int
+    audio_file_id: int | None
+    file_name: str
+    file_path: str | None
+    start_time: float
+    end_time: float
+    speaker: str | None
+    content: str
+    score: float
+    match_percent: int
+    work_title: str | None = None
+    work_author: str | None = None
+
+
 # ── Commands that accept a transcript ID as first positional arg ──
 # When context is set and no ID is given, the REPL auto-injects it.
 
@@ -95,6 +115,9 @@ class ReplSession:
         # Only cleared by \lock or the idle-lock watcher.
         # Tier 3 is intentionally excluded — it is always per-query.
         self.session_unlock_tier: int = 0
+
+        # Discovered semantic connections from \related
+        self.last_related: list[RelatedThought] = []
 
     def _get_repo(self):
         """Lazy-init the transcription repository."""

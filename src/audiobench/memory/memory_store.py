@@ -346,7 +346,12 @@ class MemoryStore:
             from audiobench.memory.singletons import get_colbert_reranker
 
             reranker = get_colbert_reranker()
-            search_query = search_query.rerank(reranker=reranker)
+            from lancedb.query import LanceHybridQueryBuilder
+
+            if isinstance(search_query, LanceHybridQueryBuilder):
+                search_query = search_query.rerank(reranker=reranker)
+            else:
+                search_query = search_query.rerank(reranker=reranker, query_string=query)
         elif use_bm25 and use_dense:
             # Explicitly use RRF if ColBERT is off but Hybrid is on
             from lancedb.rerankers import RRFReranker

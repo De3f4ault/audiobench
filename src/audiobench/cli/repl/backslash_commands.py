@@ -15,6 +15,8 @@ To add a new \\command, decorate a function here:
 
 from __future__ import annotations
 
+from typing import Any, Callable
+
 from audiobench.cli.display.theme import (
     ACCENT,
     BOLD,
@@ -190,10 +192,51 @@ def cmd_focus(session: ReplSession, args: str) -> None:
             print_context_summary(session)
         return
 
+    if arg.isdigit() and getattr(session, "last_related", None):
+        idx = int(arg)
+        if 1 <= idx <= len(session.last_related):
+            thought = session.last_related[idx - 1]
+            if thought.audio_file_id:
+                session.focus = FocusedEntity(
+                    type="file",
+                    id=thought.audio_file_id,
+                    label=thought.file_name,
+                )
+            else:
+                session.focus = FocusedEntity(
+                    type="transcript",
+                    id=thought.transcript_id,
+                    label=thought.file_name,
+                )
+            console.print(
+                f"  [{SUCCESS}]Focus switched to thought #{idx}:[/] [{ACCENT}]{thought.file_name}[/] "
+                f"[{DIM}](Transcript #{thought.transcript_id})[/]"
+            )
+            print_context_summary(session)
+            return
+
     file_id = int(arg)
     try:
         repo = TranscriptionRepository()
         audio_file = repo.get_audio_file(file_id)
+        if not audio_file:
+            # Fallback: check if the argument matches a transcript ID (e.g. from Recent transcriptions banner)
+            tx = repo.get_by_id(file_id, session=session)
+            if tx:
+                session.set_context(tx["id"])
+                af_id = tx.get("audio_file_id")
+                if af_id:
+                    audio_file = repo.get_audio_file(af_id)
+                    file_id = af_id
+                else:
+                    session.focus = FocusedEntity(
+                        type="file",
+                        id=file_id,
+                        label=tx.get("file_name", f"Transcript #{file_id}"),
+                    )
+                    print_context_summary(session)
+                    return
+
         if not audio_file:
             console.print(f"  [{WARNING}]Audio file #{file_id} not found.[/]")
             return
@@ -331,7 +374,7 @@ def cmd_search(session: ReplSession, args: str) -> None:
 
     init_db()
     repo = TranscriptionRepository()
-    results = repo.search(query, limit=limit)
+    results = repo.search(query, limit=limit, session=session)
 
     if not results:
         console.print(f"  [{DIM}]No results for \"{query}\"[/]")
@@ -436,7 +479,7 @@ def cmd_stats(session: ReplSession, args: str) -> None:
         return
 
     repo = session._get_repo()
-    rec = repo.get_by_id(session.last_id)
+    rec = repo.get_by_id(session.last_id, session=session)
     if not rec:
         return
 
@@ -457,14 +500,58 @@ def cmd_stats(session: ReplSession, args: str) -> None:
 
 @register_backslash("chat")
 def cmd_chat(session: ReplSession, args: str) -> None:
-    """Start an interactive chat with the current transcript."""
+    """Start an interactive chat with current and/or related transcripts."""
     from audiobench.cli.repl.dispatch import dispatch_command
 
-    if not session.last_id:
+    target_ids: list[int] = []
+    if session.last_id:
+        target_ids.append(session.last_id)
+
+    raw = args.strip().lower()
+
+    if raw in ("related", "all"):
+        if not getattr(session, "last_related", None):
+            console.print(f"  [{WARNING}]No related thoughts found yet. Run [{ACCENT}]\\related[/] first.[/]")
+            return
+        for thought in session.last_related:
+            if thought.transcript_id not in target_ids:
+                target_ids.append(thought.transcript_id)
+
+        console.print(
+            f"  [{SUCCESS}]✦ Seeding chat session with {len(target_ids)} connected transcripts as context...[/]"
+        )
+        dispatch_command(session, ["chat", *[str(tid) for tid in target_ids]])
+        return
+
+    # Check for index references like "1", "1 2", "1, 3"
+    tokens = [t.strip(",") for t in raw.split()] if raw else []
+    if (
+        tokens
+        and getattr(session, "last_related", None)
+        and all(t.isdigit() and 1 <= int(t) <= len(session.last_related) for t in tokens)
+    ):
+        for t in tokens:
+            idx = int(t)
+            tid = session.last_related[idx - 1].transcript_id
+            if tid not in target_ids:
+                target_ids.append(tid)
+
+        console.print(
+            f"  [{SUCCESS}]✦ Seeding chat session with {len(target_ids)} connected transcripts as context...[/]"
+        )
+        dispatch_command(session, ["chat", *[str(tid) for tid in target_ids]])
+        return
+
+    if not target_ids and not raw:
         console.print(f"  [{DIM}]No focused transcript. Use [{ACCENT}]\\focus <id>[/][/]")
         return
 
-    dispatch_command(session, ["chat", str(session.last_id)])
+    if raw:
+        import shlex
+
+        dispatch_command(session, ["chat", *shlex.split(args)])
+    else:
+        dispatch_command(session, ["chat", str(session.last_id)])
 
 
 @register_backslash("ask")
@@ -582,7 +669,7 @@ def cmd_capture(session: ReplSession, args: str) -> None:
         eid_str = arg.replace("expression:", "").strip()
         if eid_str.isdigit():
             expression_id = int(eid_str)
-            expr = expr_repo.get_by_id(expression_id)
+            expr = expr_repo.get_by_id(expression_id, session=session)
             if expr:
                 arg = f"Captured expression: {expr.content[:100]}..."
 
@@ -837,16 +924,73 @@ def _workflow_show(name: str) -> None:
 
 # ── Intelligence ──────────────────────────────────────────────
 
+def _resolve_thought_segment(
+    session_db: Any, expr_id: int, transcription_id: int, expr_content: str
+) -> tuple[float, float, str | None]:
+    """Find start_time, end_time, and speaker for an expression."""
+    from audiobench.storage.models import ExpressionSegmentMap, SegmentRecord
+
+    # 1. Check ExpressionSegmentMap
+    mapping = session_db.query(ExpressionSegmentMap).filter_by(expression_id=expr_id).first()
+    if mapping:
+        seg = session_db.query(SegmentRecord).filter_by(id=mapping.segment_id).first()
+        if seg:
+            return float(seg.start_time), float(seg.end_time), seg.speaker
+
+    # 2. Match against segments of the transcription
+    segs = (
+        session_db.query(SegmentRecord)
+        .filter_by(transcription_id=transcription_id)
+        .order_by(SegmentRecord.segment_index)
+        .all()
+    )
+    if not segs:
+        return 0.0, 0.0, None
+
+    content_clean = expr_content.strip()
+    words = [w for w in content_clean.split() if len(w) > 3]
+    prefix_words = " ".join(words[:4]) if len(words) >= 4 else content_clean[:30]
+
+    for s in segs:
+        s_text = s.text.strip()
+        if prefix_words and prefix_words in s_text:
+            return float(s.start_time), float(s.end_time), s.speaker
+        if s_text and s_text in content_clean:
+            return float(s.start_time), float(s.end_time), s.speaker
+
+    if len(words) >= 3:
+        for i in range(min(5, len(words) - 2)):
+            triplet = f"{words[i]} {words[i+1]} {words[i+2]}"
+            for s in segs:
+                if triplet in s.text:
+                    return float(s.start_time), float(s.end_time), s.speaker
+
+    return float(segs[0].start_time), float(segs[0].end_time), segs[0].speaker
+
+
 @register_backslash("related")
 def cmd_related(session: ReplSession, args: str) -> None:
     """Show semantically related fragments from other transcripts."""
-    from audiobench.cli.display.theme import ACCENT, BOLD, DIM, WARNING, console
+    from rich.panel import Panel
+
+    from audiobench.cli.display.theme import (
+        ACCENT,
+        BOLD,
+        BOX_STYLE,
+        DIM,
+        SUCCESS,
+        WARNING,
+        console,
+    )
+    from audiobench.cli.repl.session import RelatedThought
+    from audiobench.playback.controls import fmt_timestamp
+
     if not session.last_id:
         console.print(f"  [{DIM}]No focused transcript. Use [{ACCENT}]\\focus <id>[/][/]")
         return
 
     repo = session._get_repo()
-    rec = repo.get_by_id(session.last_id)
+    rec = repo.get_by_id(session.last_id, session=session)
     if not rec:
         return
 
@@ -862,10 +1006,10 @@ def cmd_related(session: ReplSession, args: str) -> None:
     console.print(f"  [{DIM}]Searching for related fragments across the library...[/]")
 
     from audiobench.daemon.factory import get_daemon_client
+
     daemon = get_daemon_client()
 
     try:
-        # Ask daemon for search
         results = daemon.search(
             query=text_to_search,
             top_k=20,
@@ -881,19 +1025,22 @@ def cmd_related(session: ReplSession, args: str) -> None:
         console.print(f"  [{DIM}]No related fragments found.[/]")
         return
 
+    from audiobench.core.db_session import get_session
     from audiobench.storage.expression_repository import ExpressionRepository
+    from audiobench.storage.models import AudioFileRecord, WorkRecord
+
     expr_repo = ExpressionRepository()
 
-    # Filter out current source_id
+    # Filter out current source_id (one fragment per related transcript)
     related_exprs = []
     seen_ids = set()
     for r in results:
         expr_id = r.get("expression_id")
         if expr_id:
-            expr = expr_repo.get_by_id(expr_id)
+            expr = expr_repo.get_by_id(expr_id, session=session)
             if expr and expr.source_id != session.last_id and expr.source_id not in seen_ids:
-                seen_ids.add(expr.source_id)  # One fragment per related transcript
-                related_exprs.append((expr, r.get("score", 0.0)))
+                seen_ids.add(expr.source_id)
+                related_exprs.append((expr, float(r.get("score", 0.0))))
                 if len(related_exprs) >= 5:
                     break
 
@@ -901,20 +1048,110 @@ def cmd_related(session: ReplSession, args: str) -> None:
         console.print(f"  [{DIM}]No related fragments found outside of this transcript.[/]")
         return
 
-    console.print(f"\n  [{BOLD}]Related Thoughts[/]")
-    console.print(f"  [{DIM}]{'─' * 40}[/]")
+    console.print(
+        f"\n  [{BOLD} {ACCENT}]Related Thoughts[/] [{DIM}]({len(related_exprs)} connections found across library)[/]"
+    )
+    console.print(f"  [{DIM}]{'─' * 55}[/]\n")
 
-    for i, (expr, score) in enumerate(related_exprs, 1):
-        # get original audio file name
-        audio_file = repo.get_by_id(expr.source_id)
-        name = audio_file.get("file_name", f"Transcript #{expr.source_id}") if audio_file else f"Source #{expr.source_id}"
+    session.last_related = []
 
-        console.print(f"  [{ACCENT}]{i}. {name}[/] [{DIM}](score: {score:.2f})[/]")
-        content = expr.content.strip().replace('\n', ' ')
-        if len(content) > 150:
-            content = content[:147] + "..."
-        console.print(f"     \"{content}\"")
-    console.print()
+    with get_session() as session_db:
+        for i, (expr, raw_score) in enumerate(related_exprs, 1):
+            transcript_record = repo.get_by_id(expr.source_id, session=session)
+            audio_file_id = transcript_record.get("audio_file_id") if transcript_record else None
+            file_name = (
+                transcript_record.get("file_name")
+                if transcript_record
+                else f"Transcript #{expr.source_id}"
+            )
+            file_path = transcript_record.get("file_path") if transcript_record else None
+
+            # Resolve work info if available
+            work_title = None
+            work_author = None
+            if expr.work_id:
+                w = session_db.query(WorkRecord).filter_by(id=expr.work_id).first()
+                if w:
+                    work_title = w.title
+                    work_author = w.author
+            elif audio_file_id:
+                af = session_db.query(AudioFileRecord).filter_by(id=audio_file_id).first()
+                if af and af.file_path and not file_path:
+                    file_path = af.file_path
+                if af and af.work:
+                    work_title = af.work.title
+                    work_author = af.work.author
+
+            # Resolve exact segment timestamp & speaker
+            start_time, end_time, seg_speaker = _resolve_thought_segment(
+                session_db, expr.id, expr.source_id, expr.content
+            )
+            speaker = seg_speaker or expr.speaker
+
+            # Score normalization: ColBERT raw scores are typically ~1.0 to 2.5
+            pct = (
+                min(99, max(45, int((raw_score / 2.2) * 90)))
+                if raw_score > 0.5
+                else int(raw_score * 100)
+            )
+
+            thought = RelatedThought(
+                index=i,
+                transcript_id=expr.source_id,
+                audio_file_id=audio_file_id,
+                file_name=file_name,
+                file_path=file_path,
+                start_time=start_time,
+                end_time=end_time,
+                speaker=speaker,
+                content=expr.content,
+                score=raw_score,
+                match_percent=pct,
+                work_title=work_title,
+                work_author=work_author,
+            )
+            session.last_related.append(thought)
+
+            # Build rich visual card
+            card_title = (
+                f"[{BOLD} {ACCENT}]\\[{i}] {file_name}[/]  [{DIM}]—[/]  "
+                f"[{SUCCESS if pct >= 80 else ACCENT}]{pct}% Match[/]"
+            )
+
+            meta_parts = [f"[{DIM}]⏱ {fmt_timestamp(start_time)}[/]"]
+            if speaker:
+                meta_parts.append(f"[{ACCENT}]Speaker:[/] {speaker}")
+            if work_title:
+                meta_parts.append(f"[{DIM}]Work:[/] {work_title}")
+            meta_line = f"  [{DIM}]•[/]  ".join(meta_parts)
+
+            clean_content = expr.content.strip().replace("\r", "").replace("\n", " ")
+            if len(clean_content) > 320:
+                clean_content = clean_content[:317] + "..."
+
+            # Use Rich.Text for the body so content is always treated as a
+            # literal — never parsed as Rich markup (square brackets in text).
+            from rich.text import Text
+
+            body_text = Text.from_markup(meta_line)
+            body_text.append(f'\n\n"{clean_content}"')
+
+            panel = Panel(
+                body_text,
+                title=card_title,
+                title_align="left",
+                box=BOX_STYLE,
+                border_style="cyan" if i == 1 else "dim cyan",
+                padding=(0, 1),
+            )
+            console.print(panel)
+
+    console.print(
+        f"  [{DIM}]Quick actions:[/]  "
+        f"[{ACCENT}]\\play <1-{len(session.last_related)}>[/] [{DIM}]listen at timestamp[/]  •  "
+        f"[{ACCENT}]\\chat related[/] [{DIM}]AI discussion[/]  •  "
+        f"[{ACCENT}]\\focus <1-{len(session.last_related)}>[/] [{DIM}]switch file[/]\n"
+    )
 
 @register_backslash("name")
 def cmd_name(session: ReplSession, args: str) -> None:
@@ -939,7 +1176,7 @@ def cmd_name(session: ReplSession, args: str) -> None:
 
     old_name, new_name = parts[0], parts[1]
     repo = session._get_repo()
-    rec = repo.get_by_id(session.last_id)
+    rec = repo.get_by_id(session.last_id, session=session)
     if not rec:
         return
 
@@ -1759,3 +1996,127 @@ def cmd_voices(session: ReplSession, args: str) -> None:
     for sc, desc in sub_cmds:
         console.print(f"  [{ACCENT}]{sc:<28}[/] [{DIM}]{desc}[/]")
     console.print()
+
+
+# ── Universal Playback Commands ──────────────────────────────
+
+
+def _playback_backslash(slash_command: str):
+    """Decorator factory: wire a backslash command to the universal playback command dispatcher."""
+    def decorator(fn: Callable) -> Callable:
+        name = fn.__name__.removeprefix("cmd_")
+
+        @register_backslash(name)
+        def wrapper(session: ReplSession, args: str) -> None:
+            from audiobench.daemon.factory import get_daemon_client
+            from audiobench.playback.controls import handle_playback_command
+
+            handle_playback_command(slash_command, args, get_daemon_client(), console)
+
+        wrapper.__doc__ = fn.__doc__
+        return wrapper
+    return decorator
+
+
+@register_backslash("play")
+def cmd_play(session: ReplSession, args: str) -> None:
+    """Play audio for current or specified transcript, or seek to timestamp."""
+    from audiobench.daemon.factory import get_daemon_client
+    from audiobench.playback.controls import handle_playback_command
+
+    client = get_daemon_client()
+
+    arg_clean = args.strip()
+    if arg_clean.isdigit() and getattr(session, "last_related", None):
+        idx = int(arg_clean)
+        if 1 <= idx <= len(session.last_related):
+            thought = session.last_related[idx - 1]
+            if thought.file_path:
+                from audiobench.playback.controls import fmt_timestamp
+
+                st = client.playback_status()
+                if st.get("playing") and st.get("transcription_id") == thought.transcript_id:
+                    client.playback_seek(thought.start_time)
+                else:
+                    client.playback_play(
+                        thought.file_path,
+                        start_pos=thought.start_time,
+                        audio_file_id=thought.audio_file_id,
+                        transcription_id=thought.transcript_id,
+                    )
+                console.print(
+                    f"  [{SUCCESS}]▶ Playing thought #{idx}[/] from [{ACCENT}]{thought.file_name}[/] "
+                    f"at [{BOLD}]{fmt_timestamp(thought.start_time)}[/]"
+                )
+                return
+
+    repo = session._get_repo() if hasattr(session, "_get_repo") else None
+    if repo is None:
+        try:
+            from audiobench.storage.repository import TranscriptionRepository
+
+            repo = TranscriptionRepository()
+        except Exception:
+            repo = None
+    loaded_ids = [session.last_id] if session.last_id else []
+    handle_playback_command(
+        "/play",
+        args,
+        client,
+        console,
+        transcript_resolver=(lambda tid: repo.get_by_id(tid, session=session)) if repo else None,
+        loaded_transcript_ids=loaded_ids,
+    )
+
+
+@_playback_backslash("/seek")
+def cmd_seek(session: ReplSession, args: str) -> None:
+    """Seek audio to a timestamp (e.g. \\seek 6:30 or \\seek +15)."""
+
+
+@_playback_backslash("/pause")
+def cmd_pause(session: ReplSession, args: str) -> None:
+    """Pause audio playback."""
+
+
+@_playback_backslash("/resume")
+def cmd_resume(session: ReplSession, args: str) -> None:
+    """Resume audio playback."""
+
+
+@_playback_backslash("/speed")
+def cmd_speed(session: ReplSession, args: str) -> None:
+    """Set playback speed (e.g. \\speed 1.5)."""
+
+
+@_playback_backslash("/stop")
+def cmd_stop(session: ReplSession, args: str) -> None:
+    """Stop audio playback and release player."""
+
+
+@_playback_backslash("/np")
+def cmd_np(session: ReplSession, args: str) -> None:
+    """Show current playing audio and position."""
+
+
+@_playback_backslash("/explain")
+def cmd_explain(session: ReplSession, args: str) -> None:
+    """Display transcript context around current audio position."""
+
+
+@_playback_backslash("/clip")
+def cmd_clip(session: ReplSession, args: str) -> None:
+    """Clip audio between two timestamps (e.g. \\clip 6:30 7:00)."""
+
+
+@register_backslash("info")
+def cmd_info(session: ReplSession, args: str) -> None:
+    """Display 360-degree dossier for an audio file or transcript."""
+    from audiobench.cli.commands.info_cmd import render_file_dossier
+
+    target = args.strip() or (str(session.last_id) if session.last_id else None)
+    if not target:
+        console.print("  [dim]Usage: \\info <target> (audio file ID, transcript ID, or filename)[/]")
+        return
+    render_file_dossier(target, console)
+
