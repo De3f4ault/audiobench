@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import heapq
 
 from audiobench.memory.retrieval_streams import SegmentHit
 
@@ -35,6 +36,7 @@ def rrf_merge(
     colbert_hits: list[SegmentHit],
     top_n: int = 10,
     diversity_weight: float = 0.4,
+    max_per_source: int | None = None,
 ) -> list[FusedResult]:
     """Fuse three ranked lists via RRF with a configurable source-diversity penalty.
 
@@ -101,26 +103,47 @@ def rrf_merge(
         source_counts[src] = n + 1
 
     # Build final result list in penalized-score order, stopping at top_n.
-    # No hard cap — a source that earns placement at a 0.3× multiplier did so
-    # on genuine retrieval signal, not indexing density.
     results: list[FusedResult] = []
-    for sid in sorted(penalized.keys(), key=lambda s: penalized[s], reverse=True):
-        hit = hit_index[sid]
-        contribs = contributions[sid]
-        results.append(
-            FusedResult(
-                segment_id=sid,
-                start_time=hit.start_time,
-                end_time=hit.end_time,
-                text=hit.text,
-                rrf_score=penalized[sid],
-                source_file=hit.source_file,
-                transcription_id=hit.transcription_id,
-                stream_contributions=tuple(sorted(contribs.items())),
+    if max_per_source is None:
+        top_sids = heapq.nlargest(top_n, penalized.keys(), key=penalized.__getitem__)
+        for sid in top_sids:
+            hit = hit_index[sid]
+            contribs = contributions[sid]
+            results.append(
+                FusedResult(
+                    segment_id=sid,
+                    start_time=hit.start_time,
+                    end_time=hit.end_time,
+                    text=hit.text,
+                    rrf_score=penalized[sid],
+                    source_file=hit.source_file,
+                    transcription_id=hit.transcription_id,
+                    stream_contributions=tuple(sorted(contribs.items())),
+                )
             )
-        )
-        if len(results) >= top_n:
-            break
+    else:
+        final_source_counts: dict[str, int] = {}
+        for sid in sorted(penalized.keys(), key=penalized.__getitem__, reverse=True):
+            hit = hit_index[sid]
+            src = hit.source_file
+            if final_source_counts.get(src, 0) >= max_per_source:
+                continue
+            contribs = contributions[sid]
+            results.append(
+                FusedResult(
+                    segment_id=sid,
+                    start_time=hit.start_time,
+                    end_time=hit.end_time,
+                    text=hit.text,
+                    rrf_score=penalized[sid],
+                    source_file=hit.source_file,
+                    transcription_id=hit.transcription_id,
+                    stream_contributions=tuple(sorted(contribs.items())),
+                )
+            )
+            final_source_counts[src] = final_source_counts.get(src, 0) + 1
+            if len(results) >= top_n:
+                break
     return results
 
 

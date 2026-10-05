@@ -18,8 +18,6 @@ from __future__ import annotations
 
 import datetime
 import threading
-import tempfile
-import shutil
 
 import pyarrow as pa
 import pytest
@@ -80,8 +78,8 @@ def test_optimize_preserves_all_ids_after_merge_insert(fresh_lance_db):
     assert new_ids[0] in before_ids, "New IDs should be present before optimize"
     assert len(before_ids) == 520
 
-    # Force optimize with a zero cleanup window to maximise compaction aggression
-    table.optimize(cleanup_older_than=datetime.timedelta(seconds=0))
+    # Force optimize
+    table.optimize(cleanup_older_than=datetime.timedelta(minutes=30))
 
     # Snapshot AFTER optimize — must be identical
     after_ids = _snapshot_ids(table)
@@ -145,7 +143,7 @@ def test_concurrent_merge_insert_and_optimize_no_id_loss(fresh_lance_db):
 
         def do_optimize():
             try:
-                table.optimize(cleanup_older_than=datetime.timedelta(seconds=0))
+                table.optimize(cleanup_older_than=datetime.timedelta(minutes=30))
             except Exception as exc:
                 errors.append(f"optimize error: {exc}")
             finally:

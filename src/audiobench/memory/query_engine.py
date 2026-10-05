@@ -17,7 +17,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from audiobench.cli.repl.session import ReplSession
 
 from audiobench.chat.chat_store import ChatRepository
 from audiobench.chat.providers.ollama_provider import OllamaClient
@@ -287,6 +290,7 @@ class MemoryQueryEngine:
         use_dense: bool | None = None,
         use_colbert: bool | None = None,
         use_cache: bool = True,
+        session: "ReplSession | None" = None,
     ) -> QueryResult:
         t0 = time.time()
         logger.info("Starting memory query for: %s (Preset: %s)", text, preset)
@@ -358,7 +362,7 @@ class MemoryQueryEngine:
             for r in results
             if r.get("expression_id") is not None
         ]
-        expr_map = self.expr_repo.get_by_ids(expr_ids)   # 1 query for all IDs
+        expr_map = self.expr_repo.get_by_ids(expr_ids, session=session)   # 1 query for all IDs
 
         candidates: list[tuple[Any, float]] = [
             (expr_map[r["expression_id"]], r.get("score", 0.0))
@@ -373,7 +377,7 @@ class MemoryQueryEngine:
 
         # ── Step 2.5: Parent expansion via batch (EQ-2: eliminates N+1) ──────
         child_ids = [expr.id for expr, _ in candidates]
-        parents = self.expr_repo.get_parents_batch(child_ids)  # 1 JOIN query
+        parents = self.expr_repo.get_parents_batch(child_ids, session=session)  # 1 JOIN query
 
         expanded: dict[int, tuple[Any, float]] = {}
         for expr, score in candidates:
@@ -405,7 +409,7 @@ class MemoryQueryEngine:
         # ── Step 4: Graph Traversal for Enriched Context ─────────────────────
         # Batch-fetch parents again for the smaller top_candidates set (EQ-2)
         top_ids = [expr.id for expr, _ in top_candidates]
-        top_parents = self.expr_repo.get_parents_batch(top_ids)
+        top_parents = self.expr_repo.get_parents_batch(top_ids, session=session)
 
         # Batch-fetch all inference relations in one pass (EQ-1)
         all_in_rel_source_ids: list[int] = []
@@ -416,7 +420,7 @@ class MemoryQueryEngine:
             all_in_rel_source_ids.extend(
                 rel.from_expression_id for rel in in_rels
             )
-        inference_map = self.expr_repo.get_by_ids(all_in_rel_source_ids)  # 1 query
+        inference_map = self.expr_repo.get_by_ids(all_in_rel_source_ids, session=session)  # 1 query
 
         # Batch-fetch bookmarks for parent source_ids
         parent_source_ids = [
@@ -601,6 +605,7 @@ class ResearchEngine:
         prior_synthesis: str | None = None,
         session_id: int | None = None,
         query_id: int | None = None,
+        skip_synthesis: bool = False,
     ) -> ResearchResult:
         """Run all three streams in parallel, fuse via RRF, synthesise, return results.
 
@@ -659,10 +664,22 @@ class ResearchEngine:
             use_hyde = False
 
         # ── Stage 1: Query reformulation ─────────────────────────────────────
+        # When skip_synthesis=True (e.g. /search in chat), skip the LLM reformulation
+        # entirely — use the raw query as keywords. This makes /search fully offline-capable.
         t_reform = time.perf_counter()
-        from audiobench.memory.query_reformulator import QueryReformulator
-        reformulator = QueryReformulator(model=model)
-        rq = reformulator.reformulate(query)
+        if skip_synthesis:
+            from audiobench.memory.query_types import ReformulatedQuery
+            rq = ReformulatedQuery(
+                original=query,
+                bm25_keywords=query,
+                semantic_query=query,
+                hyde_anchor=f"Hypothetical answer to: {query}",
+                dense_query=query,
+            )
+        else:
+            from audiobench.memory.query_reformulator import QueryReformulator
+            reformulator = QueryReformulator(model=model)
+            rq = reformulator.reformulate(query)
         reform_ms = (time.perf_counter() - t_reform) * 1000
         log_event(
             subsystem="memory.search",
@@ -955,6 +972,21 @@ class ResearchEngine:
             f"FRAGMENTS:\n{context_text}\n\n"
             "Synthesize your answer now."
         )
+
+        if skip_synthesis:
+            return ResearchResult(
+                query=query,
+                sources=fused,
+                prior_synthesis_hits=synthesis_frags,
+                query_time_seconds=t_retrieval_done - t0,
+                retrieval_time_seconds=t_retrieval_done - t0,
+                synthesis_time_seconds=0.0,
+                answer=None,
+                synthesis_failed=False,
+                streams_skipped=streams_skipped,
+                hyde_fallback=hyde_fallback,
+                hyde_document=rq.hyde_document,
+            )
 
         settings = get_settings()
         model_name = model or settings.ollama_model

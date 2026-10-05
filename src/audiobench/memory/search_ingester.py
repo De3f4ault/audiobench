@@ -33,6 +33,7 @@ from typing import Any
 from audiobench.core.db_session import get_session
 from audiobench.memory.enums import RelationType, SessionType, SourceType
 from audiobench.storage.expression_repository import ExpressionRepository
+from audiobench.storage.repository import TranscriptionRepository
 
 logger = logging.getLogger("audiobench.memory.search_ingester")
 
@@ -42,6 +43,7 @@ class SearchIngester:
 
     def __init__(self, store: Any | None = None) -> None:
         self._expr_repo = ExpressionRepository()
+        self._tx_repo = TranscriptionRepository()
         self._store = store
 
     @property
@@ -115,6 +117,7 @@ class SearchIngester:
                 {"qid": query_id},
             ).scalars().all()
         segment_ids: list[int] = list(frag_rows)
+        privacy_tier = self._tx_repo.get_max_privacy_tier_for_segments(segment_ids)
 
         # ── 1. Create SEARCH_QUERY expression ─────────────────────────
         query_expr = self._expr_repo.register(
@@ -123,6 +126,7 @@ class SearchIngester:
             source_id=query_id,          # enables dedup: source_type+source_id is unique
             session_type=SessionType.MEMORY_SEARCH.value,
             session_id=session_id,
+            privacy_tier=privacy_tier,
         )
         logger.debug(
             "SearchIngester: SEARCH_QUERY expr #%d for query_id=%d session=%d seq=%d",
@@ -138,6 +142,7 @@ class SearchIngester:
                 source_id=query_id,      # same source_id; source_type differentiates
                 session_type=SessionType.MEMORY_SEARCH.value,
                 session_id=session_id,
+                privacy_tier=privacy_tier,
             )
             synthesis_expr_id = synth_expr.id
             logger.debug(
@@ -210,6 +215,14 @@ class SearchIngester:
                 ),
                 {"sid": session_id},
             ).fetchone()
+            frag_rows = session.execute(
+                sql_text(
+                    "SELECT sqf.segment_id FROM search_query_fragments sqf "
+                    "JOIN search_queries sq ON sqf.query_id = sq.id "
+                    "WHERE sq.session_id = :sid"
+                ),
+                {"sid": session_id},
+            ).scalars().all()
 
         if row is None or not row[0]:
             logger.debug(
@@ -219,6 +232,8 @@ class SearchIngester:
             return -1
 
         summary_text: str = row[0]
+        session_segment_ids: list[int] = list(frag_rows)
+        privacy_tier = self._tx_repo.get_max_privacy_tier_for_segments(session_segment_ids)
 
         # ── Create SEARCH_SESSION_SUMMARY expression ───────────────────
         summary_expr = self._expr_repo.register(
@@ -227,6 +242,7 @@ class SearchIngester:
             source_id=session_id,
             session_type=SessionType.MEMORY_SEARCH.value,
             session_id=session_id,
+            privacy_tier=privacy_tier,
         )
         logger.debug(
             "SearchIngester: SEARCH_SESSION_SUMMARY expr #%d for session_id=%d",

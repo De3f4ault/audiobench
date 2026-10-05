@@ -133,8 +133,8 @@ class MemoirWriter:
         Returns:
             Memoir dataclass with all fields populated.
         """
-        from audiobench.storage.models import ChatMessage, ConversationSummary, ExpressionRecord
         from audiobench.storage.expression_repository import ExpressionRepository
+        from audiobench.storage.models import ChatMessage, ConversationSummary
 
         # ── 1. Fetch messages ──────────────────────────────────────────────
         with db_session() as db:
@@ -159,12 +159,21 @@ class MemoirWriter:
         memoir = self._call_llm(user_prompt, title)
 
         # ── 4. Store in DB ─────────────────────────────────────────────────
+        from audiobench.storage.repository import TranscriptionRepository
+        tx_repo = TranscriptionRepository()
+        try:
+            t_ids = json.loads(getattr(conversation, "transcript_ids", "[]") or "[]")
+        except Exception:
+            t_ids = []
+        privacy_tier = tx_repo.get_max_privacy_tier_for_transcriptions(t_ids)
+
         repo = ExpressionRepository()
         expr = repo.register(
             content=memoir.narrative,
             source_type="session_memoir",
             session_id=conversation.id,
             session_type=getattr(conversation, "session_type", "memoir"),
+            privacy_tier=privacy_tier,
         )
 
         with db_session() as db:

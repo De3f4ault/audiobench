@@ -122,19 +122,37 @@ class SearchSemanticCompleter(Completer):
 class SearchAutoSuggest(AutoSuggest):
     """Two-tier auto-suggestion:
 
-    1. Past query history match (AutoSuggestFromHistory)
-    2. Semantic transcript continuation from daemon
-    3. Command synopsis template
+    1. Past query history match (AutoSuggestFromHistory) - instant
+    2. Command synopsis template - instant
+    3. Non-blocking semantic continuation from background cache
     """
 
     def __init__(self, state: SearchSessionState) -> None:
+        import threading
+
         self._state = state
         self._history = AutoSuggestFromHistory()
+        self._threading = threading
+        self._cache: dict[str, str] = {}
+        self._last_fetch_query: str = ""
+        self._last_fetch_time: float = 0.0
         try:
             from audiobench.daemon.factory import get_daemon_client
             self._client = get_daemon_client()
         except Exception:
             self._client = None
+
+    def _fetch_background(self, text: str) -> None:
+        if not self._client:
+            return
+        try:
+            results = self._client.autocomplete(text, top_k=1)
+            if results:
+                matched_text = " ".join(results[0].get("text", "").split()).strip()
+                if matched_text:
+                    self._cache[text] = matched_text
+        except Exception:
+            pass
 
     def get_suggestion(self, buffer, document) -> Suggestion | None:
         hist_sugg = self._history.get_suggestion(buffer, document)
@@ -153,21 +171,16 @@ class SearchAutoSuggest(AutoSuggest):
                     return Suggestion(meta.synopsis)
             return None
 
-        # Semantic ghost text from memory
+        # Semantic ghost text from memory (strictly non-blocking)
         if not getattr(self._state, "autocomplete", True) or self._client is None:
             return None
 
         if text.startswith("/") or len(text.strip()) < 4 or document.cursor_position < len(text):
             return None
 
-        try:
-            results = self._client.autocomplete(text, top_k=1)
-            if not results:
-                return None
-            matched_text = " ".join(results[0].get("text", "").split()).strip()
-            if not matched_text:
-                return None
-
+        # If cached, return suggestion immediately without blocking UI
+        if text in self._cache:
+            matched_text = self._cache[text]
             text_lower = text.lower()
             matched_lower = matched_text.lower()
 
@@ -181,7 +194,15 @@ class SearchAutoSuggest(AutoSuggest):
                 rest = matched_text[pos + len(text):]
                 if rest:
                     return Suggestion(rest)
-        except Exception:
-            pass
+            return None
+
+        # Debounced trigger in background thread so prompt_toolkit main thread never stalls
+        now = time.time()
+        if text != self._last_fetch_query and (now - self._last_fetch_time > 0.15):
+            self._last_fetch_query = text
+            self._last_fetch_time = now
+            self._threading.Thread(
+                target=self._fetch_background, args=(text,), daemon=True
+            ).start()
 
         return None

@@ -97,8 +97,8 @@ def test_rrf_top_k_uses_min_heap_not_full_sort():
     for _ in range(100):
         rrf_merge(large_fts, [], [], top_n=10)
     elapsed = time.perf_counter() - t0
-    # Should complete 100 iterations in under 200ms total
-    assert elapsed < 0.2, f"RRF merge too slow: {elapsed * 1000:.1f}ms for 100 runs"
+    # Should complete 100 iterations in under 500ms total (even on high-load runner)
+    assert elapsed < 0.5, f"RRF merge too slow: {elapsed * 1000:.1f}ms for 100 runs"
 
 
 def test_rrf_empty_streams_returns_empty():

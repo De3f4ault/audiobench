@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock, patch
-
+from unittest.mock import MagicMock
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -51,7 +50,7 @@ VALID_MEMOIR_JSON = json.dumps({
 # ── compress_memoir tests ────────────────────────────────────────────────────
 
 def test_compress_full_includes_narrative():
-    from audiobench.memory.memoir_writer import Memoir, CompressionLevel, compress_memoir
+    from audiobench.memory.memoir_writer import CompressionLevel, Memoir, compress_memoir
     m = Memoir(
         narrative="Long narrative text here.",
         key_insights=json.dumps(["Insight A"]),
@@ -64,7 +63,7 @@ def test_compress_full_includes_narrative():
 
 
 def test_compress_digest_truncates_narrative():
-    from audiobench.memory.memoir_writer import Memoir, CompressionLevel, compress_memoir
+    from audiobench.memory.memoir_writer import CompressionLevel, Memoir, compress_memoir
     long_narrative = "X" * 500
     m = Memoir(
         narrative=long_narrative,
@@ -79,7 +78,7 @@ def test_compress_digest_truncates_narrative():
 
 
 def test_compress_key_only_omits_narrative():
-    from audiobench.memory.memoir_writer import Memoir, CompressionLevel, compress_memoir
+    from audiobench.memory.memoir_writer import CompressionLevel, Memoir, compress_memoir
     m = Memoir(
         narrative="This should NOT appear.",
         key_insights=json.dumps(["Key thing"]),
@@ -91,7 +90,7 @@ def test_compress_key_only_omits_narrative():
 
 def test_compress_key_only_preserves_open_threads():
     """Open threads must ALWAYS survive any compression level."""
-    from audiobench.memory.memoir_writer import Memoir, CompressionLevel, compress_memoir
+    from audiobench.memory.memoir_writer import CompressionLevel, Memoir, compress_memoir
     m = Memoir(
         narrative="Narrative.",
         key_insights=json.dumps([]),
@@ -116,7 +115,6 @@ def _make_mock_messages_query(msgs):
 def test_memoir_has_all_required_sections(monkeypatch):
     """generate() must return a Memoir with narrative, key_insights, open_threads."""
     from audiobench.memory.memoir_writer import MemoirWriter
-    from audiobench.memory.query_engine import Ok
 
     conv = _make_conversation()
     session = _make_session()
@@ -161,7 +159,7 @@ def test_memoir_has_all_required_sections(monkeypatch):
 
 def test_memoir_is_stored_in_db(monkeypatch):
     """generate() must write a ConversationSummary to the DB."""
-    from audiobench.memory.memoir_writer import MemoirWriter, Memoir
+    from audiobench.memory.memoir_writer import Memoir, MemoirWriter
 
     conv = _make_conversation()
     session = _make_session()
@@ -204,7 +202,7 @@ def test_memoir_is_stored_in_db(monkeypatch):
 
 def test_memoir_registered_as_expression(monkeypatch):
     """generate() must call ExpressionRepository.register with source_type='session_memoir'."""
-    from audiobench.memory.memoir_writer import MemoirWriter, Memoir
+    from audiobench.memory.memoir_writer import Memoir, MemoirWriter
 
     conv = _make_conversation()
     session = _make_session()
@@ -251,7 +249,7 @@ def test_memoir_registered_as_expression(monkeypatch):
 
 def test_memoir_open_threads_survive_compression(monkeypatch):
     """Open threads from a memoir must appear after KEY_ONLY compression."""
-    from audiobench.memory.memoir_writer import Memoir, CompressionLevel, compress_memoir
+    from audiobench.memory.memoir_writer import CompressionLevel, Memoir, compress_memoir
 
     old_session_memoir = Memoir(
         narrative="Old session narrative.",

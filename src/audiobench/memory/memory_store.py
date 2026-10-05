@@ -36,6 +36,9 @@ class ExpressionNode(LanceModel):
     confidence: float | None = None
     original_language: str | None = None
     work_id: int | None = None
+    chapter_id: int | None = None
+    chapter_title: str | None = None
+    author: str | None = None
 
 
 class QueryCacheNode(LanceModel):
@@ -175,6 +178,11 @@ class MemoryStore:
         content: str,
         source_type: str,
         speaker: str | None = None,
+        chapter_id: int | None = None,
+        chapter_title: str | None = None,
+        author: str | None = None,
+        work_id: int | None = None,
+        audio_file_id: int | None = None,
     ) -> None:
         """Embed and write a single expression to LanceDB via atomic merge_insert.
 
@@ -194,6 +202,11 @@ class MemoryStore:
             embedded_at=now_str,
             source_type=source_type,
             speaker=speaker,
+            chapter_id=chapter_id,
+            chapter_title=chapter_title,
+            author=author,
+            work_id=work_id,
+            audio_file_id=audio_file_id,
         )
         tbl = self.table
         # IMPORTANT: always pass schema=tbl.schema here.
@@ -269,6 +282,9 @@ class MemoryStore:
                 confidence=n.get("confidence"),
                 original_language=n.get("original_language"),
                 work_id=n.get("work_id"),
+                chapter_id=n.get("chapter_id"),
+                chapter_title=n.get("chapter_title"),
+                author=n.get("author"),
             )
             for n, v in zip(nodes, vectors)
         ]
@@ -296,6 +312,8 @@ class MemoryStore:
         speaker_filter: str | None = None,
         audio_file_id: int | None = None,
         work_id: int | None = None,
+        chapter_id: int | None = None,
+        author_filter: str | None = None,
         hyde_document: str | None = None,
         use_bm25: bool = True,
         use_dense: bool = True,
@@ -336,6 +354,10 @@ class MemoryStore:
             where_clauses.append(f"audio_file_id = {audio_file_id}")
         if work_id is not None:
             where_clauses.append(f"work_id = {work_id}")
+        if chapter_id is not None:
+            where_clauses.append(f"chapter_id = {chapter_id}")
+        if author_filter:
+            where_clauses.append(f"author = '{author_filter}'")
 
         prefilter = " AND ".join(where_clauses) if where_clauses else None
         if prefilter:

@@ -121,3 +121,46 @@ def test_content_aware_router_diarized(mock_chunk: MagicMock) -> None:
         chunks = content_aware_router(text, diarized_segments=segments)
         # SPK1 has 5 sentences, SPK2 has 1 sentence. Both are > 10 chars so they get chunked.
         assert mock_chunk.call_count == 2
+
+
+def test_attribute_chunks_to_segments_monotonic_alignment() -> None:
+    """Verify attribute_chunks_to_segments accurately links chunks to physical segments."""
+    from audiobench.memory.chunking import Chunk, attribute_chunks_to_segments
+
+    raw_text = "The quick brown fox jumps over the lazy dog. It was a sunny afternoon in the forest."
+    segments = [
+        {"id": 101, "text": "The quick brown fox jumps", "start_time": 0.0, "end_time": 2.5},
+        {"id": 102, "text": "over the lazy dog.", "start_time": 2.5, "end_time": 4.8},
+        {"id": 103, "text": "It was a sunny afternoon", "start_time": 5.0, "end_time": 7.2},
+        {"id": 104, "text": "in the forest.", "start_time": 7.2, "end_time": 9.0},
+    ]
+
+    chunk1 = Chunk(content="The quick brown fox jumps over the lazy dog.", uuid="c1", tier=3)
+    chunk2 = Chunk(content="It was a sunny afternoon in the forest.", uuid="c2", tier=3)
+
+    attributed = attribute_chunks_to_segments([chunk1, chunk2], raw_text, segments)
+    assert len(attributed) == 2
+
+    assert attributed[0].segment_ids == [101, 102]
+    assert attributed[0].start_time == 0.0
+    assert attributed[0].end_time == 4.8
+
+    assert attributed[1].segment_ids == [103, 104]
+    assert attributed[1].start_time == 5.0
+    assert attributed[1].end_time == 9.0
+
+
+def test_content_aware_router_attaches_segments() -> None:
+    """Verify content_aware_router populates segment_ids and timestamps when segments are passed."""
+    raw_text = "Short text under threshold."
+    segments = [
+        {"id": 201, "text": "Short text", "start_time": 1.0, "end_time": 2.0},
+        {"id": 202, "text": "under threshold.", "start_time": 2.0, "end_time": 3.5},
+    ]
+
+    chunks = content_aware_router(raw_text, segments=segments)
+    assert len(chunks) == 1
+    assert chunks[0].segment_ids == [201, 202]
+    assert chunks[0].start_time == 1.0
+    assert chunks[0].end_time == 3.5
+

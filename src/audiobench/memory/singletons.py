@@ -10,7 +10,8 @@ import contextlib
 import os
 import threading
 import time
-from typing import Any, Generator
+from collections.abc import Generator
+from typing import Any
 
 from huggingface_hub.utils import HfHubHTTPError, LocalEntryNotFoundError
 from requests.exceptions import ConnectionError  # type: ignore[import-untyped]
@@ -36,8 +37,15 @@ _primary_inference_lock = threading.RLock()
 _reranker: Any = None
 _reranker_lock = threading.Lock()
 
-_llm_breaker: Any = None
-_llm_breaker_lock = threading.Lock()
+_llm_breaker: Any = None  # kept for backward compat — alias to _gemini_breaker below
+_gemini_breaker: Any = None
+_gemini_breaker_lock = threading.Lock()
+
+_memory_store: Any = None
+_memory_store_lock = threading.Lock()
+
+_segment_store: Any = None
+_segment_store_lock = threading.Lock()
 
 _hf_configured = False
 
@@ -74,7 +82,7 @@ def _force_offline_env() -> Generator[None, None, None]:
     orig_hf = os.environ.get("HF_HUB_OFFLINE")
     orig_tr = os.environ.get("TRANSFORMERS_OFFLINE")
     orig_const = hf_constants.HF_HUB_OFFLINE
-    
+
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     hf_constants.HF_HUB_OFFLINE = True
@@ -280,7 +288,7 @@ def get_colbert_reranker() -> Any:
                         _colbert_reranker = ColbertReranker(
                             model_name="answerdotai/answerai-colbert-small-v1", column="content"
                         )
-                            
+
                     logger.info("ColBERT reranker loaded in %.2fs", time.time() - t0)
                 except (ImportError, ModuleNotFoundError) as e:
                     # rerankers package not installed — ColBERT is optional
@@ -296,16 +304,35 @@ def get_colbert_reranker() -> Any:
     return _colbert_reranker
 
 
-def get_llm_circuit_breaker() -> Any:
-    """Get the global circuit breaker for LLM API calls."""
-    global _llm_breaker
-    if _llm_breaker is None:
-        with _llm_breaker_lock:
-            if _llm_breaker is None:
+def get_gemini_circuit_breaker() -> Any:
+    """Get the circuit breaker for Gemini API calls only.
+
+    This breaker is intentionally **not** shared with Ollama — a Gemini DNS
+    failure must never prevent local Ollama from being called.
+    """
+    global _gemini_breaker
+    if _gemini_breaker is None:
+        with _gemini_breaker_lock:
+            if _gemini_breaker is None:
                 from audiobench.memory.llm_caller import CircuitBreaker
-                # Trip after 3 failures, allow probe after 60s
-                _llm_breaker = CircuitBreaker(failure_threshold=3, recovery_timeout=60.0)
-    return _llm_breaker
+                # Trip after 3 consecutive Gemini failures; probe again after 60 s.
+                _gemini_breaker = CircuitBreaker(failure_threshold=3, recovery_timeout=60.0)
+    return _gemini_breaker
+
+
+def get_llm_circuit_breaker() -> Any:
+    """Backward-compatible alias — returns the Gemini-only circuit breaker."""
+    return get_gemini_circuit_breaker()
+
+
+def reset_gemini_circuit_breaker() -> None:
+    """Manually reset the Gemini circuit breaker to CLOSED.
+
+    Call this when the user switches model mid-session (e.g. /set model default)
+    so a previous network outage does not keep blocking future synthesis calls.
+    """
+    breaker = get_gemini_circuit_breaker()
+    breaker.reset()
 
 
 def pre_warm_retrieval_pipeline() -> None:
@@ -322,3 +349,26 @@ def pre_warm_retrieval_pipeline() -> None:
     get_colbert_reranker()  # optional — won't crash if rerankers pkg is absent
 
     logger.info("Retrieval pipeline fully warmed in %.2fs", time.time() - t0)
+
+
+def get_memory_store() -> Any:
+    """Get the thread-safe singleton MemoryStore instance."""
+    global _memory_store
+    if _memory_store is None:
+        with _memory_store_lock:
+            if _memory_store is None:
+                from audiobench.memory.memory_store import MemoryStore
+                _memory_store = MemoryStore()
+    return _memory_store
+
+
+def get_segment_store() -> Any:
+    """Get the thread-safe singleton SegmentVectorStore instance."""
+    global _segment_store
+    if _segment_store is None:
+        with _segment_store_lock:
+            if _segment_store is None:
+                from audiobench.memory.memory_store import SegmentVectorStore
+                _segment_store = SegmentVectorStore()
+    return _segment_store
+

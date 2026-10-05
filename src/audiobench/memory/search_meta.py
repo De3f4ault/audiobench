@@ -139,6 +139,27 @@ SEARCH_COMMAND_REGISTRY: list[CommandMeta] = [
         example="/forget",
     ),
     CommandMeta(
+        name="/voice",
+        aliases=["/v"],
+        summary="Prompt one-shot voice input for search query",
+        synopsis="",
+        example="/voice",
+    ),
+    CommandMeta(
+        name="/voices",
+        aliases=["/voice-picker"],
+        summary="Open interactive Piper TTS voice audition and picker",
+        synopsis="",
+        example="/voices",
+    ),
+    CommandMeta(
+        name="/speak",
+        aliases=["/read"],
+        summary="Speak current AI synthesis answer aloud using Piper TTS",
+        synopsis="",
+        example="/speak",
+    ),
+    CommandMeta(
         name="/help",
         aliases=["/?"],
         summary="Show interactive commands and keyboard shortcuts",

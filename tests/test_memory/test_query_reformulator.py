@@ -20,6 +20,7 @@ def mock_llm_returns_valid_json(monkeypatch):
         }
         return Ok(value=json.dumps(payload))
     monkeypatch.setattr("audiobench.memory.query_reformulator._call_llm", mock_call)
+    monkeypatch.setattr("audiobench.memory.query_reformulator._call_llm_for_model", mock_call)
 
 @pytest.fixture
 def mock_llm_fails(monkeypatch):
@@ -27,6 +28,7 @@ def mock_llm_fails(monkeypatch):
     def mock_call(*args, **kwargs):
         return Err(error="Connection refused")
     monkeypatch.setattr("audiobench.memory.query_reformulator._call_llm", mock_call)
+    monkeypatch.setattr("audiobench.memory.query_reformulator._call_llm_for_model", mock_call)
 
 @pytest.fixture
 def mock_llm_returns_garbage(monkeypatch):
@@ -34,6 +36,7 @@ def mock_llm_returns_garbage(monkeypatch):
     def mock_call(*args, **kwargs):
         return Ok(value="This is definitely not json!")
     monkeypatch.setattr("audiobench.memory.query_reformulator._call_llm", mock_call)
+    monkeypatch.setattr("audiobench.memory.query_reformulator._call_llm_for_model", mock_call)
 
 
 def test_reformulated_query_is_frozen_dataclass():

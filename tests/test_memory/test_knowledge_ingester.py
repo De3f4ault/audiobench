@@ -1,10 +1,19 @@
 import json
+
 import pytest
+
+from audiobench.core.db_session import get_session
 from audiobench.memory.knowledge_ingester import KnowledgeIngester
 from audiobench.storage.models import (
-    ChatMessage, ChatConversation, AskEntry, AskLog, ExpressionRecord, TranscriptionRecord, AudioFileRecord
+    AskEntry,
+    AskLog,
+    AudioFileRecord,
+    ChatConversation,
+    ChatMessage,
+    ExpressionRecord,
+    TranscriptionRecord,
 )
-from audiobench.core.db_session import get_session
+
 
 @pytest.fixture
 def ingester(test_db):
@@ -16,16 +25,16 @@ def conversation(test_db):
         audio = AudioFileRecord(file_path="test_chat.mp3", file_name="test_chat.mp3", duration_seconds=10)
         session.add(audio)
         session.commit()
-        
+
         tx = TranscriptionRecord(audio_file_id=audio.id, file_name="test_chat.mp3", model_name="x", language="en")
         session.add(tx)
         session.commit()
-        
+
         c = ChatConversation(title="Test", transcript_ids=json.dumps([tx.id]))
         session.add(c)
         session.commit()
         session.refresh(c)
-        
+
         # We need to detach so test functions can use them and pass to ingester without threading detached instance issues
         session.expunge(c)
         return c
@@ -57,11 +66,11 @@ def ask_log(test_db):
         audio = AudioFileRecord(file_path="test_ask.mp3", file_name="test_ask.mp3", duration_seconds=10)
         session.add(audio)
         session.commit()
-        
+
         tx = TranscriptionRecord(audio_file_id=audio.id, file_name="test_ask.mp3", model_name="x", language="en")
         session.add(tx)
         session.commit()
-        
+
         log = AskLog(audio_file_id=audio.id)
         session.add(log)
         session.commit()
@@ -106,13 +115,14 @@ def test_ingest_creates_thematic_edge_to_transcript(ingester, chat_message, conv
 
 def test_ingest_is_nonblocking_when_called_from_chat(monkeypatch):
     """ingest_chat_message when called via background thread must not block main thread."""
-    import threading, time
+    import threading
+    import time
     ingester_calls = []
     def slow_ingest(*args, **kwargs):
         time.sleep(0.5)
         ingester_calls.append(1)
     monkeypatch.setattr("audiobench.memory.knowledge_ingester.KnowledgeIngester.ingest_chat_message", slow_ingest)
-    
+
     t0 = time.perf_counter()
     t = threading.Thread(target=slow_ingest)
     t.start()

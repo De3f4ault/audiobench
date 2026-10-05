@@ -19,6 +19,10 @@ class SourceType(str, Enum):
     SYSTEM_INFERENCE = "system_inference"
     USER_CORRECTION = "user_correction"
     JOURNAL_ENTRY = "journal_entry"
+    # Search-session derived knowledge (added 2026-08-07)
+    SEARCH_QUERY           = "search_query"            # user's research question (intent signal)
+    SEARCH_SYNTHESIS       = "search_synthesis"         # AI synthesis answer (distilled knowledge)
+    SEARCH_SESSION_SUMMARY = "search_session_summary"   # /summary output (identity arc)
 
 
 class RelationType(str, Enum):
@@ -44,6 +48,7 @@ class SessionType(str, Enum):
     CHAT = "chat"
     ASK_LOG = "ask_log"
     SYNTHESIS = "synthesis"
+    MEMORY_SEARCH = "memory_search"  # search REPL sessions
 
 
 class DaemonCmd(str, Enum):

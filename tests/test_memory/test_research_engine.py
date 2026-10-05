@@ -5,10 +5,9 @@ import time
 
 import pytest
 
+from audiobench.memory.query_engine import ResearchEngine
 from audiobench.memory.query_reformulator import ReformulatedQuery
 from audiobench.memory.retrieval_streams import SegmentHit
-from audiobench.memory.query_engine import ResearchEngine
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -27,6 +26,24 @@ def _make_hit(segment_id: int, start: float = 1.0, end: float = 2.0) -> SegmentH
         start_time=start,
         end_time=end,
         text=f"segment {segment_id}",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _stub_synthesis_and_llm(monkeypatch):
+    """Prevent ResearchEngine tests from hanging on external Ollama or loading models in-process."""
+    from audiobench.memory.query_engine import Ok
+    monkeypatch.setattr(
+        "audiobench.memory.retrieval_streams.SynthesisStream.retrieve",
+        lambda *a, **kw: [],
+    )
+    monkeypatch.setattr(
+        "audiobench.memory.query_engine._call_llm",
+        lambda *a, **kw: Ok(value="mock answer"),
+    )
+    monkeypatch.setattr(
+        "audiobench.memory.query_engine._call_llm_for_model",
+        lambda *a, **kw: Ok(value="mock answer"),
     )
 
 
@@ -54,6 +71,7 @@ def test_all_three_streams_called_in_parallel(monkeypatch):
     monkeypatch.setattr("audiobench.memory.retrieval_streams.FTS5Stream.retrieve", slow_fts)
     monkeypatch.setattr("audiobench.memory.retrieval_streams.DenseStream.retrieve", slow_dense)
     monkeypatch.setattr("audiobench.memory.retrieval_streams.ColBERTStream.retrieve", slow_colbert)
+    monkeypatch.setattr("audiobench.memory.retrieval_streams.SynthesisStream.retrieve", lambda *a, **kw: [])
 
     # Also stub reformulator to avoid real LLM call
     monkeypatch.setattr(
@@ -147,8 +165,9 @@ def test_fts5_stream_not_using_model_inference(monkeypatch):
 
 def test_dense_and_colbert_route_through_daemon_not_singletons(monkeypatch):
     """Dense and ColBERT streams must NOT call local singletons directly."""
-    from audiobench.memory.retrieval_streams import ColBERTStream, DenseStream
     from unittest.mock import MagicMock
+
+    from audiobench.memory.retrieval_streams import ColBERTStream, DenseStream
 
     singleton_calls: list[str] = []
     try:

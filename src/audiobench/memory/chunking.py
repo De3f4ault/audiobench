@@ -8,20 +8,38 @@ from __future__ import annotations
 
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 
 from audiobench.core.logger_factory import get_logger
 from audiobench.core.settings import get_settings
+from audiobench.memory.boilerplate import clean_audio_disclaimers, is_pure_boilerplate
 from audiobench.memory.singletons import get_boundary_embedder
 
 try:
+    import os
+
     import nltk  # type: ignore[import-untyped]
 
-    nltk.download("punkt", quiet=True)
-    nltk.download("punkt_tab", quiet=True)
+    is_offline = get_settings().offline_mode or os.environ.get("HF_HUB_OFFLINE") == "1"
+    if not is_offline:
+        try:
+            nltk.data.find("tokenizers/punkt")
+        except LookupError:
+            try:
+                nltk.download("punkt", quiet=True)
+            except Exception:
+                pass
+
+        try:
+            nltk.data.find("tokenizers/punkt_tab")
+        except LookupError:
+            try:
+                nltk.download("punkt_tab", quiet=True)
+            except Exception:
+                pass
     from nltk.tokenize import sent_tokenize  # type: ignore[import-untyped]
 except ImportError:
     # Fallback if nltk is somehow missing
@@ -48,6 +66,9 @@ class Chunk:
     uuid: str
     tier: int
     speaker: str | None = None
+    segment_ids: list[int] = field(default_factory=list)
+    start_time: float | None = None
+    end_time: float | None = None
 
 
 @dataclass
@@ -105,6 +126,11 @@ def _clean_text(text: str) -> str:
                 else:
                     break
             text = " ".join(sentences[: trim_idx + 1])  # Keep one instance
+
+    # Strip publisher preambles and closing production credits.
+    # Covers all major audiobook producers, streaming platforms, public-domain
+    # repositories (LibriVox and phonetic variants), and podcast conventions.
+    text = clean_audio_disclaimers(text)
 
     return text
 
@@ -269,8 +295,190 @@ def speaker_turn_splitter(diarized_segments: list[dict[str, Any]]) -> list[Speak
     return blocks
 
 
+def norm_punct(t: str) -> str:
+    """Normalize whitespace around punctuation and typographic variants."""
+    t = t.replace("—", " ").replace("–", " ")
+    t = re.sub(r"\s+([?.!,;:\'\"])", r"\1", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def strip_all_punct(t: str) -> str:
+    """Strip all non-alphanumeric characters for robust fallback matching."""
+    return re.sub(r"[^a-zA-Z0-9]", "", t.lower())
+
+
+def align_cft_to_ft(cft: str, ft: str) -> list[int]:
+    """Map each character index in cleaned_ft back to raw full_text."""
+    cft_to_ft = [0] * len(cft)
+    ft_ptr = 0
+    cft_ptr = 0
+
+    while cft_ptr < len(cft) and ft_ptr < len(ft):
+        c = cft[cft_ptr]
+        idx = ft.find(c, ft_ptr)
+        if idx != -1:
+            ft_ptr = idx
+            cft_to_ft[cft_ptr] = ft_ptr
+            cft_ptr += 1
+            ft_ptr += 1
+        else:
+            cft_ptr += 1
+    return cft_to_ft
+
+
+def attribute_chunks_to_segments(
+    chunks: list[Chunk],
+    raw_text: str,
+    segments: list[dict[str, Any]],
+) -> list[Chunk]:
+    """Map semantic chunks back to physical transcript segments.
+
+    Sets segment_ids, start_time, and end_time on each Chunk instance.
+    Uses monotonic subsequence alignment to ground cleaned chunk text in raw full_text spans.
+    """
+    if not chunks or not segments or not raw_text:
+        return chunks
+
+    raw_ft = raw_text or ""
+    # 1. Compute segment spans in raw full_text
+    seg_spans = []
+    curr_offset = 0
+    for seg in segments:
+        sid = seg.get("id") if isinstance(seg, dict) else getattr(seg, "id", None)
+        stext = seg.get("text", "") if isinstance(seg, dict) else getattr(seg, "text", "")
+        s_start = seg.get("start_time", 0.0) if isinstance(seg, dict) else getattr(seg, "start_time", 0.0)
+        s_end = seg.get("end_time", 0.0) if isinstance(seg, dict) else getattr(seg, "end_time", 0.0)
+
+        st_clean = stext.strip()
+        if not st_clean:
+            continue
+        idx = raw_ft.find(st_clean, curr_offset)
+        if idx == -1:
+            idx = raw_ft.find(st_clean)
+        if idx != -1:
+            seg_spans.append({
+                "id": sid,
+                "char_start": idx,
+                "char_end": idx + len(st_clean),
+                "start_time": s_start,
+                "end_time": s_end,
+            })
+            curr_offset = idx + len(st_clean)
+
+    if not seg_spans:
+        return chunks
+
+    # 2. Clean full_text and align to raw full_text
+    cft = _clean_text(raw_ft)
+    cft_to_ft = align_cft_to_ft(cft, raw_ft)
+
+    cft_norm = norm_punct(cft)
+    ft_alphanum = strip_all_punct(raw_ft)
+    ft_alphanum_to_raw = [raw_i for raw_i, ch in enumerate(raw_ft) if ch.isalnum()]
+
+    cft_cursor = 0
+
+    for chunk in chunks:
+        c_clean = chunk.content.strip()
+        if not c_clean:
+            continue
+
+        c_start_raw: int | None = None
+        c_end_raw: int | None = None
+
+        # Tier 1: exact cft match
+        idx = cft.find(c_clean, cft_cursor)
+        if idx != -1:
+            cft_cursor = idx
+            c_start_raw = cft_to_ft[idx]
+            end_idx = min(len(cft_to_ft) - 1, idx + len(c_clean) - 1)
+            c_end_raw = cft_to_ft[end_idx] + 1
+        else:
+            # Tier 2: prefix cft match
+            prefix = c_clean[:80]
+            idx = cft.find(prefix, cft_cursor)
+            if idx != -1:
+                cft_cursor = idx
+                c_start_raw = cft_to_ft[idx]
+                if idx + len(c_clean) >= len(cft):
+                    c_end_raw = len(raw_ft)
+                else:
+                    end_idx = min(len(cft_to_ft) - 1, idx + len(c_clean) - 1)
+                    c_end_raw = cft_to_ft[end_idx] + 1
+            else:
+                # Tier 3: normalized cft match
+                c_norm = norm_punct(c_clean)
+                idx_norm = cft_norm.find(c_norm)
+                if idx_norm != -1:
+                    prefix_words = c_clean.split()[:4]
+                    pw = " ".join(prefix_words)
+                    idx_pw = cft.find(pw, cft_cursor)
+                    if idx_pw == -1:
+                        idx_pw = cft.find(pw)
+                    if idx_pw != -1:
+                        cft_cursor = idx_pw
+                        c_start_raw = cft_to_ft[idx_pw]
+                        end_idx = min(len(cft_to_ft) - 1, idx_pw + len(c_clean) - 1)
+                        c_end_raw = cft_to_ft[end_idx] + 1
+
+        # Fallback search directly in raw full_text
+        if c_start_raw is None:
+            # Tier 4: exact raw ft match
+            idx_raw = raw_ft.find(c_clean)
+            if idx_raw != -1:
+                c_start_raw = idx_raw
+                c_end_raw = idx_raw + len(c_clean)
+            else:
+                # Tier 5: normalized raw ft match
+                words = [w for w in c_clean.split() if len(w) > 3]
+                if len(words) >= 4:
+                    search_phrase = " ".join(words[:4])
+                    idx_sp = raw_ft.find(search_phrase)
+                    if idx_sp == -1:
+                        idx_sp = raw_ft.lower().find(search_phrase.lower())
+                    if idx_sp != -1:
+                        c_start_raw = idx_sp
+                        c_end_raw = min(len(raw_ft), idx_sp + len(c_clean))
+
+        if c_start_raw is None:
+            # Tier 6: prefix in raw ft fallback
+            idx_pfx = raw_ft.find(c_clean[:40])
+            if idx_pfx == -1:
+                idx_pfx = raw_ft.lower().find(c_clean[:40].lower())
+            if idx_pfx != -1:
+                c_start_raw = idx_pfx
+                c_end_raw = min(len(raw_ft), idx_pfx + len(c_clean))
+
+        if c_start_raw is None:
+            # Tier 7: alphanumeric stripped fallback
+            c_alpha = strip_all_punct(c_clean)
+            pos_alpha = ft_alphanum.find(c_alpha[:50])
+            if pos_alpha != -1 and pos_alpha < len(ft_alphanum_to_raw):
+                c_start_raw = ft_alphanum_to_raw[pos_alpha]
+                end_pos_alpha = min(len(ft_alphanum_to_raw) - 1, pos_alpha + len(c_alpha) - 1)
+                c_end_raw = ft_alphanum_to_raw[end_pos_alpha] + 1
+
+        if c_start_raw is not None and c_end_raw is not None:
+            matched_segs = [
+                s for s in seg_spans
+                if max(s["char_start"], c_start_raw) < min(s["char_end"], c_end_raw)
+            ]
+            if matched_segs:
+                chunk.segment_ids = [s["id"] for s in matched_segs if s["id"] is not None]
+                start_times = [s["start_time"] for s in matched_segs if s["start_time"] is not None]
+                end_times = [s["end_time"] for s in matched_segs if s["end_time"] is not None]
+                if start_times:
+                    chunk.start_time = min(start_times)
+                if end_times:
+                    chunk.end_time = max(end_times)
+
+    return chunks
+
+
 def content_aware_router(
-    text: str, diarized_segments: list[dict[str, Any]] | None = None
+    text: str,
+    diarized_segments: list[dict[str, Any]] | None = None,
+    segments: list[dict[str, Any]] | None = None,
 ) -> list[Chunk]:
     """Route text to appropriate chunking strategy based on length and diarization."""
     settings = get_settings()
@@ -279,9 +487,22 @@ def content_aware_router(
     def _stable_uuid(txt: str) -> str:
         return str(uuid.uuid5(uuid.NAMESPACE_OID, txt))
 
+    # Guard: if the entire cleaned transcript is pure boilerplate (e.g. a standalone
+    # publisher stamp file), skip it entirely.  The sweep loop in server.py already
+    # handles an empty return value with 'if chunks:'.
+    if is_pure_boilerplate(cleaned_text):
+        logger.debug("Skipping pure-boilerplate transcript (all content is publisher stamp)")
+        return []
+
     # 1. Short text -> single chunk
     if len(cleaned_text) < settings.chunk_short_threshold:
-        return [Chunk(content=cleaned_text, uuid=_stable_uuid(cleaned_text), tier=3)]
+        chunk = Chunk(content=cleaned_text, uuid=_stable_uuid(cleaned_text), tier=3)
+        if is_pure_boilerplate(chunk.content):
+            return []
+        chunks = [chunk]
+        if segments:
+            chunks = attribute_chunks_to_segments(chunks, text, segments)
+        return chunks
 
     chunker = AdvancedSemanticChunker(
         breakpoint_percentile=settings.chunk_breakpoint_percentile,
@@ -304,16 +525,21 @@ def content_aware_router(
         for block in blocks:
             # If a block is very short, don't semantic-chunk it further
             if len(block.text) < settings.chunk_short_threshold:
-                chunks.append(
-                    Chunk(
-                        content=block.text,
-                        uuid=_stable_uuid(block.text),
-                        tier=3,
-                        speaker=block.speaker,
-                    )
+                chunk = Chunk(
+                    content=block.text,
+                    uuid=_stable_uuid(block.text),
+                    tier=3,
+                    speaker=block.speaker,
                 )
+                if not is_pure_boilerplate(chunk.content):
+                    chunks.append(chunk)
             else:
-                chunks.extend(chunker.chunk(block.text, speaker=block.speaker))
+                chunks.extend(
+                    c for c in chunker.chunk(block.text, speaker=block.speaker)
+                    if not is_pure_boilerplate(c.content)
+                )
+        if segments and chunks:
+            chunks = attribute_chunks_to_segments(chunks, text, segments)
         return chunks
 
     # 3. Long text -> AdvancedSemanticChunker
@@ -321,7 +547,13 @@ def content_aware_router(
     if len(cleaned_text) >= settings.chunk_long_threshold:
         pass  # The chunker logic handles this
 
-    return chunker.chunk(cleaned_text)
+    chunks = [
+        c for c in chunker.chunk(cleaned_text)
+        if not is_pure_boilerplate(c.content)
+    ]
+    if segments and chunks:
+        chunks = attribute_chunks_to_segments(chunks, text, segments)
+    return chunks
 
 
 # ---------------------------------------------------------------------------

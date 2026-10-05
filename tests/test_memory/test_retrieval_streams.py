@@ -1,12 +1,13 @@
 """Tests for retrieval streams."""
 
 import pytest
+
 from audiobench.memory.query_reformulator import ReformulatedQuery
 from audiobench.memory.retrieval_streams import (
-    RetrievalStream,
-    FTS5Stream,
-    DenseStream,
     ColBERTStream,
+    DenseStream,
+    FTS5Stream,
+    RetrievalStream,
 )
 
 
@@ -24,17 +25,17 @@ def any_rq():
 def db_with_fts5(test_db):
     """Seed test_db with some segment data."""
     from audiobench.core.db_session import get_session
-    from audiobench.storage.models import AudioFileRecord, TranscriptionRecord, SegmentRecord
-    
+    from audiobench.storage.models import AudioFileRecord, SegmentRecord, TranscriptionRecord
+
     with get_session() as session:
         audio = AudioFileRecord(file_path="stream.mp3", file_name="stream.mp3", duration_seconds=100)
         session.add(audio)
         session.commit()
-        
+
         tx = TranscriptionRecord(audio_file_id=audio.id, file_name="stream.mp3", model_name="x", language="en")
         session.add(tx)
         session.commit()
-        
+
         # Add segments
         s1 = SegmentRecord(
             transcription_id=tx.id,
@@ -52,7 +53,7 @@ def db_with_fts5(test_db):
         )
         session.add_all([s1, s2])
         session.commit()
-        
+
         # We need to manually sync FTS5 in tests if triggers are not active, or just insert it
         # Actually our migrations have triggers that auto-update FTS5 on insert to segments!
         # Let's hope the trigger works in sqlite test.db.
@@ -75,6 +76,7 @@ def broken_db_connection(monkeypatch):
 @pytest.fixture
 def query_counter():
     from sqlalchemy import event
+
     from audiobench.core.db_engine import _engine
 
     class QueryCounter:

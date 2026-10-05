@@ -54,7 +54,7 @@ class EmbeddingEngine:
     All inference calls are serialised via an RLock (see module docstring).
     """
 
-    def embed_for_storage(self, text: str) -> "np.ndarray":
+    def embed_for_storage(self, text: str) -> np.ndarray:
         """Embed text intended for the storage layer.
 
         Args:
@@ -69,7 +69,7 @@ class EmbeddingEngine:
         with lock:
             return model.encode(prefixed_text)
 
-    def embed_for_query(self, text: str) -> "np.ndarray":
+    def embed_for_query(self, text: str) -> np.ndarray:
         """Embed text intended as a search query.
 
         Args:
@@ -88,7 +88,7 @@ class EmbeddingEngine:
         self,
         texts: list[str],
         batch_size: int = 64,
-    ) -> "list[list[float]]":
+    ) -> list[list[float]]:
         """Embed a batch of texts for storage in a single forward pass.
 
         Texts are truncated and sorted by length before encoding so that each

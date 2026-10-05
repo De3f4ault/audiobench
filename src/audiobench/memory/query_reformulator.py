@@ -5,7 +5,7 @@ import json
 from audiobench.chat.providers.ollama_provider import OllamaClient
 from audiobench.core.logger_factory import get_logger
 from audiobench.core.settings import get_settings
-from audiobench.memory.query_engine import Err, Ok, _call_llm
+from audiobench.memory.query_engine import Err, Ok, _call_llm, _call_llm_for_model
 from audiobench.memory.query_types import ReformulatedQuery
 
 # Re-export so callers can still do: from audiobench.memory.query_reformulator import ReformulatedQuery
@@ -17,8 +17,9 @@ logger = get_logger("memory.query_reformulator")
 class QueryReformulator:
     """Uses an LLM to expand a simple query into retrieval-optimized forms."""
 
-    def __init__(self) -> None:
+    def __init__(self, model: str | None = None) -> None:
         self.settings = get_settings()
+        self.model = model
         self.llm = OllamaClient(
             base_url=self.settings.ollama_base_url,
             model=self.settings.ollama_model,
@@ -39,7 +40,7 @@ class QueryReformulator:
             f"User Query: {query}\n"
         )
 
-        result = _call_llm(prompt, temperature=0.2, llm=self.llm, api_key=self.api_key)
+        result = _call_llm_for_model(prompt, temperature=0.2, model=self.model, llm=self.llm, api_key=self.api_key)
 
         match result:
             case Ok(value=text):
