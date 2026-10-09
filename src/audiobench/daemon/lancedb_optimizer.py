@@ -136,11 +136,20 @@ def _get_dir_size(path: Path) -> int:
     return total_size
 
 
-def _optimize_with_retry(table: Any, table_name: str, max_attempts: int = 3) -> None:
+def _optimize_with_retry(
+    table: Any,
+    table_name: str,
+    cleanup_older_than: datetime.timedelta = datetime.timedelta(hours=2),
+    delete_unverified: bool = False,
+    max_attempts: int = 3,
+) -> None:
     """Optimize a table with exponential backoff on retryable commit conflicts."""
     for attempt in range(1, max_attempts + 1):
         try:
-            table.optimize(cleanup_older_than=datetime.timedelta(days=7))
+            table.optimize(
+                cleanup_older_than=cleanup_older_than,
+                delete_unverified=delete_unverified,
+            )
             return
         except Exception as e:
             if "Retryable commit conflict" in str(e) and attempt < max_attempts:
@@ -155,9 +164,19 @@ def _optimize_with_retry(table: Any, table_name: str, max_attempts: int = 3) -> 
                 raise
 
 
-def _do_optimize_all_tables(triggered_by: str = "cli_command") -> dict[str, Any]:
+def _do_optimize_all_tables(
+    triggered_by: str = "cli_command",
+    retention_hours: float | None = None,
+    delete_unverified: bool = False,
+) -> dict[str, Any]:
     """
     Run LanceDB optimization on all tables in the database.
+    
+    Args:
+        triggered_by: Label for state tracking (e.g. 'cli_command', 'vacuum_cli', 'write_threshold').
+        retention_hours: Historical versions older than this are purged. Defaults to 2 hours
+            for routine sweeps to allow concurrent writes to settle, or 0.0 for aggressive vacuuming.
+        delete_unverified: If True, delete unverified files (orphaned fragments). Recommended for vacuum.
     
     Returns a dictionary suitable for DaemonResponse.data matching OptimizeResult.
     """
@@ -184,24 +203,26 @@ def _do_optimize_all_tables(triggered_by: str = "cli_command") -> dict[str, Any]
 
     bytes_before = _get_dir_size(lancedb_dir)
 
+    # Determine retention timedelta
+    if retention_hours is None:
+        cleanup_delta = datetime.timedelta(hours=2)
+    else:
+        cleanup_delta = datetime.timedelta(hours=retention_hours)
+
     for table_name in tables:
         try:
-            logger.info("Optimizing LanceDB table '%s'...", table_name)
+            logger.info(
+                "Optimizing LanceDB table '%s' (retention=%s, delete_unverified=%s)...",
+                table_name, cleanup_delta, delete_unverified,
+            )
             table = db.open_table(table_name)
 
-            # optimize runs compaction and version cleanup.
-            # IMPORTANT: cleanup_older_than must NOT be 0 — LanceDB's MVCC
-            # needs time to promote new writes to stable versions. Using hours=0
-            # (or delete_unverified=True) can vacuum freshly written rows before
-            # they are checkpointed, causing silent data loss on the next boot.
-            # 7 days matches the LanceDB default and is safe for this workload.
-            #
-            # NOTE: The 'expressions' table previously had a create_fts_index()
-            # call that caused a Rust panic in lance-index 7.0.0 during optimize.
-            # That FTS index has been permanently dropped (repair_expressions_table.py)
-            # and is no longer created (memory_store.py). Optimize is now safe on
-            # all tables.
-            _optimize_with_retry(table, table_name)
+            _optimize_with_retry(
+                table,
+                table_name,
+                cleanup_older_than=cleanup_delta,
+                delete_unverified=delete_unverified,
+            )
             optimized_tables.append(table_name)
         except Exception as e:
             logger.error("Failed to optimize table '%s': %s", table_name, e, exc_info=True)

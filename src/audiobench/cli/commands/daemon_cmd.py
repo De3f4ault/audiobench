@@ -2,11 +2,6 @@
 
 from __future__ import annotations
 
-import os
-import signal
-import time
-from pathlib import Path
-
 import click
 from rich.console import Console
 
@@ -31,9 +26,9 @@ def start_daemon() -> None:
 
     console.print("[dim]Starting supervised audiobench memory daemon...[/dim]")
     try:
+        from audiobench.events import get_bus
         from audiobench.observatory.db import init_journal_db
         from audiobench.observatory.subscriber import get_subscriber
-        from audiobench.events import get_bus
 
         init_journal_db()
         get_bus().on("*", get_subscriber().record)
@@ -70,22 +65,23 @@ def daemon_status() -> None:
         if not client.ping():
             console.print("[yellow]Daemon is not running or socket is unreachable.[/yellow]")
             try:
-                from audiobench.supervisor.registry import get_process
                 import psutil
+
+                from audiobench.supervisor.registry import get_process
                 p = get_process("daemon")
                 if p:
                     state = p["state"].lower()
                     if state == "fatal":
-                        console.print(f"[bold red]Supervisor reports daemon is in FATAL state (restarts exhausted).[/bold red]")
+                        console.print("[bold red]Supervisor reports daemon is in FATAL state (restarts exhausted).[/bold red]")
                     elif state == "backoff":
-                        console.print(f"[bold yellow]Supervisor reports daemon is in BACKOFF (restarting shortly).[/bold yellow]")
+                        console.print("[bold yellow]Supervisor reports daemon is in BACKOFF (restarting shortly).[/bold yellow]")
                     elif state == "stopped":
-                        console.print(f"[dim]Supervisor reports daemon is gracefully STOPPED.[/dim]")
+                        console.print("[dim]Supervisor reports daemon is gracefully STOPPED.[/dim]")
                     elif state == "running":
                         if p["pid"] and not psutil.pid_exists(p["pid"]):
                             console.print(f"[bold red]Supervisor reports RUNNING but PID {p['pid']} is dead (STALE state).[/bold red]")
                         else:
-                            console.print(f"[bold red]Supervisor reports RUNNING but socket ping failed.[/bold red]")
+                            console.print("[bold red]Supervisor reports RUNNING but socket ping failed.[/bold red]")
             except ImportError:
                 pass
             return
@@ -97,6 +93,25 @@ def daemon_status() -> None:
         console.print(f"[bold]Uptime:[/bold] {stats.get('uptime_seconds', 0)}s")
         console.print(f"[bold]Model:[/bold] {stats.get('embedding_model_version', 'unknown')}")
         console.print(f"[bold]Nodes Stored:[/bold] {stats.get('total_nodes', 0)}")
+        console.print(f"[bold]Queue Depth:[/bold] {stats.get('queue_depth', 0)}")
+
+        pb = stats.get("playback", {})
+        if pb and pb.get("playing"):
+            import os
+            st_icon = "[||] Paused" if pb.get("paused") else "[>] Playing"
+            f_name = os.path.basename(pb.get("file", "Audio"))
+            console.print(f"[bold]Playback:[/bold] {st_icon} · {f_name} ({pb.get('position', 0)}s / {pb.get('duration', 0)}s)")
+        else:
+            console.print("[bold]Playback:[/bold] [dim]Idle[/dim]")
+
+        sweep_failures = stats.get("sweep_consecutive_failures", 0)
+        if sweep_failures == 0:
+            console.print("[bold]Sweep Health:[/bold] [dim]OK (0 consecutive failures)[/dim]")
+        else:
+            console.print(
+                f"[bold]Sweep Health:[/bold] [bold red][!]  {sweep_failures} consecutive failure(s)[/bold red]"
+                f" — RAG indexing loop is degraded. Check logs for details."
+            )
     except Exception as e:
         console.print(f"[bold red]Failed to retrieve status:[/bold red] {e}")
 
@@ -163,98 +178,33 @@ def reindex_daemon() -> None:
         )
 
 
-@daemon_group.command(name="index")
-@click.option("--tx-id", type=int, default=None, help="Transcription ID to index. Omit for all unindexed.")
-def index_transcripts(tx_id: int | None) -> None:
-    """Register and embed unindexed transcripts into the semantic memory store.
-
-    Runs the consistency sweep in-process — works even if the daemon is busy
-    or not running. Use --tx-id to target a single transcript.
-    """
-    from audiobench.core.db_session import get_session
-    from audiobench.memory.chunking import content_aware_router
-    from audiobench.memory.enums import SourceType
-    from audiobench.memory.memory_store import MemoryStore
-    from audiobench.memory.singletons import pre_warm_retrieval_pipeline
-    from audiobench.storage.expression_repository import ExpressionRepository
-    from audiobench.storage.models import TranscriptionRecord
-
-    with get_session() as session:
-        if tx_id is not None:
-            records = session.query(TranscriptionRecord).filter_by(id=tx_id).all()
-            if not records:
-                console.print(f"[red]Transcription #{tx_id} not found.[/red]")
-                return
-        else:
-            records = (
-                session.query(TranscriptionRecord)
-                .filter(TranscriptionRecord.is_indexed == 0)
-                .all()
-            )
-
-        if not records:
-            console.print("[green]All transcripts are already indexed.[/green]")
-            return
-
-        console.print(f"[bold]Loading embedding model…[/bold]")
-        pre_warm_retrieval_pipeline()
-        store = MemoryStore()
-        expr_repo = ExpressionRepository()
-
-        console.print(f"[bold]Indexing {len(records)} transcript(s)…[/bold]")
-        from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Indexing", total=len(records))
-            success = 0
-            for rec in records:
-                try:
-                    text = rec.full_text or ""
-                    if not text.strip():
-                        rec.is_indexed = 1
-                        progress.advance(task)
-                        continue
-                    progress.update(task, description=f"[dim]{rec.file_name[:40]}[/dim]")
-                    chunks = content_aware_router(text)
-                    for chunk in chunks:
-                        expr = expr_repo.register(
-                            content=chunk.content,
-                            source_type=SourceType.AUDIO_TRANSCRIPT.value,
-                            source_id=rec.id,
-                            speaker=chunk.speaker,
-                        )
-                        store.write_node(
-                            expression_id=expr.id,
-                            content=expr.content,
-                            source_type=SourceType.AUDIO_TRANSCRIPT.value,
-                            speaker=chunk.speaker,
-                        )
-                    rec.is_indexed = 1
-                    success += 1
-                except Exception as e:
-                    logger.error("Failed to index transcript %d: %s", rec.id, e)
-                    console.print(f"  [red]✗ #{rec.id} {rec.file_name}: {e}[/red]")
-                finally:
-                    progress.advance(task)
-            session.commit()
-
-        console.print(f"[bold green]✓ Indexed {success}/{len(records)} transcript(s).[/bold green]")
-
-
 @daemon_group.command(name="optimize")
-def optimize_lancedb() -> None:
+@click.option(
+    "--vacuum",
+    is_flag=True,
+    help="Aggressively vacuum all historical versions down to the latest snapshot and delete orphaned fragments.",
+)
+@click.option(
+    "--retention-hours",
+    type=float,
+    default=None,
+    help="Historical versions older than this many hours will be purged (defaults to 2 hours, or 0 if --vacuum is set).",
+)
+def optimize_lancedb(vacuum: bool, retention_hours: float | None) -> None:
     """Optimize LanceDB tables: compact fragments and remove old versions.
 
     Sends the request to the running daemon if available (safe, coordinated).
     Falls back to in-process optimization if the daemon is not running.
     """
     client = DaemonClient()
-    
+
+    if vacuum:
+        effective_retention = 0.0 if retention_hours is None else retention_hours
+        delete_unverified = True
+    else:
+        effective_retention = retention_hours
+        delete_unverified = False
+
     def _format_bytes(size: int) -> str:
         for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
             if size < 1024.0:
@@ -265,27 +215,36 @@ def optimize_lancedb() -> None:
     def _print_result(result: dict) -> None:
         for table in result.get("tables_optimized", []):
             console.print(f"  [green]✓[/green] Optimized {table}")
-            
+
         bytes_freed = result.get("bytes_freed", 0)
         freed_str = f" | Freed {_format_bytes(bytes_freed)}" if bytes_freed > 0 else ""
-        
+
         cleared_writes = result.get("cleared_writes", 0)
         writes_str = f"Cleared {cleared_writes} fragmented writes" if cleared_writes > 0 else "No fragmented writes"
-        
+
         console.print(f"[bold green]✓ Optimization complete in {result.get('duration_seconds', 0.0):.2f}s ({writes_str}{freed_str}).[/bold green]")
 
     if client.ping():
-        console.print("Daemon is ONLINE — sending optimize request...")
+        mode_str = " (vacuum mode)" if vacuum else ""
+        console.print(f"Daemon is ONLINE — sending optimize request{mode_str}...")
         try:
-            result = client.optimize()
+            result = client.optimize(
+                retention_hours=effective_retention,
+                delete_unverified=delete_unverified,
+            )
             _print_result(result)
         except Exception as e:
             console.print(f"[bold red]Failed to optimize via daemon:[/bold red] {e}")
     else:
-        console.print("Daemon is OFFLINE — running in-process optimization...")
+        mode_str = " (vacuum mode)" if vacuum else ""
+        console.print(f"Daemon is OFFLINE — running in-process optimization{mode_str}...")
         try:
             from audiobench.daemon.lancedb_optimizer import _do_optimize_all_tables
-            result = _do_optimize_all_tables(triggered_by="cli_fallback")
+            result = _do_optimize_all_tables(
+                triggered_by="cli_fallback" if not vacuum else "cli_vacuum_fallback",
+                retention_hours=effective_retention,
+                delete_unverified=delete_unverified,
+            )
             _print_result(result)
         except Exception as e:
             console.print(f"[bold red]Failed to optimize:[/bold red] {e}")

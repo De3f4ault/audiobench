@@ -440,9 +440,18 @@ class DaemonClient:
             },
         )
 
-    def optimize(self) -> dict:
+    def optimize(
+        self,
+        retention_hours: float | None = None,
+        delete_unverified: bool = False,
+    ) -> dict:
         """Request LanceDB optimization from the daemon."""
-        return self._send("optimize", {})
+        payload: dict[str, Any] = {}
+        if retention_hours is not None:
+            payload["retention_hours"] = retention_hours
+        if delete_unverified:
+            payload["delete_unverified"] = True
+        return self._send("optimize", payload)
 
     # ------------------------------------------------------------------
     # Universal Playback interface
@@ -456,6 +465,8 @@ class DaemonClient:
         speed: float = 1.0,
         audio_file_id: int | None = None,
         transcription_id: int | None = None,
+        segments: list[dict[str, Any]] | None = None,
+        auto_resume: bool = False,
     ) -> dict[str, Any]:
         """Start playback or seek within the current file.
 
@@ -463,13 +474,17 @@ class DaemonClient:
         """
         args: dict[str, Any] = {
             "file_path": file_path,
-            "start_pos": start_pos,
-            "speed": speed,
+            "start_pos": float(start_pos or 0.0),
+            "speed": float(speed or 1.0),
         }
         if audio_file_id is not None:
             args["audio_file_id"] = audio_file_id
         if transcription_id is not None:
             args["transcription_id"] = transcription_id
+        if segments is not None:
+            args["segments"] = segments
+        if auto_resume:
+            args["auto_resume"] = True
         return self._send("playback_play", args)
 
     def playback_sync_session(
@@ -483,7 +498,7 @@ class DaemonClient:
         """Sync playback session metadata without spawning a daemon mpv process."""
         args: dict[str, Any] = {
             "file_path": file_path,
-            "position": position,
+            "position": float(position or 0.0),
         }
         if transcription_id is not None:
             args["transcription_id"] = transcription_id
@@ -493,11 +508,11 @@ class DaemonClient:
 
     def playback_seek(self, position: float) -> dict[str, Any]:
         """Seek to absolute position in seconds."""
-        return self._send("playback_seek", {"position": position})
+        return self._send("playback_seek", {"position": float(position or 0.0)})
 
     def playback_seek_relative(self, offset: float) -> dict[str, Any]:
         """Seek by relative offset in seconds."""
-        return self._send("playback_seek_relative", {"offset": offset})
+        return self._send("playback_seek_relative", {"offset": float(offset or 0.0)})
 
     def playback_pause(self) -> dict[str, Any]:
         """Pause playback."""
@@ -513,7 +528,7 @@ class DaemonClient:
 
     def playback_speed(self, speed: float) -> dict[str, Any]:
         """Set playback speed."""
-        return self._send("playback_speed", {"speed": speed})
+        return self._send("playback_speed", {"speed": float(speed or 1.0)})
 
     def playback_stop(self) -> dict[str, Any]:
         """Stop playback and tear down mpv."""
@@ -531,3 +546,20 @@ class DaemonClient:
         if position is not None:
             args["position"] = position
         return self._send("playback_context", args)
+
+    def whisper_acquire(self, session_id: str, model: str = "base") -> dict[str, Any]:
+        """Register a session requiring the Whisper model to keep it warm."""
+        return self._send("whisper_acquire", {"session_id": session_id, "model": model})
+
+    def whisper_release(self, session_id: str) -> dict[str, Any]:
+        """Unregister a session requiring Whisper, releasing the model if no sessions remain."""
+        return self._send("whisper_release", {"session_id": session_id})
+
+    def whisper_transcribe(
+        self, file_path: str, model: str = "base", language: str = "en"
+    ) -> dict[str, Any]:
+        """Transcribe an audio file using the warm Whisper model hosted in the daemon."""
+        return self._send(
+            "whisper_transcribe",
+            {"file_path": file_path, "model": model, "language": language},
+        )

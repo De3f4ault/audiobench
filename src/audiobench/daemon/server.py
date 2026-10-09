@@ -533,7 +533,14 @@ def _handle_optimize(args: dict[str, Any]) -> dict[str, Any]:
         _optimize_in_progress = True
 
     try:
-        result = _do_optimize_all_tables(triggered_by="cli_command")
+        retention_hours = args.get("retention_hours")
+        delete_unverified = bool(args.get("delete_unverified", False))
+        triggered_by = "cli_vacuum" if (retention_hours == 0 or delete_unverified) else "cli_command"
+        result = _do_optimize_all_tables(
+            triggered_by=triggered_by,
+            retention_hours=retention_hours,
+            delete_unverified=delete_unverified,
+        )
         return result
     finally:
         with _optimize_lock:
@@ -553,21 +560,25 @@ _playback_service: PlaybackService | None = None
 def _get_playback_service() -> PlaybackService:
     global _playback_service
     if _playback_service is None:
-        from audiobench.playback.service import PlaybackService
+        from audiobench.playback.service import get_playback_service
 
-        _playback_service = PlaybackService()
+        _playback_service = get_playback_service()
     return _playback_service
 
 
 def _handle_playback_play(args: dict[str, Any]) -> dict[str, Any]:
     svc = _get_playback_service()
-    return svc.play(
-        args["file_path"],
-        start_pos=float(args.get("start_pos", 0.0)),
-        speed=float(args.get("speed", 1.0)),
-        audio_file_id=args.get("audio_file_id"),
-        transcription_id=args.get("transcription_id"),
-    )
+    kwargs: dict[str, Any] = {
+        "start_pos": float(args.get("start_pos") or 0.0),
+        "speed": float(args.get("speed") or 1.0),
+        "audio_file_id": args.get("audio_file_id"),
+        "transcription_id": args.get("transcription_id"),
+    }
+    if args.get("segments") is not None:
+        kwargs["segments"] = args["segments"]
+    if args.get("auto_resume"):
+        kwargs["auto_resume"] = bool(args["auto_resume"])
+    return svc.play(args["file_path"], **kwargs)
 
 
 def _handle_playback_sync_session(args: dict[str, Any]) -> dict[str, Any]:
@@ -575,19 +586,19 @@ def _handle_playback_sync_session(args: dict[str, Any]) -> dict[str, Any]:
     return svc.sync_session(
         args["file_path"],
         transcription_id=args.get("transcription_id"),
-        position=float(args.get("position", 0.0)),
+        position=float(args.get("position") or 0.0),
         audio_file_id=args.get("audio_file_id"),
     )
 
 
 def _handle_playback_seek(args: dict[str, Any]) -> dict[str, Any]:
     svc = _get_playback_service()
-    return svc.seek(float(args["position"]))
+    return svc.seek(float(args.get("position") or 0.0))
 
 
 def _handle_playback_seek_relative(args: dict[str, Any]) -> dict[str, Any]:
     svc = _get_playback_service()
-    return svc.seek_relative(float(args.get("offset", 0.0)))
+    return svc.seek_relative(float(args.get("offset") or 0.0))
 
 
 def _handle_playback_pause(args: dict[str, Any]) -> dict[str, Any]:
@@ -607,7 +618,7 @@ def _handle_playback_toggle(args: dict[str, Any]) -> dict[str, Any]:
 
 def _handle_playback_speed(args: dict[str, Any]) -> dict[str, Any]:
     svc = _get_playback_service()
-    return svc.set_speed(float(args["speed"]))
+    return svc.set_speed(float(args.get("speed") or 1.0))
 
 
 def _handle_playback_stop(args: dict[str, Any]) -> dict[str, Any]:
@@ -620,6 +631,7 @@ def _handle_playback_status(args: dict[str, Any]) -> dict[str, Any]:
         return {
             "playing": False,
             "paused": False,
+            "state": "stopped",
             "position": 0.0,
             "duration": 0.0,
             "speed": 1.0,
@@ -635,6 +647,94 @@ def _handle_playback_context(args: dict[str, Any]) -> dict[str, Any]:
     pos = float(args["position"]) if "position" in args and args["position"] is not None else None
     window = int(args.get("window", 3))
     return svc.get_context_window(position=pos, window=window)
+
+
+_stt_sessions: dict[str, str] = {}  # session_id -> model_name
+_warm_whisper_model: Any | None = None
+_warm_whisper_key: str | None = None
+_stt_lock = threading.Lock()
+
+
+def _ensure_whisper_loaded(model_name: str = "base") -> Any:
+    global _warm_whisper_model, _warm_whisper_key
+    with _stt_lock:
+        key = f"{model_name}:cpu:int8"
+        if _warm_whisper_model is not None and _warm_whisper_key == key:
+            return _warm_whisper_model
+
+        from faster_whisper import WhisperModel
+
+        logger.info("Pre-warming Whisper model in daemon: %s", key)
+        _warm_whisper_model = WhisperModel(model_name, device="cpu", compute_type="int8")
+        _warm_whisper_key = key
+        return _warm_whisper_model
+
+
+def _handle_whisper_acquire(args: dict[str, Any]) -> dict[str, Any]:
+    session_id = str(args.get("session_id", ""))
+    model_name = str(args.get("model") or "base")
+    if not session_id:
+        return {"ok": False, "error": "session_id required"}
+
+    with _stt_lock:
+        _stt_sessions[session_id] = model_name
+
+    logger.info(
+        "Whisper session acquired: %s (total active: %d)",
+        session_id,
+        len(_stt_sessions),
+    )
+    try:
+        _ensure_whisper_loaded(model_name)
+        return {"ok": True, "active_sessions": len(_stt_sessions), "model": model_name}
+    except Exception as exc:
+        logger.warning("Failed to preload Whisper model in daemon: %s", exc)
+        return {"ok": False, "error": str(exc)}
+
+
+def _handle_whisper_release(args: dict[str, Any]) -> dict[str, Any]:
+    global _warm_whisper_model, _warm_whisper_key
+    session_id = str(args.get("session_id", ""))
+    if not session_id:
+        return {"ok": False, "error": "session_id required"}
+
+    with _stt_lock:
+        _stt_sessions.pop(session_id, None)
+        active_count = len(_stt_sessions)
+        if active_count == 0 and _warm_whisper_model is not None:
+            logger.info("All Whisper sessions closed; unloading warm model from daemon RAM")
+            _warm_whisper_model = None
+            _warm_whisper_key = None
+            import gc
+
+            gc.collect()
+
+    logger.info(
+        "Whisper session released: %s (remaining active: %d)",
+        session_id,
+        active_count,
+    )
+    return {"ok": True, "active_sessions": active_count}
+
+
+def _handle_whisper_transcribe(args: dict[str, Any]) -> dict[str, Any]:
+    file_path = str(args.get("file_path", ""))
+    model_name = str(args.get("model") or "base")
+    language = str(args.get("language") or "en")
+
+    if not file_path or not os.path.exists(file_path):
+        return {"ok": False, "error": f"Audio file not found: {file_path}"}
+
+    try:
+        model = _ensure_whisper_loaded(model_name)
+        segments, info = model.transcribe(file_path, language=language)
+        text = " ".join(s.text.strip() for s in segments).strip()
+        detected_lang = getattr(info, "language", language)
+        return {"ok": True, "text": text, "language": detected_lang}
+    except Exception as exc:
+        logger.error("Daemon Whisper transcription failed: %s", exc)
+        return {"ok": False, "error": str(exc)}
+
 
 
 _HANDLERS: dict[str, Any] = {
@@ -674,6 +774,9 @@ _HANDLERS: dict[str, Any] = {
     "playback_stop": _handle_playback_stop,
     "playback_status": _handle_playback_status,
     "playback_context": _handle_playback_context,
+    "whisper_acquire": _handle_whisper_acquire,
+    "whisper_release": _handle_whisper_release,
+    "whisper_transcribe": _handle_whisper_transcribe,
 }
 
 
@@ -889,14 +992,49 @@ def _do_sweep_once() -> None:
             tx_placeholders = ", ".join(f":id{i}" for i in range(len(tx_ids)))
             rows = session.execute(
                 sql_text(
-                    f"SELECT t.id, t.full_text, t.audio_file_id, t.language_probability, t.language, af.work_id "
+                    f"SELECT t.id, t.full_text, t.audio_file_id, t.language_probability, t.language, af.work_id, w.author "
                     f"FROM transcriptions t "
                     f"LEFT JOIN audio_files af ON t.audio_file_id = af.id "
+                    f"LEFT JOIN works w ON af.work_id = w.id "
                     f"WHERE t.id IN ({tx_placeholders})"
                 ),
                 tx_named,
             ).mappings().all()
             tx_data = list(rows)
+
+            # Eager load segments for mapping
+            seg_rows = session.execute(
+                sql_text(
+                    f"SELECT id, transcription_id, segment_index, text, start_time, end_time, speaker "
+                    f"FROM segments "
+                    f"WHERE transcription_id IN ({tx_placeholders}) "
+                    f"ORDER BY transcription_id, segment_index"
+                ),
+                tx_named,
+            ).mappings().all()
+
+            from collections import defaultdict
+            tx_segments_map: dict[int, list[dict[str, Any]]] = defaultdict(list)
+            for s in seg_rows:
+                tx_segments_map[s["transcription_id"]].append(dict(s))
+
+            # Eager load chapters for audio_files
+            af_ids = list({tx["audio_file_id"] for tx in tx_data if tx["audio_file_id"] is not None})
+            af_chapters_map: dict[int, list[dict[str, Any]]] = defaultdict(list)
+            if af_ids:
+                af_named = {f"af{i}": afid for i, afid in enumerate(af_ids)}
+                af_placeholders = ", ".join(f":af{i}" for i in range(len(af_ids)))
+                chap_rows = session.execute(
+                    sql_text(
+                        f"SELECT id, audio_file_id, title, start_time, end_time "
+                        f"FROM chapters "
+                        f"WHERE audio_file_id IN ({af_placeholders}) "
+                        f"ORDER BY audio_file_id, start_time"
+                    ),
+                    af_named,
+                ).mappings().all()
+                for ch in chap_rows:
+                    af_chapters_map[ch["audio_file_id"]].append(dict(ch))
 
         for tx in tx_data:
             try:
@@ -911,13 +1049,16 @@ def _do_sweep_once() -> None:
                 tx_repo = TranscriptionRepository()
                 tx_privacy_tier = tx_repo.get_max_privacy_tier_for_transcriptions([tx["id"]])
 
-                chunks = content_aware_router(text)
+                tx_segs = tx_segments_map.get(tx["id"], [])
+                chunks = content_aware_router(text, segments=tx_segs)
                 if chunks:
                     from audiobench.memory.chunking import _clean_text, parent_child_grouper
                     from audiobench.memory.enums import RelationType
 
                     parent_groups = parent_child_grouper(chunks)
                     nodes = []
+                    all_esm_links: list[tuple[int, int]] = []
+                    tx_chapters = af_chapters_map.get(tx["audio_file_id"], [])
 
                     # Tier 1: full-text document node (not embedded in LanceDB)
                     cleaned_text = _clean_text(text)
@@ -944,6 +1085,27 @@ def _do_sweep_once() -> None:
 
                         # Tier 3: embedded leaf node (written to LanceDB)
                         for child in pg.children:
+                            matched_chap_id: int | None = None
+                            matched_chap_title: str | None = None
+                            if tx_chapters:
+                                if len(tx_chapters) == 1:
+                                    matched_chap_id = tx_chapters[0]["id"]
+                                    matched_chap_title = tx_chapters[0]["title"]
+                                elif child.start_time is not None and child.end_time is not None:
+                                    c_mid = (child.start_time + child.end_time) / 2.0
+                                    for ch in tx_chapters:
+                                        if ch["start_time"] <= c_mid < ch["end_time"]:
+                                            matched_chap_id = ch["id"]
+                                            matched_chap_title = ch["title"]
+                                            break
+                                    if matched_chap_id is None and tx_chapters:
+                                        if c_mid >= tx_chapters[-1]["start_time"]:
+                                            matched_chap_id = tx_chapters[-1]["id"]
+                                            matched_chap_title = tx_chapters[-1]["title"]
+                                        elif c_mid <= tx_chapters[0]["end_time"]:
+                                            matched_chap_id = tx_chapters[0]["id"]
+                                            matched_chap_title = tx_chapters[0]["title"]
+
                             t3_expr = expr_repo.register(
                                 content=child.content,
                                 source_type=SourceType.AUDIO_TRANSCRIPT.value,
@@ -952,8 +1114,12 @@ def _do_sweep_once() -> None:
                                 work_id=tx["work_id"],
                                 graph_role="sweep_chunk",
                                 privacy_tier=tx_privacy_tier,
+                                chapter_id=matched_chap_id,
                             )
                             expr_repo.link(t3_expr.id, t2_expr.id, RelationType.SOURCE.value)
+
+                            for seg_id in child.segment_ids:
+                                all_esm_links.append((t3_expr.id, seg_id))
 
                             nodes.append({
                                 "expression_id": t3_expr.id,
@@ -964,7 +1130,13 @@ def _do_sweep_once() -> None:
                                 "confidence": tx["language_probability"],
                                 "original_language": tx["language"],
                                 "work_id": t3_expr.work_id,
+                                "chapter_id": matched_chap_id,
+                                "chapter_title": matched_chap_title,
+                                "author": tx.get("author"),
                             })
+
+                    if all_esm_links:
+                        expr_repo.link_segments_batch(all_esm_links)
 
 
 
@@ -991,6 +1163,11 @@ def _do_sweep_once() -> None:
                         from audiobench.daemon.lancedb_optimizer import increment_unoptimized_writes
                         increment_unoptimized_writes(len(unique_nodes))
                         _maybe_trigger_threshold_optimize()
+
+                        # Enqueue newly indexed chunk IDs for asynchronous cross-work linking
+                        from audiobench.memory.graph_linker import enqueue_for_linking
+                        new_eids = [n["expression_id"] for n in unique_nodes]
+                        enqueue_for_linking(new_eids)
 
                 success_ids.append(tx["id"])
             except Exception as e:
@@ -1523,11 +1700,15 @@ async def _serve(socket_path: Path, pid_path: Path) -> None:
     from audiobench.daemon.intelligence.pattern_detector import PatternDetector
     from audiobench.daemon.intelligence.proposal_generator import ProposalGenerator
     from audiobench.daemon.intelligence.search_session_sweep import SearchSessionSweep
+    from audiobench.daemon.intelligence.chapter_embedder import ChapterEmbedder
+    from audiobench.daemon.intelligence.work_linker import WorkLinker
 
     # Load dynamic operators
     get_operator_registry().load_from_db(_get_store() if _memory_store else None)
 
     scheduler = IntelligenceScheduler()
+    scheduler.register(WorkLinker())         # populate works table first
+    scheduler.register(ChapterEmbedder(_get_store() if _memory_store else None))     # Tier 2 chapter passage embedder
     scheduler.register(PatternDetector())
     scheduler.register(DriftDetector())
     scheduler.register(ConnectionSurfer())
@@ -1535,6 +1716,9 @@ async def _serve(socket_path: Path, pid_path: Path) -> None:
     scheduler.register(ProposalGenerator())
     scheduler.register(SearchSessionSweep())   # search knowledge layer
     asyncio.create_task(scheduler.run_loop())
+
+    from audiobench.memory.graph_linker import drain_pending_links_loop
+    asyncio.create_task(drain_pending_links_loop(poll_interval=2.0))
 
 
     _start_time = time.time()
@@ -1581,6 +1765,16 @@ async def _serve(socket_path: Path, pid_path: Path) -> None:
         await stop_event.wait()
         server.close()
         await server.wait_closed()
+
+    # Save shared HNSW index snapshot on shutdown
+    try:
+        from audiobench.daemon.index import get_shared_hnsw_index
+        idx = get_shared_hnsw_index()
+        if idx.is_ready():
+            logger.info("Saving shared InCoreHNSWIndex snapshot on shutdown...")
+            idx.save()
+    except Exception as exc:
+        logger.warning("Could not save InCoreHNSWIndex on shutdown: %s", exc)
 
     _cleanup(socket_path, pid_path)
 
