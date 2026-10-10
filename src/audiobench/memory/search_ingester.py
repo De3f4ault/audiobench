@@ -107,16 +107,17 @@ class SearchIngester:
         query_text   = row["query_text"] or ""
         synthesis    = row["synthesis_text"]  # may be None
 
-        # ── Fetch retrieved fragment segment_ids ───────────────────────
+        # ── Fetch retrieved fragment metadata ──────────────────────────
         with get_session() as session:
-            frag_rows = session.execute(
+            frag_records = session.execute(
                 sql_text(
-                    "SELECT segment_id FROM search_query_fragments "
+                    "SELECT segment_id, source_file, start_time, fragment_text "
+                    "FROM search_query_fragments "
                     "WHERE query_id = :qid ORDER BY rank"
                 ),
                 {"qid": query_id},
-            ).scalars().all()
-        segment_ids: list[int] = list(frag_rows)
+            ).mappings().all()
+        segment_ids: list[int] = [int(r["segment_id"]) for r in frag_records]
         privacy_tier = self._tx_repo.get_max_privacy_tier_for_segments(segment_ids)
 
         # ── 1. Create SEARCH_QUERY expression ─────────────────────────
@@ -158,8 +159,13 @@ class SearchIngester:
             )
 
             # ── 4. THEMATIC: synthesis → retrieved fragment expressions ─
-            for seg_id in segment_ids:
-                frag_expr_id = self._resolve_fragment_expression_id(seg_id)
+            for frag in frag_records:
+                frag_expr_id, _ = self.resolve_fragment_expression(
+                    segment_id=int(frag["segment_id"]),
+                    source_file=frag.get("source_file"),
+                    start_time=frag.get("start_time"),
+                    fragment_text=frag.get("fragment_text"),
+                )
                 if frag_expr_id is not None:
                     self._expr_repo.link(
                         from_id=synth_expr.id,
@@ -284,42 +290,30 @@ class SearchIngester:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _resolve_fragment_expression_id(
+    def resolve_fragment_expression(
         self,
         segment_id: int,
+        source_file: str | None = None,
+        start_time: float | None = None,
+        fragment_text: str | None = None,
         deferred_tx_ids: set[int] | None = None,
-    ) -> int | None:
+        tx_cache: dict[str, int | None] | None = None,
+    ) -> tuple[int | None, int | None]:
         """
-        Resolve a ``segment_id`` from ``search_query_fragments`` to the
-        corresponding expression in the expression graph.
+        Map a fragment citation to an expression_id, with multi-tier fallback
+        if the transcription was upgraded or segment_id was purged.
 
-        Why this is non-trivial
-        -----------------------
-        The RAG sweep creates ``sweep_chunk`` expressions with:
-          - source_type = 'audio_transcript'
-          - source_id   = transcription.id      ← NOT segment.id
-          - graph_role  = 'sweep_chunk'
+        Tier 1: Fast ID Lookup (O(1)) via segments table.
+        Tier 2: Resilient Active-Transcription Text Probe in expressions table.
+        Tier 3: Acoustic Alignment via Timeline Proximity + expression_segment_map.
+        Tier 4: Document Fallback (sweep_document).
 
-        There is no column joining segment_id to any expression.  Instead we
-        use content proximity:
-
-          Step 1: segment_id → (transcription_id, text) from the segments table.
-          Step 2: Find the sweep_chunk expression where
-                  source_id = transcription_id  AND
-                  content LIKE '%{first_40_chars_of_segment_text}%'
-
-        The 40-character prefix is enough to be distinctive while short enough
-        to survive minor cleaning differences between WhisperX output and the
-        content-aware chunker's cleaned text.
-
-        Falls back to the sweep_document (tier-1 full-transcript) expression
-        if no chunk matches — a less precise but always-valid anchor.
-
-        Returns None only if the transcription has never been swept at all.
+        Returns:
+            tuple[int | None, int | None]: (expression_id, current_segment_id)
         """
         from sqlalchemy import text as sql_text
 
-        # ── Step 1: resolve segment → transcription_id + raw text ─────
+        # ── Tier 1: Fast ID Lookup (O(1)) ─────────────────────────────
         with get_session() as session:
             seg_row = session.execute(
                 sql_text(
@@ -329,23 +323,143 @@ class SearchIngester:
                 {"sid": segment_id},
             ).fetchone()
 
-        if seg_row is None:
+        if seg_row is not None:
+            transcription_id: int = seg_row[0]
+            if deferred_tx_ids is not None and transcription_id in deferred_tx_ids:
+                return None, segment_id
+            seg_text: str = (seg_row[1] or "").strip()
+            expr_id = self._match_chunk_or_doc(transcription_id, seg_text, deferred_tx_ids)
+            return expr_id, segment_id
+
+        # ── Tier 2 & 3: Resilient Fallback (Content Changed / Upgraded) ─
+        if not source_file:
             logger.debug(
-                "SearchIngester: segment_id=%d not found in segments table",
+                "SearchIngester: segment_id=%d not found in segments table and no source_file provided",
                 segment_id,
             )
-            return None
+            return None, None
 
-        transcription_id: int = seg_row[0]
-        if deferred_tx_ids is not None and transcription_id in deferred_tx_ids:
-            # Short-circuit: already known to be unswept in this cycle
-            return None
+        # Resolve active complete transcription for source_file (with optional caller cache)
+        active_tx_id: int | None = None
+        if tx_cache is not None and source_file in tx_cache:
+            active_tx_id = tx_cache[source_file]
+        else:
+            with get_session() as session:
+                tx_row = session.execute(
+                    sql_text(
+                        "SELECT t.id FROM transcriptions t "
+                        "JOIN audio_files a ON t.audio_file_id = a.id "
+                        "WHERE a.file_path = :path AND t.status = 'complete' "
+                        "ORDER BY t.id DESC LIMIT 1"
+                    ),
+                    {"path": source_file},
+                ).fetchone()
+            active_tx_id = int(tx_row[0]) if tx_row is not None else None
+            if tx_cache is not None:
+                tx_cache[source_file] = active_tx_id
 
-        seg_text: str = (seg_row[1] or "").strip()
+        if active_tx_id is None:
+            logger.debug(
+                "SearchIngester: segment_id=%d source_file=%s has no active complete transcription",
+                segment_id, source_file,
+            )
+            return None, None
 
-        # ── Step 2a: match sweep_chunk by content substring ────────────
-        # Use first 40 chars of the segment's raw WhisperX text as a LIKE
-        # probe against the chunker-assembled sweep_chunk content.
+        if deferred_tx_ids is not None and active_tx_id in deferred_tx_ids:
+            return None, None
+
+        # Step B: Tier 2 — Match by text prefix probe in active transcription
+        probe = (fragment_text or "").strip()[:40].replace("%", "%%").replace("_", "\\_")
+        if probe:
+            with get_session() as session:
+                chunk_row = session.execute(
+                    sql_text(
+                        "SELECT id FROM expressions "
+                        "WHERE source_id    = :tx_id "
+                        "  AND graph_role   = 'sweep_chunk' "
+                        "  AND content LIKE :probe ESCAPE '\\' "
+                        "LIMIT 1"
+                    ),
+                    {"tx_id": active_tx_id, "probe": f"%{probe}%"},
+                ).fetchone()
+
+            if chunk_row is not None:
+                logger.debug(
+                    "SearchIngester: segment_id=%d → active tx=%d sweep_chunk expr #%d (via text match)",
+                    segment_id, active_tx_id, chunk_row[0],
+                )
+                new_seg_id = None
+                if start_time is not None:
+                    with get_session() as session:
+                        time_row = session.execute(
+                            sql_text(
+                                "SELECT id FROM segments "
+                                "WHERE transcription_id = :tx_id "
+                                "  AND start_time BETWEEN :t1 AND :t2 "
+                                "ORDER BY ABS(start_time - :st) ASC LIMIT 1"
+                            ),
+                            {"tx_id": active_tx_id, "t1": start_time - 3.0, "t2": start_time + 3.0, "st": start_time},
+                        ).fetchone()
+                    if time_row is not None:
+                        new_seg_id = int(time_row[0])
+                return int(chunk_row[0]), new_seg_id
+
+        # Step C: Tier 3 — Acoustic Alignment via Timeline + Junction Table
+        if start_time is not None:
+            with get_session() as session:
+                time_match = session.execute(
+                    sql_text(
+                        "SELECT s.id, esm.expression_id "
+                        "FROM segments s "
+                        "JOIN expression_segment_map esm ON esm.segment_id = s.id "
+                        "WHERE s.transcription_id = :tx_id "
+                        "  AND s.start_time BETWEEN :t1 AND :t2 "
+                        "ORDER BY ABS(s.start_time - :st) ASC LIMIT 1"
+                    ),
+                    {"tx_id": active_tx_id, "t1": start_time - 3.0, "t2": start_time + 3.0, "st": start_time},
+                ).fetchone()
+
+            if time_match is not None:
+                new_seg_id, expr_id = int(time_match[0]), int(time_match[1])
+                logger.debug(
+                    "SearchIngester: segment_id=%d → active tx=%d expr #%d (via acoustic timeline alignment %.2fs)",
+                    segment_id, active_tx_id, expr_id, start_time,
+                )
+                return expr_id, new_seg_id
+
+        # Step D: Tier 4 — Document fallback
+        with get_session() as session:
+            doc_row = session.execute(
+                sql_text(
+                    "SELECT id FROM expressions "
+                    "WHERE source_id  = :tx_id "
+                    "  AND graph_role = 'sweep_document' "
+                    "LIMIT 1"
+                ),
+                {"tx_id": active_tx_id},
+            ).fetchone()
+
+        if doc_row is not None:
+            logger.debug(
+                "SearchIngester: segment_id=%d → active tx=%d sweep_document expr #%d (fallback)",
+                segment_id, active_tx_id, doc_row[0],
+            )
+            return int(doc_row[0]), None
+
+        # Transcription has never been swept — defer
+        if deferred_tx_ids is not None:
+            deferred_tx_ids.add(active_tx_id)
+        return None, None
+
+    def _match_chunk_or_doc(
+        self,
+        transcription_id: int,
+        seg_text: str,
+        deferred_tx_ids: set[int] | None = None,
+    ) -> int | None:
+        """Helper to match sweep_chunk by content probe or fall back to sweep_document."""
+        from sqlalchemy import text as sql_text
+
         if seg_text:
             probe = seg_text[:40].replace("%", "%%").replace("_", "\\_")
             with get_session() as session:
@@ -361,14 +475,8 @@ class SearchIngester:
                 ).fetchone()
 
             if chunk_row is not None:
-                logger.debug(
-                    "SearchIngester: segment_id=%d → sweep_chunk expr #%d "
-                    "(via content match, tx=%d)",
-                    segment_id, chunk_row[0], transcription_id,
-                )
                 return int(chunk_row[0])
 
-        # ── Step 2b: fall back to sweep_document (tier-1) ─────────────
         with get_session() as session:
             doc_row = session.execute(
                 sql_text(
@@ -381,29 +489,25 @@ class SearchIngester:
             ).fetchone()
 
         if doc_row is not None:
-            logger.debug(
-                "SearchIngester: segment_id=%d → sweep_document expr #%d "
-                "(chunk match failed, tx=%d)",
-                segment_id, doc_row[0], transcription_id,
-            )
             return int(doc_row[0])
 
-        # Transcription has never been swept — defer
         if deferred_tx_ids is not None:
-            if transcription_id not in deferred_tx_ids:
-                logger.debug(
-                    "SearchIngester: segment_id=%d transcription_id=%d has no "
-                    "expression yet (not swept) — THEMATIC link deferred",
-                    segment_id, transcription_id,
-                )
-                deferred_tx_ids.add(transcription_id)
-        else:
-            logger.debug(
-                "SearchIngester: segment_id=%d transcription_id=%d has no "
-                "expression yet (not swept) — THEMATIC link deferred",
-                segment_id, transcription_id,
-            )
+            deferred_tx_ids.add(transcription_id)
         return None
+
+    def _resolve_fragment_expression_id(
+        self,
+        segment_id: int,
+        deferred_tx_ids: set[int] | None = None,
+    ) -> int | None:
+        """
+        Backwards-compatible wrapper delegating to resolve_fragment_expression.
+        """
+        expr_id, _ = self.resolve_fragment_expression(
+            segment_id=segment_id,
+            deferred_tx_ids=deferred_tx_ids,
+        )
+        return expr_id
 
     def _resolve_prior_query_expression(
         self, session_id: int, sequence_num: int

@@ -116,24 +116,34 @@ class SearchSessionSweep(IntelligenceTask):
         repaired = 0
         deferred = 0
         deferred_tx_ids: set[int] = set()
+        tx_cache: dict[str, int | None] = {}
 
         for row in rows:
             synth_id = int(row["synth_id"])
             query_id = int(row["query_id"])
 
-            # Load the fragment segment_ids for this query
+            # Load the full fragment context for resilient healing
             with get_session() as session:
-                seg_ids = session.execute(
+                frag_rows = session.execute(
                     sql_text(
-                        "SELECT segment_id FROM search_query_fragments "
+                        "SELECT segment_id, source_file, start_time, fragment_text "
+                        "FROM search_query_fragments "
                         "WHERE query_id = :qid ORDER BY rank"
                     ),
                     {"qid": query_id},
-                ).scalars().all()
+                ).mappings().all()
 
-            for seg_id in seg_ids:
-                frag_expr_id = ingester._resolve_fragment_expression_id(
-                    int(seg_id), deferred_tx_ids=deferred_tx_ids
+            linked_for_synth = 0
+
+            for frag in frag_rows:
+                old_seg_id = int(frag["segment_id"])
+                frag_expr_id, healed_seg_id = ingester.resolve_fragment_expression(
+                    segment_id=old_seg_id,
+                    source_file=frag.get("source_file"),
+                    start_time=frag.get("start_time"),
+                    fragment_text=frag.get("fragment_text"),
+                    deferred_tx_ids=deferred_tx_ids,
+                    tx_cache=tx_cache,
                 )
                 if frag_expr_id is not None:
                     try:
@@ -143,6 +153,23 @@ class SearchSessionSweep(IntelligenceTask):
                             relation_type=RelationType.THEMATIC.value,
                         )
                         repaired += 1
+                        linked_for_synth += 1
+
+                        # Self-heal search_query_fragments with the new segment_id
+                        if healed_seg_id and healed_seg_id != old_seg_id:
+                            try:
+                                with get_session() as s:
+                                    s.execute(
+                                        sql_text(
+                                            "UPDATE OR IGNORE search_query_fragments "
+                                            "SET segment_id = :nid "
+                                            "WHERE query_id = :qid AND segment_id = :oid"
+                                        ),
+                                        {"nid": healed_seg_id, "qid": query_id, "oid": old_seg_id},
+                                    )
+                                    s.commit()
+                            except Exception as update_err:
+                                logger.debug("Failed to update healed fragment: %s", update_err)
                     except Exception as exc:
                         logger.debug(
                             "SearchSessionSweep: THEMATIC link %d→%d failed: %s",
@@ -150,6 +177,43 @@ class SearchSessionSweep(IntelligenceTask):
                         )
                 else:
                     deferred += 1
+
+            # If all fragments could not be linked and none are deferred waiting for RAG sweep:
+            # Anchor synthesis to its parent query expression so it does not loop infinitely.
+            query_deferred = False
+            for frag in frag_rows:
+                path = frag.get("source_file")
+                if path and tx_cache.get(path) in deferred_tx_ids:
+                    query_deferred = True
+                    break
+
+            if linked_for_synth == 0 and not query_deferred:
+                with get_session() as session:
+                    query_expr = session.execute(
+                        sql_text(
+                            "SELECT id FROM expressions "
+                            "WHERE source_type = 'search_query' AND source_id = :qid "
+                            "LIMIT 1"
+                        ),
+                        {"qid": query_id},
+                    ).fetchone()
+                if query_expr is not None:
+                    try:
+                        expr_repo.link(
+                            from_id=synth_id,
+                            to_id=int(query_expr[0]),
+                            relation_type=RelationType.THEMATIC.value,
+                        )
+                        logger.info(
+                            "SearchSessionSweep: synthesis #%d orphaned (all sources extinct); "
+                            "anchored THEMATIC link to query expr #%d",
+                            synth_id, query_expr[0],
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "SearchSessionSweep: fallback anchor link %d→%d failed: %s",
+                            synth_id, query_expr[0], exc,
+                        )
 
         if deferred_tx_ids:
             logger.info(
