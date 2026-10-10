@@ -37,12 +37,15 @@ from audiobench.cli.display.theme import (
 from audiobench.core.db_session import get_session
 from audiobench.core.settings import get_settings
 from audiobench.playback.controls import fmt_timestamp
+from sqlalchemy import or_
+
 from audiobench.storage.models import (
     AudioFileRecord,
     BookmarkRecord,
     ChapterRecord,
     ChatConversation,
     NoteCapture,
+    NoteCollection,
     SegmentRecord,
     StudyProject,
     StudySession,
@@ -184,11 +187,14 @@ def render_file_dossier(
             .all()
         )
 
-        # Query chat conversations referencing any transcription of this audio file
+        # Query chat conversations referencing this audio file directly or via transcription
         tx_ids = [t.id for t in tx_rows]
         all_chats = session.query(ChatConversation).order_by(ChatConversation.id.desc()).all()
         related_chats = []
         for c in all_chats:
+            if c.audio_file_id == audio.id or (c.transcription_id and c.transcription_id in tx_ids):
+                related_chats.append(c)
+                continue
             if not c.transcript_ids:
                 continue
             try:
@@ -207,16 +213,20 @@ def render_file_dossier(
             .all()
         )
 
-        # Query note captures associated with any segment of this audio file
-        note_rows = []
+        # Query note captures associated with any collection or segment of this audio file
+        note_filters = [NoteCollection.audio_file_id == audio.id]
         if tx_ids:
-            note_rows = (
-                session.query(NoteCapture)
-                .join(SegmentRecord, NoteCapture.segment_id == SegmentRecord.id)
-                .filter(SegmentRecord.transcription_id.in_(tx_ids))
-                .order_by(NoteCapture.id.desc())
-                .all()
-            )
+            note_filters.append(SegmentRecord.transcription_id.in_(tx_ids))
+
+        note_rows = (
+            session.query(NoteCapture)
+            .outerjoin(NoteCollection, NoteCapture.collection_id == NoteCollection.id)
+            .outerjoin(SegmentRecord, NoteCapture.segment_id == SegmentRecord.id)
+            .filter(or_(*note_filters))
+            .order_by(NoteCapture.id.desc())
+            .distinct()
+            .all()
+        )
 
         # Scan for rendered clips in managed directory
         settings = get_settings()
@@ -331,12 +341,35 @@ def render_file_dossier(
         if note_rows:
             for n in note_rows:
                 n_date = n.created_at.strftime("%Y-%m-%d") if n.created_at else ""
-                seg_ts = fmt_timestamp(n.segment.start_time) if n.segment else "–"
+                seg_ts = "–"
+                if n.segment:
+                    seg_ts = fmt_timestamp(n.segment.start_time)
+                elif tx_rows and n.body:
+                    active_tx_id = tx_rows[0].id
+                    clean_body = re.sub(r"[^\w\s]", " ", n.body.strip()[:100]).strip()
+                    words = [w for w in clean_body.split() if len(w) > 3]
+                    matched_s = None
+                    if len(words) >= 3:
+                        for i in range(min(5, len(words) - 2)):
+                            pat = "%" + "%".join(words[i : i + 3]) + "%"
+                            matched_s = (
+                                session.query(SegmentRecord)
+                                .filter(
+                                    SegmentRecord.transcription_id == active_tx_id,
+                                    SegmentRecord.text.like(pat),
+                                )
+                                .order_by(SegmentRecord.start_time)
+                                .first()
+                            )
+                            if matched_s:
+                                break
+                    if matched_s:
+                        seg_ts = f"~{fmt_timestamp(matched_s.start_time)}"
                 snippet = n.body.replace("\n", " ").strip()
                 if len(snippet) > 60:
                     snippet = snippet[:57] + "…"
                 target_console.print(
-                    f"    [{ACCENT}]Note #{n.id}[/] [{DIM}@{seg_ts}][/] {snippet} [{DIM}]({n_date})[/]"
+                    f"    [{ACCENT}]Note #{n.id}[/] [{DIM}]@{seg_ts}[/] {snippet} [{DIM}]({n_date})[/]"
                 )
         else:
             target_console.print(f"    [{DIM}]No notes recorded.[/]")

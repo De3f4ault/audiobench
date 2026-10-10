@@ -45,6 +45,11 @@ class KnowledgeIngester:
             except Exception:
                 t_ids = []
 
+            if not t_ids and conversation.audio_file_id:
+                latest_tx = self._tx_repo.get_latest_transcript_for_file(conversation.audio_file_id)
+                if latest_tx:
+                    t_ids = [latest_tx["id"]]
+
             # Inherit the highest privacy tier from any source transcript.
             privacy_tier = self._tx_repo.get_max_privacy_tier_for_transcriptions(t_ids)
 

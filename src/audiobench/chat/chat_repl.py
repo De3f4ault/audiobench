@@ -15,6 +15,7 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.columns import Columns
 from rich.table import Table
+from rich.markup import escape
 
 from audiobench.chat.chat_session import ChatSession
 from audiobench.chat.chat_store import ChatRepository
@@ -31,11 +32,14 @@ from audiobench.cli.display.theme import (
     chat_console,
     console,
     error_panel,
+    format_duration,
 )
 import os
 import re
 import textwrap
+import time
 from collections import defaultdict
+from pathlib import Path
 
 from audiobench.core.db_engine import init_db
 from audiobench.core.error_types import AudioBenchError
@@ -45,10 +49,13 @@ from audiobench.playback.controls import (
     PLAYBACK_COMMANDS,
     extract_timestamps,
     handle_playback_command,
+    is_bg_exit_requested,
+    pause_playback_if_owned,
     render_citations_banner,
     render_jump_bar,
     render_playback_status_line,
 )
+from audiobench.storage.bookmark_repository import BookmarkRepository
 from audiobench.storage.repository import TranscriptionRepository
 
 logger = get_logger("chat.repl")
@@ -106,17 +113,22 @@ class ChatREPL:
         session_type: str = "chat",
         preloaded_fragments=None,
         preloaded_title: str | None = None,
+        preloaded_query: str | None = None,
+        preloaded_answer: str | None = None,
+        search_session_id: int | None = None,
         model: str | None = None,
         temperature: float = 0.3,
         think: bool = True,
         resume_id: int | None = None,
         project_id: int | None = None,
         current_session_number: int | None = None,
+        start_voice: bool = False,
     ):
         init_db()
         self.settings = settings or get_settings()
         self.tx_repo = tx_repo or TranscriptionRepository()
         self.chat_repo = chat_repo or ChatRepository()
+        self.start_voice = start_voice
 
         if session is None:
             model_name = model or self.settings.ollama_model
@@ -146,6 +158,9 @@ class ChatREPL:
         self.session_type = session_type
         self.preloaded_fragments = preloaded_fragments
         self.preloaded_title = preloaded_title
+        self.preloaded_query = preloaded_query
+        self.preloaded_answer = preloaded_answer
+        self.search_session_id = search_session_id
 
         # Ensure active model and provider are available, auto-falling back if missing
         if session is None and resume_id is not None and not model:
@@ -161,7 +176,15 @@ class ChatREPL:
                 model=self.session.model,
                 title=title,
                 session_type=self.session_type,
+                search_session_id=self.search_session_id,
             )
+        elif self.session.conversation_id and self.search_session_id:
+            self.chat_repo.update_search_session_id(self.session.conversation_id, self.search_session_id)
+
+        # Inject preloaded search fragments into chat context
+        if self.preloaded_fragments and self.session:
+            q_text = self.preloaded_query or self.preloaded_title or ""
+            self.session.inject_search_fragments(self.preloaded_fragments, query=q_text)
 
         import time as _time
         from pathlib import Path as _Path
@@ -176,7 +199,8 @@ class ChatREPL:
         self._completer = ChatSlashCompleter(self)
         self._auto_suggest = ChatAutoSuggest()
         self._active_citations: list[tuple[str, float]] = []
-        if resume_id is not None and self.session.messages:
+        active_resume_id = resume_id if resume_id is not None else (self.session.conversation_id if self.session else None)
+        if active_resume_id is not None and self.session and self.session.messages:
             from audiobench.playback.controls import extract_timestamps
 
             for msg in reversed(self.session.messages):
@@ -185,6 +209,21 @@ class ChatREPL:
                     if cited:
                         self._active_citations = cited
                         break
+
+        # Rehydrate citations from preloaded answer or fragments if not yet set
+        if not self._active_citations and self.preloaded_answer:
+            from audiobench.playback.controls import extract_timestamps
+
+            cited = extract_timestamps(self.preloaded_answer)
+            if cited:
+                self._active_citations = cited
+
+        if not self._active_citations and self.preloaded_fragments:
+            for frag in self.preloaded_fragments:
+                sf = getattr(frag, "source_file", None) or ""
+                st = getattr(frag, "start_time", 0.0)
+                if (sf, st) not in self._active_citations:
+                    self._active_citations.append((sf, st))
 
         from prompt_toolkit.key_binding import KeyBindings
 
@@ -264,12 +303,41 @@ class ChatREPL:
             key_bindings=kb,
         )
 
+        self._stt_session_id: str | None = None
         try:
             from audiobench.daemon.factory import get_daemon_client
-            self._daemon = get_daemon_client()
+            self._daemon = get_daemon_client(autostart=False)
+            if self._daemon and hasattr(self._daemon, "whisper_acquire"):
+                self._stt_session_id = f"chat_repl_{os.getpid()}"
+                self._daemon.whisper_acquire(
+                    self._stt_session_id,
+                    model=self.settings.stt_model or "base",
+                )
         except Exception as exc:
-            logger.debug("Daemon not available for playback: %s", exc)
+            logger.debug("Daemon not available for playback or STT: %s", exc)
             self._daemon = None
+            self._stt_session_id = None
+
+        self._exit_bg: bool = False
+
+    def _cleanup_stt_session(self) -> None:
+        """Release warm Whisper session in daemon upon chat exit."""
+        if self._daemon and getattr(self, "_stt_session_id", None):
+            try:
+                self._daemon.whisper_release(self._stt_session_id)
+            except Exception:
+                pass
+            self._stt_session_id = None
+
+    def _pause_session_playback(self, reason: str = "exit", force_bg: bool = False) -> None:
+        """Pause playback and save resume position if daemon is playing this session's audio."""
+        pause_playback_if_owned(
+            self._daemon,
+            self.session._transcript_ids if self.session else None,
+            console,
+            reason=reason,
+            force_bg=force_bg,
+        )
 
     def _ensure_model_available(self) -> None:
         """Verify the active model and client are accessible, falling back gracefully if missing."""
@@ -758,7 +826,7 @@ class ChatREPL:
                             transcription_id=tx_id,
                         )
                     elif tx_id:
-                        rec = self.tx_repo.get_by_id(tx_id)
+                        rec = self.tx_repo.get_by_id(tx_id, session=None)
                         if rec and rec.get("file_path"):
                             self._daemon.playback_play(
                                 rec["file_path"],
@@ -801,7 +869,7 @@ class ChatREPL:
             console.print(f"  [{DIM}]{'─' * 60}[/]")
             for t in txs:
                 skip_tag = "  [yellow][!] [context limit reached - skipped from prompt][/yellow]" if t["skipped"] else ""
-                ts_badge = f"  [{SUCCESS}]⏱ timestamps active[/]" if t.get("has_timestamps") else f"  [{DIM}](no timestamps)[/]"
+                ts_badge = f"  [{SUCCESS}][TS] timestamps active[/]" if t.get("has_timestamps") else f"  [{DIM}](no timestamps)[/]"
                 console.print(
                     f"    [{DIM}]#{t['id']}[/] {t['file_name']} "
                     f"[{DIM}]({t['word_count']:,} words)[/]{ts_badge}{skip_tag}"
@@ -912,6 +980,7 @@ class ChatREPL:
         arg = parts[1] if len(parts) > 1 else ""
 
         if command in ("/exit", "/quit", "/q"):
+            self._exit_bg = is_bg_exit_requested(arg)
             return True
 
         elif command == "/help":
@@ -920,7 +989,7 @@ class ChatREPL:
         elif command == "/context":
             if arg and arg.strip().isdigit():
                 tid = int(arg.strip())
-                record = self.tx_repo.get_by_id(tid)
+                record = self.tx_repo.get_by_id(tid, session=None)
                 if not record:
                     console.print(f"  [{DIM}]Transcript #{tid} not found[/]")
                     return False
@@ -946,7 +1015,7 @@ class ChatREPL:
             if explicit_ids:
                 # Direct ID load — no picker needed
                 for tid in explicit_ids:
-                    record = self.tx_repo.get_by_id(tid)
+                    record = self.tx_repo.get_by_id(tid, session=None)
                     if not record:
                         console.print(f"  [{DIM}]Transcript #{tid} not found[/]")
                     else:
@@ -961,7 +1030,7 @@ class ChatREPL:
                 initial_query = arg.strip() if arg else ""
                 chosen_ids = self._show_transcript_picker(initial_query)
                 for tid in chosen_ids:
-                    record = self.tx_repo.get_by_id(tid)
+                    record = self.tx_repo.get_by_id(tid, session=None)
                     if not record:
                         console.print(f"  [{DIM}]Transcript #{tid} not found[/]")
                     else:
@@ -973,6 +1042,7 @@ class ChatREPL:
                         )
 
         elif command == "/clear":
+            self._pause_session_playback(reason="switch")
             self.session.clear_history()
             console.print(
                 f"  [{SUCCESS}]✓ Conversation cleared (new session #{self.session.conversation_id})[/]"
@@ -1132,6 +1202,7 @@ class ChatREPL:
                 return False
 
             if chosen_id is not None and chosen_id != self.session.conversation_id:
+                self._pause_session_playback(reason="switch")
                 self.session = ChatSession(
                     client=self.session._client,
                     chat_repo=self.chat_repo,
@@ -1216,7 +1287,7 @@ class ChatREPL:
                 cmp_model = getattr(self.session, "_compare_model", None)
                 if cmp_model:
                     console.print(
-                        f"  [{ACCENT}]⚡ Comparison mode ON[/]\n"
+                        f"  [{ACCENT}][COMPARE] Comparison mode ON[/]\n"
                         f"  [{DIM}]Primary:   {self.session.model}[/]\n"
                         f"  [{DIM}]Secondary: {cmp_model}[/]\n"
                         f"  [{DIM}]Use /compare off to disable[/]"
@@ -1243,11 +1314,11 @@ class ChatREPL:
             self.session._compare_model = new_model
             if old and old != new_model:
                 console.print(
-                    f"  [{ACCENT}]⚡ Switched comparison:[/] [{DIM}]{old}[/] → [{BOLD}]{new_model}[/]"
+                    f"  [{ACCENT}][COMPARE] Switched comparison:[/] [{DIM}]{old}[/] → [{BOLD}]{new_model}[/]"
                 )
             else:
                 console.print(
-                    f"  [{ACCENT}]⚡ Comparison mode ON[/]\n"
+                    f"  [{ACCENT}][COMPARE] Comparison mode ON[/]\n"
                     f"  [{DIM}]Every prompt will compare {self.session.model} vs {new_model}[/]\n"
                     f"  [{DIM}]/compare off to disable[/]"
                 )
@@ -1268,7 +1339,7 @@ class ChatREPL:
 
             if arg and arg.strip().isdigit():
                 tid = int(arg.strip())
-                record = self.tx_repo.get_by_id(tid)
+                record = self.tx_repo.get_by_id(tid, session=None)
                 if not record:
                     console.print(f"  [{DIM}]Transcript #{tid} not found[/]")
                     return False
@@ -1289,7 +1360,7 @@ class ChatREPL:
             console.print()
             console.print(f"  [{ACCENT}]Bookmarks — {label}[/]")
             for b in bookmarks:
-                emoji = BOOKMARK_TYPES.get(b["bookmark_type"], "🔖")
+                emoji = BOOKMARK_TYPES.get(b["bookmark_type"], "[BM]")
                 time_str = _bfmt(b["timestamp"])
                 if b.get("is_region") and b.get("end_timestamp"):
                     time_str += f"→{_bfmt(b['end_timestamp'])}"
@@ -1427,6 +1498,432 @@ class ChatREPL:
             render_file_dossier(target, console)
             return False
 
+        elif command in ("/voice", "/v"):
+            record_audio = "--no-record" not in arg and "--no-audio" not in arg
+            clean_arg = arg.replace("--no-record", "").replace("--no-audio", "").strip().lower()
+
+            if clean_arg in ("status", "info"):
+                from audiobench.chat.voice_session import _LOADED_WHISPER_MODELS, is_internet_connected
+                from audiobench.tts.engine import PiperTTSEngine
+                engine = PiperTTSEngine(voices_dir=self.settings.voices_dir)
+                is_voice_local = (engine._voices_dir / f"{self.settings.tts_voice}.onnx").exists()
+                whisper_cached = self.settings.stt_model in _LOADED_WHISPER_MODELS
+                has_gemini = bool(self.settings.gemini_api_key)
+                online = is_internet_connected()
+
+                console.print()
+                console.print(f"  [{BOLD} {ACCENT}]AudioBench[/] — Voice & Audio Configuration")
+                console.print(f"  [{DIM}]{'─' * 54}[/]")
+                console.print(f"    STT Provider:       [bold cyan]{self.settings.stt_provider}[/bold cyan] [dim](auto / local / cloud)[/dim]")
+                console.print(f"    Whisper STT Model:  [bold cyan]{self.settings.stt_model}[/bold cyan] [dim]({'cached in RAM' if whisper_cached else 'loads on-demand'})[/dim]")
+                console.print(f"    Gemini Cloud STT:   {'[green]Available[/green]' if has_gemini else '[yellow]No API key[/yellow]'} [dim](gemini-2.5-flash)[/dim]")
+                console.print(f"    TTS Voice Model:    [bold cyan]{self.settings.tts_voice}[/bold cyan] [dim]({'downloaded' if is_voice_local else 'needs download'})[/dim]")
+                console.print(f"    Live Duplex Model:  gemini-2.5-flash-native-audio-preview")
+                console.print(f"    Internet Link:      {'[green]Online[/green]' if online else '[red]Offline[/red]'}")
+                console.print(f"    Session Recording:  {'enabled (session WAV saved)' if record_audio else 'disabled'}")
+                console.print(f"  [{DIM}]{'─' * 54}[/]")
+                console.print(f"  [{DIM}]Commands: /voice provider · /voice model · /voice picker · /voice live[/dim]")
+                console.print()
+                return False
+
+            elif clean_arg.startswith("provider") or clean_arg.startswith("engine"):
+                tokens = clean_arg.split(None, 1)
+                provider_arg = tokens[1].strip() if len(tokens) > 1 else ""
+                valid_providers = ("auto", "local", "cloud")
+                if not provider_arg:
+                    current_prov = getattr(self.settings, "stt_provider", "auto")
+                    console.print()
+                    console.print(f"  [{BOLD} {ACCENT}]Speech-to-Text (STT) Provider Selection[/]")
+                    console.print(f"  [{DIM}]{'─' * 52}[/]")
+                    console.print(f"    [[bold cyan]1[/bold cyan]] auto   — Cloud (Gemini) when online + API key, offline Whisper fallback {'[green]← active[/green]' if current_prov == 'auto' else ''}")
+                    console.print(f"    [[bold cyan]2[/bold cyan]] local  — Local Whisper only (private, zero network dependency) {'[green]← active[/green]' if current_prov == 'local' else ''}")
+                    console.print(f"    [[bold cyan]3[/bold cyan]] cloud  — Gemini 2.5 Flash STT only (fast, high accuracy on jargon) {'[green]← active[/green]' if current_prov == 'cloud' else ''}")
+                    console.print(f"    [[bold cyan]0[/bold cyan]] Keep current ({current_prov})")
+                    console.print()
+                    try:
+                        raw = input("    › Pick provider [0]: ").strip()
+                    except (KeyboardInterrupt, EOFError):
+                        console.print()
+                        return False
+                    if not raw or raw == "0":
+                        console.print(f"  [{DIM}]Kept current provider: {current_prov}[/]")
+                        return False
+                    mapping = {"1": "auto", "2": "local", "3": "cloud", "auto": "auto", "local": "local", "cloud": "cloud"}
+                    provider_arg = mapping.get(raw.lower(), "")
+                    if not provider_arg:
+                        console.print(f"  [red]Invalid provider option: '{raw}'[/red]")
+                        return False
+
+                if provider_arg in valid_providers:
+                    self.settings.stt_provider = provider_arg
+                    self.settings.save()
+                    console.print(f"  [{SUCCESS}]✓ STT Provider set to:[/] [bold cyan]{provider_arg}[/bold cyan]")
+                else:
+                    console.print(f"  [red]Invalid provider: '{provider_arg}'. Choose from: auto, local, cloud[/red]")
+                return False
+
+            elif clean_arg.startswith("model") or clean_arg.startswith("stt-model"):
+                tokens = clean_arg.split(None, 1)
+                model_arg = tokens[1].strip() if len(tokens) > 1 else ""
+                model_specs = [
+                    ("tiny", "~75MB", "Fastest transcription, lowest memory footprint"),
+                    ("base", "~145MB", "Fast, balanced accuracy for general speech (default)"),
+                    ("small", "~480MB", "High accuracy, moderate compute requirements"),
+                    ("medium", "~1.5GB", "Studio-level accuracy, higher RAM"),
+                    ("turbo", "~1.6GB", "State-of-the-art accuracy at 8× real-time speed"),
+                ]
+                valid_models = {"tiny", "base", "small", "medium", "turbo", "large-v3-turbo"}
+                current_model = getattr(self.settings, "stt_model", "base")
+
+                if not model_arg:
+                    console.print()
+                    console.print(f"  [{BOLD} {ACCENT}]Whisper Speech-to-Text Model Selection[/]")
+                    console.print(f"  [{DIM}]{'─' * 62}[/]")
+                    for idx, (m_name, m_size, m_desc) in enumerate(model_specs, 1):
+                        is_curr = (current_model == m_name or (current_model == "large-v3-turbo" and m_name == "turbo"))
+                        marker = " [green]← active[/green]" if is_curr else ""
+                        console.print(f"    [[bold cyan]{idx}[/bold cyan]] [bold]{m_name:<7}[/bold] ({m_size:<7}) — {m_desc}{marker}")
+                    console.print(f"    [[bold cyan]0[/bold cyan]] Keep current ({current_model})")
+                    console.print()
+                    try:
+                        raw = input("    › Pick Whisper model [0]: ").strip()
+                    except (KeyboardInterrupt, EOFError):
+                        console.print()
+                        return False
+                    if not raw or raw == "0":
+                        console.print(f"  [{DIM}]Kept current model: {current_model}[/]")
+                        return False
+                    mapping = {"1": "tiny", "2": "base", "3": "small", "4": "medium", "5": "turbo"}
+                    model_arg = mapping.get(raw.lower(), raw.lower())
+
+                if model_arg == "large-v3-turbo":
+                    model_arg = "turbo"
+
+                if model_arg in valid_models:
+                    self.settings.stt_model = model_arg
+                    self.settings.save()
+                    console.print(f"  [{SUCCESS}]✓ Whisper STT model set to:[/] [bold cyan]{model_arg}[/bold cyan]")
+                else:
+                    console.print(f"  [red]Invalid model: '{model_arg}'. Choose from: tiny, base, small, medium, turbo[/red]")
+                return False
+
+            elif clean_arg in ("test", "audition"):
+                from audiobench.chat.voice_picker import audition_voice
+                audition_voice(self.settings.tts_voice, console=console)
+                return False
+
+            elif clean_arg in ("picker", "set", "choose", "select"):
+                from audiobench.chat.voice_picker import show_voice_picker
+                chosen = show_voice_picker(console=console, current_voice=self.settings.tts_voice)
+                if chosen:
+                    self.settings.tts_voice = chosen
+                    self.settings.save()
+                    console.print(f"  [{SUCCESS}]✓ TTS voice set to: {chosen}[/]")
+                return False
+
+            elif clean_arg in ("live", "call", "stream"):
+                from audiobench.chat.voice_session import VoiceChatSession
+                conv_id = self.session.ensure_conversation() if hasattr(self.session, "ensure_conversation") and getattr(self.session, "_chat_repo", None) else None
+                v_session = VoiceChatSession(
+                    conversation_id=conv_id,
+                    console=console,
+                    settings=self.settings,
+                    record_audio=record_audio,
+                )
+                turns, wav_path, total_duration = v_session.run_continuous_live()
+                if turns and conv_id is not None:
+                    audio_fid, tx_id, seg_ids = self.tx_repo.save_voice_chat_session(
+                        conversation_id=conv_id,
+                        audio_file_path=wav_path,
+                        turns=turns,
+                        duration_seconds=total_duration,
+                        model_name=self.session.model,
+                    )
+                    self.chat_repo.link_voice_session(
+                        conversation_id=conv_id,
+                        audio_file_id=audio_fid,
+                        transcription_id=tx_id,
+                    )
+
+                    for idx, turn in enumerate(turns):
+                        s_id = seg_ids[idx] if idx < len(seg_ids) else None
+                        self.chat_repo.add_message(
+                            conversation_id=conv_id,
+                            role=turn["role"],
+                            content=turn["text"],
+                            modality="voice_live",
+                            duration_seconds=max(0.0, turn.get("end_time", 0.0) - turn.get("start_time", 0.0)),
+                            audio_path=wav_path,
+                            voice_name=turn.get("voice_name"),
+                            segment_id=s_id,
+                        )
+                return False
+
+            else:
+                from audiobench.chat.voice_session import VoiceChatSession
+                conv_id = self.session.ensure_conversation() if hasattr(self.session, "ensure_conversation") and getattr(self.session, "_chat_repo", None) else None
+                v_session = VoiceChatSession(
+                    conversation_id=conv_id,
+                    console=console,
+                    settings=self.settings,
+                    record_audio=record_audio,
+                )
+                try:
+                    spoken_text, wav_path, duration = v_session.record_single_turn(silence_timeout=5.0)
+                except KeyboardInterrupt:
+                    console.print()
+                    console.print(f"  [{DIM}]Cancelled.[/]")
+                    return False
+                if spoken_text:
+                    console.print(f"  [{DIM}]Prompt: \"{spoken_text}\"[/]")
+                    seg_id = None
+                    if wav_path and conv_id is not None:
+                        single_turn = [{"role": "user", "text": spoken_text, "start_time": 0.0, "end_time": duration}]
+                        _, _, seg_ids = self.tx_repo.save_voice_chat_session(
+                            conversation_id=conv_id,
+                            audio_file_path=wav_path,
+                            turns=single_turn,
+                            duration_seconds=duration,
+                            model_name=self.session.model,
+                        )
+                        if seg_ids:
+                            seg_id = seg_ids[0]
+
+                    self._stream_and_render(
+                        spoken_text,
+                        modality="voice",
+                        duration_seconds=duration,
+                        audio_path=wav_path,
+                        segment_id=seg_id,
+                    )
+                else:
+                    console.print(f"  [{DIM}]No speech detected.[/]")
+                return False
+
+        elif command in ("/voices", "/voice-picker"):
+            from audiobench.chat.voice_picker import show_voice_picker
+            chosen = show_voice_picker(console=console, current_voice=self.settings.tts_voice)
+            if chosen:
+                self.settings.tts_voice = chosen
+            return False
+
+        elif command == "/speak":
+            raw_arg = arg.strip() if arg else ""
+            from audiobench.chat.voice_picker import ensure_voice_downloaded, strip_markdown_for_speech
+            from audiobench.tts.engine import PiperTTSEngine, TTSError
+
+            # Parse flags
+            tokens = raw_arg.split()
+            show_lyrics = False
+            foreground_mode = False
+            auto_pause = True
+            text_tokens = []
+
+            for t in tokens:
+                if t in ("-l", "--lyrics"):
+                    show_lyrics = True
+                elif t in ("-f", "--foreground"):
+                    foreground_mode = True
+                elif t == "--no-pause":
+                    auto_pause = False
+                else:
+                    text_tokens.append(t)
+
+            target = " ".join(text_tokens).strip()
+
+            text_to_speak = ""
+            if target.startswith("msg ") or target.startswith("message "):
+                parts = target.split()
+                if len(parts) > 1 and parts[1].isdigit():
+                    m_id = int(parts[1])
+                    from audiobench.core.db_session import get_session
+                    from audiobench.storage.models import ChatMessage
+                    with get_session() as db:
+                        msg = db.query(ChatMessage).filter_by(id=m_id).first()
+                        if msg and msg.content:
+                            text_to_speak = msg.content
+                        else:
+                            console.print(f"  [{DIM}]Message #{m_id} not found or empty.[/]")
+                            return False
+            elif target:
+                text_to_speak = target
+            else:
+                for msg in reversed(self.session.messages):
+                    if msg.get("role") == "assistant" and msg.get("content"):
+                        text_to_speak = msg["content"]
+                        break
+
+            if not text_to_speak:
+                console.print(f"  [{DIM}]No assistant message or text to speak.[/]")
+                return False
+
+            if not ensure_voice_downloaded(self.settings.tts_voice, console=console):
+                return False
+
+            cleaned = strip_markdown_for_speech(text_to_speak)
+            voice = self.settings.tts_voice
+
+            if foreground_mode or not self._daemon:
+                console.print(f"  [cyan][Voice][/cyan] [dim]Speaking with {voice}... [bold](Space: pause · q: stop)[/bold][/dim]")
+                try:
+                    engine = PiperTTSEngine(voices_dir=self.settings.voices_dir)
+                    engine.play(cleaned, voice=voice)
+                except KeyboardInterrupt:
+                    PiperTTSEngine.stop()
+                    console.print("\n  [dim][Voice] Playback stopped.[/dim]")
+                except TTSError as e:
+                    console.print(f"  [yellow]TTS Error: {e}[/yellow]")
+                except Exception as e:
+                    console.print(f"  [yellow]TTS Playback failed: {e}[/yellow]")
+                return False
+
+            # Daemon background playback with sentence timestamps
+            try:
+                cache_dir = Path(self.settings.data_dir) / "cache" / "tts"
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                speech_wav = cache_dir / f"speak_{os.getpid()}_{int(time.time())}.wav"
+
+                engine = PiperTTSEngine(voices_dir=self.settings.voices_dir)
+                wav_path, segments = engine.synthesize_with_timestamps(
+                    cleaned, voice=voice, output_path=speech_wav
+                )
+
+                self._daemon.playback_play(
+                    str(wav_path),
+                    segments=segments,
+                    auto_resume=auto_pause,
+                )
+
+                if show_lyrics:
+                    from audiobench.playback.lyrics_hud import show_daemon_lyrics
+                    show_daemon_lyrics(self._daemon, console, tx_repo=self.tx_repo)
+                else:
+                    pause_info = " · auto-resumes previous track" if auto_pause else ""
+                    console.print(
+                        f"  [cyan][Voice][/cyan] [dim]Speaking with {voice} in background "
+                        f"[bold](Space: pause · /stop · /lyrics to follow{pause_info})[/bold][/dim]"
+                    )
+            except TTSError as e:
+                console.print(f"  [yellow]TTS Error: {e}[/yellow]")
+            except Exception as e:
+                logger.error("Daemon /speak failed: %s", e)
+                console.print(f"  [yellow]TTS Playback failed: {e}[/yellow]")
+            return False
+
+        elif command == "/play" and (arg.strip().startswith("msg") or arg.strip().startswith("message")):
+            parts = arg.strip().split()
+            if len(parts) > 1 and parts[1].isdigit():
+                msg_id = int(parts[1])
+                from audiobench.core.db_session import get_session
+                from audiobench.storage.models import (
+                    AudioFileRecord,
+                    ChatMessage,
+                    SegmentRecord,
+                    TranscriptionRecord,
+                )
+                audio_path = None
+                msg_content = None
+                start_pos = 0.0
+                with get_session() as db:
+                    msg = db.query(ChatMessage).filter_by(id=msg_id).first()
+                    if msg:
+                        audio_path = msg.audio_path
+                        msg_content = msg.content
+                        seg = None
+                        if msg.segment_id:
+                            seg = db.query(SegmentRecord).filter_by(id=msg.segment_id).first()
+                            if seg:
+                                start_pos = seg.start_time
+
+                        # If segment was purged, missing, or detached, probe active transcription
+                        if seg is None and (audio_path or (msg.conversation and msg.conversation.audio_file_id)):
+                            audio_rec = None
+                            if audio_path:
+                                audio_rec = db.query(AudioFileRecord).filter_by(file_path=audio_path).first()
+                                if not audio_rec:
+                                    audio_rec = db.query(AudioFileRecord).filter(
+                                        AudioFileRecord.file_name == Path(audio_path).name
+                                    ).first()
+                            if not audio_rec and msg.conversation and msg.conversation.audio_file_id:
+                                audio_rec = db.query(AudioFileRecord).filter_by(id=msg.conversation.audio_file_id).first()
+
+                            if audio_rec:
+                                if not audio_path:
+                                    audio_path = audio_rec.file_path
+                                active_tx = (
+                                    db.query(TranscriptionRecord)
+                                    .filter(
+                                        TranscriptionRecord.audio_file_id == audio_rec.id,
+                                        TranscriptionRecord.pipeline_phase.in_(["complete", "completed"])
+                                    )
+                                    .order_by(TranscriptionRecord.id.desc())
+                                    .first()
+                                )
+                                if active_tx and msg_content:
+                                    matched_seg = None
+                                    # 1. Probe explicit quotes first
+                                    quotes = re.findall(r'["\']([^"\']{10,})["\']', msg_content)
+                                    for q in quotes:
+                                        q_words = [w for w in re.sub(r"[^\w\s]", " ", q).split() if len(w) > 3][:4]
+                                        if len(q_words) >= 2:
+                                            pat = "%" + "%".join(q_words) + "%"
+                                            matched_seg = (
+                                                db.query(SegmentRecord)
+                                                .filter(
+                                                    SegmentRecord.transcription_id == active_tx.id,
+                                                    SegmentRecord.text.like(pat)
+                                                )
+                                                .order_by(SegmentRecord.start_time)
+                                                .first()
+                                            )
+                                            if matched_seg:
+                                                break
+
+                                    # 2. Sliding word windows from message content
+                                    if not matched_seg:
+                                        clean_probe = re.sub(r"[^\w\s]", " ", msg_content.strip()[:120]).strip()
+                                        words = [w for w in clean_probe.split() if len(w) > 3]
+                                        if len(words) >= 3:
+                                            for i in range(min(5, len(words) - 2)):
+                                                pat = "%" + "%".join(words[i : i + 3]) + "%"
+                                                matched_seg = (
+                                                    db.query(SegmentRecord)
+                                                    .filter(
+                                                        SegmentRecord.transcription_id == active_tx.id,
+                                                        SegmentRecord.text.like(pat)
+                                                    )
+                                                    .order_by(SegmentRecord.start_time)
+                                                    .first()
+                                                )
+                                                if matched_seg:
+                                                    break
+                                    if matched_seg:
+                                        start_pos = matched_seg.start_time
+                                        msg.segment_id = matched_seg.id
+                                        db.commit()
+
+                if audio_path and Path(audio_path).exists() and self._daemon:
+                    self._daemon.playback_play(audio_path, start_pos=start_pos)
+                    console.print(f"  [{SUCCESS}][DONE] Playing voice message #{msg_id}[/] [{DIM}]({audio_path} from {start_pos:.1f}s)[/]")
+                elif msg_content:
+                    from audiobench.chat.voice_picker import ensure_voice_downloaded, strip_markdown_for_speech
+                    from audiobench.tts.engine import PiperTTSEngine
+                    if not ensure_voice_downloaded(self.settings.tts_voice, console=console):
+                        return False
+                    cleaned = strip_markdown_for_speech(msg_content)
+                    console.print(f"  [cyan][Voice][/cyan] [dim]Synthesizing message #{msg_id} with {self.settings.tts_voice}... [bold](Space: pause · q: stop)[/bold][/dim]")
+                    try:
+                        engine = PiperTTSEngine(voices_dir=self.settings.voices_dir)
+                        engine.play(cleaned, voice=self.settings.tts_voice)
+                    except KeyboardInterrupt:
+                        PiperTTSEngine.stop()
+                        console.print("\n  [dim][Voice] Playback stopped.[/dim]")
+                    except Exception as e:
+                        console.print(f"  [yellow]TTS Playback failed: {e}[/yellow]")
+                else:
+                    console.print(f"  [{DIM}]Message #{msg_id} has no audio or content.[/]")
+                return False
+
         elif command in PLAYBACK_COMMANDS or (command.startswith("/") and command[1:].isdigit()):
             if not self._daemon:
                 console.print(f"  [{DIM}]Daemon not available for playback.[/]")
@@ -1441,7 +1938,7 @@ class ChatREPL:
 
             def_record = None
             if self.session._transcript_ids:
-                def_record = self.tx_repo.get_by_id(next(iter(self.session._transcript_ids)))
+                def_record = self.tx_repo.get_by_id(next(iter(self.session._transcript_ids)), session=None)
 
             try:
                 handle_playback_command(
@@ -1449,14 +1946,16 @@ class ChatREPL:
                     arg,
                     self._daemon,
                     console,
-                    transcript_resolver=self.tx_repo.get_by_id,
+                    # Wrap with session=None so the playback resolver never returns
+                    # owner-voice content regardless of ChatSession state.
+                    transcript_resolver=lambda tid: self.tx_repo.get_by_id(tid, session=None),
                     loaded_transcript_ids=list(self.session._transcript_ids) if self.session._transcript_ids else [],
                     on_explain_context=on_explain,
                     active_citations=self._active_citations,
                     default_record=def_record,
                 )
             except Exception as exc:
-                console.print(f"  [{WARNING}]Playback error: {exc}[/]")
+                console.print(f"  [{WARNING}]Playback error: {escape(str(exc))}[/]")
 
         else:
             console.print(f"  [{DIM}]Unknown command: {command} (type /help for commands)[/]")
@@ -1477,14 +1976,21 @@ class ChatREPL:
                 think_preview = msg["thinking"][:300]
                 if len(msg["thinking"]) > 300:
                     think_preview += "…"
-                parts.append(Text(f"💭 {think_preview}", style="dim italic"))
+                parts.append(Text(f"[thinking] {think_preview}", style="dim italic"))
             parts.append(RichMarkdown(msg["content"], code_theme=CHAT_CODE_THEME))
             model_label = msg.get("model_name") or "Model"
             border = "cyan" if side == "left" else "magenta"
             layout[side].update(Panel(Group(*parts), title=model_label, border_style=border))
         console.print(layout)
 
-    def _stream_and_render(self, user_text: str) -> None:
+    def _stream_and_render(
+        self,
+        user_text: str,
+        modality: str = "text",
+        duration_seconds: float | None = None,
+        audio_path: str | None = None,
+        segment_id: int | None = None,
+    ) -> None:
         """Send user input and render the streamed response."""
         console.print()
         try:
@@ -1498,7 +2004,13 @@ class ChatREPL:
                 refresh_per_second=8,
                 transient=True,
             ) as live:
-                for chunk in self.session.send(user_text):
+                for chunk in self.session.send(
+                    user_text,
+                    modality=modality,
+                    duration_seconds=duration_seconds,
+                    audio_path=audio_path,
+                    segment_id=segment_id,
+                ):
                     thinking = chunk.get("thinking", "")
                     content = chunk.get("content", "")
 
@@ -1517,7 +2029,7 @@ class ChatREPL:
                         if len(think_lines) > 5:
                             think_text = "…\n" + "\n".join(think_lines[-5:])
                         display_parts.append(
-                            Text(f"💭 {think_text}", style="dim italic"),
+                            Text(f"[thinking] {think_text}", style="dim italic"),
                         )
 
                     if content_parts:
@@ -1830,7 +2342,7 @@ class ChatREPL:
                                 think_preview += "…"
                             console.print(
                                 Padding(
-                                    Text(f"💭 {think_preview}", style="dim italic"),
+                                    Text(f"[thinking] {think_preview}", style="dim italic"),
                                     (0, 2, 0, 4),
                                 )
                             )
@@ -1847,6 +2359,16 @@ class ChatREPL:
                     i += 1
             console.print(f"  [{DIM}]─── End of History ───[/]")
             console.print()
+            if not self._active_citations and self.session and self.session.messages:
+                from audiobench.playback.controls import extract_timestamps
+
+                for msg in reversed(self.session.messages):
+                    if msg.get("role") == "assistant" and msg.get("content"):
+                        cited = extract_timestamps(msg["content"])
+                        if cited:
+                            self._active_citations = cited
+                            break
+
             if self._active_citations:
                 from audiobench.playback.controls import render_citations_banner
 
@@ -1854,8 +2376,22 @@ class ChatREPL:
                 console.print()
 
     def run(self, resume_id: int | None = None) -> None:
+        """Run the chat REPL session, ensuring STT daemon session cleanup upon exit."""
+        try:
+            self._run_loop(resume_id=resume_id)
+        finally:
+            self._cleanup_stt_session()
+
+    def _run_loop(self, resume_id: int | None = None) -> None:
         console.print()
-        conv_label = f" [#{resume_id}]" if resume_id else ""
+
+        # Seed initial turn if preloaded_answer is provided and this is a brand new session
+        if self.preloaded_answer and self.session and self.session.turn_count == 0:
+            query_text = self.preloaded_query or self.preloaded_title or "Search Query"
+            self.session.seed_initial_turn(query_text, self.preloaded_answer)
+
+        active_resume_id = resume_id if resume_id is not None else (self.session.conversation_id if (self.session and self.session.turn_count > 0) else None)
+        conv_label = f" [#{active_resume_id}]" if active_resume_id else ""
         if self.preloaded_title:
             console.print(f"  [{BOLD} {ACCENT}]{APP_NAME}[/] — {self.preloaded_title}{conv_label}")
         else:
@@ -1869,18 +2405,27 @@ class ChatREPL:
             console.print(f"              {line}")
         think_label = "on" if self.session.show_thinking else "off"
         console.print(f"    Thinking: {think_label}")
-        if resume_id and self.session.turn_count > 0:
+        if active_resume_id and self.session.turn_count > 0:
             console.print(f"    Resumed:  {self.session.turn_count} previous turn(s)")
         console.print(f"  [{DIM}]{'─' * 44}[/]")
         console.print()
 
-        if resume_id:
+        if active_resume_id and self.session.turn_count > 0:
             self._render_history()
+        elif self._active_citations:
+            from audiobench.playback.controls import render_citations_banner
+
+            render_citations_banner(console, self._active_citations)
+            console.print()
 
         last_user_input: str | None = None
         self.session._retry_requested = False
         if not hasattr(self.session, "_compare_model"):
             self.session._compare_model = None
+
+        if self.start_voice:
+            self.start_voice = False
+            self._handle_slash_command("/voice live")
 
         while True:
             try:
@@ -1892,12 +2437,34 @@ class ChatREPL:
                 )
                 status_prefix = f"\033[38;5;240m  {status_str}\033[0m\n" if status_str else ""
                 if cmp_active:
-                    prompt_str = ANSI(f"{status_prefix}\033[38;5;214m⚡ >>> \033[0m")
+                    prompt_str = ANSI(f"{status_prefix}\033[38;5;214m[cmp] >>> \033[0m")
                 else:
                     prompt_str = ANSI(f"{status_prefix}\033[38;5;48m>>> \033[0m")
                 user_input = self._pt_session.prompt(prompt_str).strip()
-            except (EOFError, KeyboardInterrupt):
+            except KeyboardInterrupt:
+                now = self._time.monotonic()
+                last_sig = getattr(self, "_last_interrupt_time", 0.0)
+                if now - last_sig < 1.5:
+                    console.print()
+                    self._pause_session_playback(reason="exit", force_bg=False)
+                    if self.session.conversation_id:
+                        console.print(
+                            f"  [{SUCCESS}]✓ Conversation "
+                            f"#{self.session.conversation_id} saved "
+                            f"({self.session.turn_count * 2} messages)[/]"
+                        )
+                        if self.session.turn_count >= 3:
+                            self._trigger_summary()
+                    self._push_exit_frame()
+                    console.print(f"  [{DIM}]Goodbye![/]")
+                    console.print()
+                    break
+                self._last_interrupt_time = now
+                console.print(f"\n  [{DIM}](Press Ctrl+C again or type /exit to quit)[/]")
+                continue
+            except EOFError:
                 console.print()
+                self._pause_session_playback(reason="exit", force_bg=False)
                 if self.session.conversation_id:
                     console.print(
                         f"  [{SUCCESS}]✓ Conversation "
@@ -1927,47 +2494,64 @@ class ChatREPL:
             if user_input.startswith("\\"):
                 user_input = "/" + user_input[1:]
             # Intercept bare quit words so they don't get sent to the LLM
-            if user_input.strip().lower() in ("q", "quit", "exit", ":q", ":wq"):
+            tokens = user_input.strip().lower().split()
+            if tokens and tokens[0] in ("q", "quit", "exit", ":q", ":wq"):
+                self._exit_bg = is_bg_exit_requested(tokens[1:])
                 user_input = "/exit"
-            if user_input.startswith("/"):
-                should_exit = self._handle_slash_command(user_input)
+            try:
+                if user_input.startswith("/"):
+                    try:
+                        should_exit = self._handle_slash_command(user_input)
+                    except Exception as cmd_err:
+                        logger.exception("Error executing command '%s'", user_input)
+                        console.print(f"  [red]Command error: {cmd_err}[/red]")
+                        continue
 
-                if getattr(self.session, "_retry_requested", False):
-                    self.session._retry_requested = False
-                    if last_user_input and self.session.messages:
-                        self.session._messages = [m for m in self.session._messages if m != self.session._messages[-1]]
-                        if self.session._messages and self.session._messages[-1]["role"] == "user":
-                            self.session._messages.pop()
-                        console.print(f"  [{DIM}]Regenerating...[/]")
-                        self._stream_and_render(last_user_input)
-                    else:
-                        console.print(f"  [{DIM}]Nothing to retry[/]")
+                    if getattr(self.session, "_retry_requested", False):
+                        self.session._retry_requested = False
+                        if last_user_input and self.session.messages:
+                            self.session._messages = [m for m in self.session._messages if m != self.session._messages[-1]]
+                            if self.session._messages and self.session._messages[-1]["role"] == "user":
+                                self.session._messages.pop()
+                            console.print(f"  [{DIM}]Regenerating...[/]")
+                            self._stream_and_render(last_user_input)
+                        else:
+                            console.print(f"  [{DIM}]Nothing to retry[/]")
+                        continue
+
+                    if should_exit:
+                        self._pause_session_playback(reason="exit", force_bg=getattr(self, "_exit_bg", False))
+                        if self.session.conversation_id:
+                            console.print(
+                                f"  [{SUCCESS}]✓ Conversation "
+                                f"#{self.session.conversation_id} saved "
+                                f"({self.session.turn_count * 2} messages)"
+                                f"[/]"
+                            )
+                            if self.session.turn_count >= 3:
+                                self._trigger_summary()
+                        self._push_exit_frame()
+                        console.print(f"  [{DIM}]Goodbye![/]")
+                        console.print()
+                        break
                     continue
 
-                if should_exit:
-                    if self.session.conversation_id:
-                        console.print(
-                            f"  [{SUCCESS}]✓ Conversation "
-                            f"#{self.session.conversation_id} saved "
-                            f"({self.session.turn_count * 2} messages)"
-                            f"[/]"
-                        )
-                        if self.session.turn_count >= 3:
-                            self._trigger_summary()
-                    self._push_exit_frame()
-                    console.print(f"  [{DIM}]Goodbye![/]")
-                    console.print()
-                    break
+                last_user_input = user_input
+                self._active_citations = []  # Retire prior turn's active citation hotkeys for new turn
+
+                compare_model = getattr(self.session, "_compare_model", None)
+                if compare_model:
+                    self._compare_and_render(user_input, compare_model)
+                else:
+                    self._stream_and_render(user_input)
+            except KeyboardInterrupt:
+                try:
+                    from audiobench.tts.engine import PiperTTSEngine
+                    PiperTTSEngine.stop()
+                except Exception:
+                    pass
+                console.print("\n  [dim]Cancelled.[/dim]")
                 continue
-
-            last_user_input = user_input
-            self._active_citations = []  # Retire prior turn's active citation hotkeys for new turn
-
-            compare_model = getattr(self.session, "_compare_model", None)
-            if compare_model:
-                self._compare_and_render(user_input, compare_model)
-            else:
-                self._stream_and_render(user_input)
 
     def _handle_sentinel_action(self, sentinel: str) -> None:
         """Dispatch empty-buffer hotkeys without sending input to LLM."""
@@ -1977,17 +2561,27 @@ class ChatREPL:
         action = sentinel[1:]
         def_record = None
         if self.session._transcript_ids:
-            def_record = self.tx_repo.get_by_id(next(iter(self.session._transcript_ids)))
+            def_record = self.tx_repo.get_by_id(next(iter(self.session._transcript_ids)), session=None)
+
+        session_tids = list(self.session._transcript_ids) if self.session._transcript_ids else []
+        # Locked resolver: bake session=None into all playback lookups from chat.
+        _locked_resolver = lambda tid: self.tx_repo.get_by_id(tid, session=None)  # noqa: E731
 
         if action == "SPACE":
-            st = self._daemon.playback_toggle()
-            state = "Paused" if st.get("paused") else "Playing"
-            console.print(f"  [{SUCCESS}][DONE] {state}[/]")
+            handle_playback_command(
+                "/toggle", "", self._daemon, console,
+                transcript_resolver=_locked_resolver,
+                loaded_transcript_ids=session_tids,
+                active_citations=self._active_citations,
+                default_record=def_record,
+            )
             return
 
         if action == "NEXT":
             handle_playback_command(
                 "/next", "", self._daemon, console,
+                transcript_resolver=_locked_resolver,
+                loaded_transcript_ids=session_tids,
                 active_citations=self._active_citations,
                 default_record=def_record,
             )
@@ -1996,6 +2590,8 @@ class ChatREPL:
         if action == "PREV":
             handle_playback_command(
                 "/prev", "", self._daemon, console,
+                transcript_resolver=_locked_resolver,
+                loaded_transcript_ids=session_tids,
                 active_citations=self._active_citations,
                 default_record=def_record,
             )
@@ -2004,6 +2600,8 @@ class ChatREPL:
         if action.isdigit():
             handle_playback_command(
                 f"/{action}", "", self._daemon, console,
+                transcript_resolver=_locked_resolver,
+                loaded_transcript_ids=session_tids,
                 active_citations=self._active_citations,
                 default_record=def_record,
             )
