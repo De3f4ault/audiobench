@@ -94,6 +94,11 @@ def daemon_status() -> None:
         console.print(f"[bold]Model:[/bold] {stats.get('embedding_model_version', 'unknown')}")
         console.print(f"[bold]Nodes Stored:[/bold] {stats.get('total_nodes', 0)}")
         console.print(f"[bold]Queue Depth:[/bold] {stats.get('queue_depth', 0)}")
+        pending_rev = stats.get('pending_privacy_reviews', 0)
+        if pending_rev > 0:
+            console.print(f"[bold]Pending Privacy Reviews:[/bold] [bold yellow]{pending_rev}[/bold yellow] (run 'audiobench review audiobooks')")
+        else:
+            console.print("[bold]Pending Privacy Reviews:[/bold] [dim]0[/dim]")
 
         pb = stats.get("playback", {})
         if pb and pb.get("playing"):

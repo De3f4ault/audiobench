@@ -119,6 +119,12 @@ def _handle_ping(args: dict[str, Any]) -> dict[str, Any]:
     tracker = get_calibration_tracker()
     timing = get_timing_model()
 
+    try:
+        from audiobench.storage.repository import TranscriptionRepository
+        pending_privacy_reviews_count = len(TranscriptionRepository().get_pending_privacy_reviews())
+    except Exception:
+        pending_privacy_reviews_count = 0
+
     return {
         "alive": True,
         "status": "ok",
@@ -126,6 +132,7 @@ def _handle_ping(args: dict[str, Any]) -> dict[str, Any]:
         "embedding_model_version": store_version,
         "memory_mb": round(memory_mb, 2),
         "queue_depth": queue_depth,
+        "pending_privacy_reviews": pending_privacy_reviews_count,
         "sweep_consecutive_failures": sweep_consecutive_failures,
         "models": {
             "embedding": store_version,
@@ -463,12 +470,90 @@ def _handle_reject_inference(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _handle_authorize_proposal(args: dict[str, Any]) -> dict[str, Any]:
-    """Authorize a daemon_proposal: write confirmed to DB and hot-register the operator."""
+    """Authorize a daemon_proposal.
+
+    If operator proposal: hot-register operator and mark confirmed.
+    If knowledge gap / advisory proposal: mark confirmed in DB and return acknowledged.
+    Legacy plain-text fallback: mark confirmed in DB, log warning, and return acknowledged.
+    """
+    import json
+    from sqlalchemy import text as sql_text
+    from audiobench.core.db_session import get_session
     from audiobench.daemon.intelligence.operator_registry import get_operator_registry
 
     expression_id = int(args["expression_id"])
-    get_operator_registry().authorize(expression_id)
-    return {"status": "ok", "expression_id": expression_id, "action": "authorized"}
+
+    with get_session() as session:
+        row = session.execute(
+            sql_text("SELECT content FROM expressions WHERE id = :eid AND source_type = 'daemon_proposal'"),
+            {"eid": expression_id}
+        ).fetchone()
+
+        if not row:
+            return {"status": "error", "message": f"Proposal {expression_id} not found"}
+
+        content = (row[0] or "").strip()
+        if not content.startswith("{"):
+            logger.warning("Legacy plain-text proposal %d authorized without proposal_type; marking confirmed", expression_id)
+            session.execute(
+                sql_text("UPDATE expressions SET inference_status = 'confirmed' WHERE id = :eid"),
+                {"eid": expression_id}
+            )
+            session.commit()
+            return {"status": "ok", "expression_id": expression_id, "action": "acknowledged"}
+
+        try:
+            data = json.loads(content)
+        except Exception:
+            logger.warning("Malformed proposal %d JSON; marking confirmed", expression_id)
+            session.execute(
+                sql_text("UPDATE expressions SET inference_status = 'confirmed' WHERE id = :eid"),
+                {"eid": expression_id}
+            )
+            session.commit()
+            return {"status": "ok", "expression_id": expression_id, "action": "acknowledged"}
+
+        proposal_type = data.get("proposal_type")
+        if proposal_type == "operator" or ("operator_template" in data and proposal_type is None):
+            get_operator_registry().authorize(expression_id)
+            return {"status": "ok", "expression_id": expression_id, "action": "authorized"}
+        else:
+            session.execute(
+                sql_text("UPDATE expressions SET inference_status = 'confirmed' WHERE id = :eid"),
+                {"eid": expression_id}
+            )
+            session.commit()
+            return {"status": "ok", "expression_id": expression_id, "action": "acknowledged"}
+
+
+def _handle_defer_proposal(args: dict[str, Any]) -> dict[str, Any]:
+    """Defer a daemon_proposal: set inference_status to 'deferred'."""
+    from sqlalchemy import text as sql_text
+    from audiobench.core.db_session import get_session
+
+    expression_id = int(args["expression_id"])
+    with get_session() as session:
+        session.execute(
+            sql_text("UPDATE expressions SET inference_status = 'deferred' WHERE id = :eid AND source_type = 'daemon_proposal'"),
+            {"eid": expression_id}
+        )
+        session.commit()
+    return {"status": "ok", "expression_id": expression_id, "action": "deferred"}
+
+
+def _handle_reject_proposal(args: dict[str, Any]) -> dict[str, Any]:
+    """Reject a daemon_proposal: set inference_status to 'rejected' without debiting calibration."""
+    from sqlalchemy import text as sql_text
+    from audiobench.core.db_session import get_session
+
+    expression_id = int(args["expression_id"])
+    with get_session() as session:
+        session.execute(
+            sql_text("UPDATE expressions SET inference_status = 'rejected' WHERE id = :eid AND source_type = 'daemon_proposal'"),
+            {"eid": expression_id}
+        )
+        session.commit()
+    return {"status": "ok", "expression_id": expression_id, "action": "rejected"}
 
 
 def _handle_get_inferences(args: dict[str, Any]) -> dict[str, Any]:
@@ -497,25 +582,69 @@ def _handle_get_inferences(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _handle_get_proposals(args: dict[str, Any]) -> dict[str, Any]:
-    """Return pending daemon proposals for the ProposalsFeed panel."""
+    """Return pending daemon proposals for the ProposalsFeed panel or REPL \\proposals."""
     from sqlalchemy import text as sql_text
 
     from audiobench.core.db_session import get_session
 
+    expression_id = args.get("expression_id")
+    include_all = args.get("include_all", False)
+    status_filter = args.get("status")
+
     with get_session() as session:
-        rows = session.execute(
-            sql_text("""
-            SELECT id, source_type, content, created_at
-            FROM expressions
-            WHERE source_type = 'daemon_proposal'
-              AND inference_status IN ('proposed', 'deferred')
-            ORDER BY created_at DESC
-            LIMIT 100
-            """)
-        ).fetchall()
+        if expression_id is not None:
+            rows = session.execute(
+                sql_text("""
+                SELECT id, source_type, content, inference_status, created_at
+                FROM expressions
+                WHERE source_type = 'daemon_proposal'
+                  AND id = :eid
+                LIMIT 1
+                """),
+                {"eid": int(expression_id)},
+            ).fetchall()
+        elif status_filter:
+            rows = session.execute(
+                sql_text("""
+                SELECT id, source_type, content, inference_status, created_at
+                FROM expressions
+                WHERE source_type = 'daemon_proposal'
+                  AND inference_status = :status
+                ORDER BY created_at DESC
+                LIMIT 100
+                """),
+                {"status": status_filter},
+            ).fetchall()
+        elif include_all:
+            rows = session.execute(
+                sql_text("""
+                SELECT id, source_type, content, inference_status, created_at
+                FROM expressions
+                WHERE source_type = 'daemon_proposal'
+                ORDER BY created_at DESC
+                LIMIT 100
+                """)
+            ).fetchall()
+        else:
+            rows = session.execute(
+                sql_text("""
+                SELECT id, source_type, content, inference_status, created_at
+                FROM expressions
+                WHERE source_type = 'daemon_proposal'
+                  AND inference_status IN ('proposed', 'deferred')
+                ORDER BY created_at DESC
+                LIMIT 100
+                """)
+            ).fetchall()
 
     proposals = [
-        {"id": r[0], "source_type": r[1], "content": r[2], "created_at": str(r[3])}
+        {
+            "id": r[0],
+            "source_type": r[1],
+            "content": r[2],
+            "inference_status": r[3],
+            "created_at": str(r[4]),
+        }
         for r in rows
     ]
     return {"proposals": proposals}
@@ -757,6 +886,8 @@ _HANDLERS: dict[str, Any] = {
     "confirm_inference": _handle_confirm_inference,
     "reject_inference": _handle_reject_inference,
     "authorize_proposal": _handle_authorize_proposal,
+    "defer_proposal": _handle_defer_proposal,
+    "reject_proposal": _handle_reject_proposal,
     "get_inferences": _handle_get_inferences,
     "get_proposals": _handle_get_proposals,
     "register_process": _handle_register_process,
@@ -1815,6 +1946,15 @@ def _handle_work_assigned(audio_file_id: int, work_id: int, **kwargs: Any) -> No
             logger.info("Queued %d expressions for work_id=%d reconciliation", len(expr_ids), work_id)
         finally:
             conn.close()
+
+        # Event-driven ingest linking: enqueue chunks for real-time cross-work linking
+        try:
+            from audiobench.memory.graph_linker import enqueue_for_linking
+
+            enqueued = enqueue_for_linking(expr_ids)
+            logger.info("Queued %d expressions for work_id=%d graph linking", enqueued, work_id)
+        except Exception as link_err:
+            logger.warning("Failed to enqueue expressions for linking: %s", link_err)
     except Exception as e:
         logger.error("Failed to queue expressions for reconciliation: %s", e)
 

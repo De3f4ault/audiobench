@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import signal
 import sys
 from pathlib import Path
 
@@ -29,15 +30,20 @@ def _setup_logging() -> logging.Logger:
     log_file = log_dir / "biometric_worker.log"
 
     handler = logging.FileHandler(log_file, encoding="utf-8")
-    handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
+    handler.setFormatter(fmt)
+
+    # Stream to stderr as well so parent process / job runner captures output in job_<id>.log
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setFormatter(fmt)
+
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     root.addHandler(handler)
+    root.addHandler(console_handler)
     return logging.getLogger("biometric_worker")
 
 
@@ -61,14 +67,23 @@ def main() -> int:
 
     logger.info("Biometric worker started for tx #%d (%d segments)", tx_id, len(segment_ids))
 
+    def _sigterm_handler(signum, frame):
+        logger.info("Biometric worker received SIGTERM (preempted by transcription). Exiting cleanly.")
+        sys.exit(0)
+
     try:
+        signal.signal(signal.SIGTERM, _sigterm_handler)
+    except Exception:
+        pass
+
+    try:
+
         from audiobench.security.voiceprint import (
             _load_audio,
             _load_ecapa,
             is_enrolled,
             tag_segments_batch,
         )
-        import numpy as np
 
         if not is_enrolled():
             logger.info("Voiceprint not enrolled — skipping tx #%d", tx_id)
@@ -85,7 +100,69 @@ def main() -> int:
         from audiobench.core.db_session import get_session as db_session
         from audiobench.storage.models import SegmentRecord
 
+        from audiobench.core.settings import get_settings
+        settings = get_settings()
+        n_threads = settings.resolve_indexing_threads()
+        try:
+            import torch
+            torch.set_num_threads(n_threads)
+        except Exception:
+            pass
+
         init_db()
+
+        # ── Worker-Level Firewall Pre-Check ───────────────────────────────────
+        try:
+            from audiobench.media.classifier import classify_media
+            from audiobench.storage.models import AudioFileRecord, TranscriptionRecord
+
+            with db_session() as s:
+                tx_rec = s.get(TranscriptionRecord, tx_id)
+                af_rec = s.get(AudioFileRecord, tx_rec.audio_file_id) if tx_rec and tx_rec.audio_file_id else None
+                meta_dict = {}
+                if af_rec:
+                    try:
+                        meta_dict["tags"] = json.loads(af_rec.tags) if af_rec.tags else {}
+                    except Exception:
+                        meta_dict["tags"] = {}
+                    meta_dict["title"] = af_rec.track_title or af_rec.file_name
+                    meta_dict["genre"] = af_rec.genre
+
+                tags_data = meta_dict.get("tags") or {}
+                is_confirmed = isinstance(tags_data, dict) and (tags_data.get("audiobook") or tags_data.get("user_confirmed"))
+
+                cls_res = classify_media(
+                    file_path=audio_path,
+                    transcript_text=tx_rec.full_text if tx_rec else None,
+                    metadata=meta_dict,
+                    duration_seconds=tx_rec.duration_seconds if tx_rec else 0.0,
+                    explicit_flag=bool(is_confirmed),
+                )
+
+                if cls_res.is_autonomous_bypass:
+                    logger.info(
+                        "Autonomous bypass inside worker for tx #%d: verified audiobook (%s)",
+                        tx_id, ", ".join(cls_res.evidence),
+                    )
+                    if af_rec and isinstance(tags_data, dict):
+                        tags_data["audiobook"] = True
+                        tags_data["user_confirmed"] = True
+                        af_rec.tags = json.dumps(tags_data)
+                        s.commit()
+                    return 0
+
+                if cls_res.category == "class_b_soft_heuristic":
+                    logger.info(
+                        "Class B soft heuristic inside worker for tx #%d: %s — deferring to pending review",
+                        tx_id, cls_res.review_reason,
+                    )
+                    if af_rec and isinstance(tags_data, dict):
+                        tags_data["pending_privacy_review"] = cls_res.review_reason
+                        af_rec.tags = json.dumps(tags_data)
+                        s.commit()
+                    return 0
+        except Exception as exc:
+            logger.debug("Worker firewall check skipped: %s", exc)
 
         waveform, sr = _load_audio(Path(audio_path))
         model = _load_ecapa()
@@ -109,12 +186,20 @@ def main() -> int:
                     ids.append(seg.id)
 
         if ids:
-            tag_segments_batch(ids, slices, sr, model=model)
+            chunk_size = 25
+            total_tagged = 0
+            for i in range(0, len(ids), chunk_size):
+                chunk_ids = ids[i : i + chunk_size]
+                chunk_slices = slices[i : i + chunk_size]
+                tagged = tag_segments_batch(chunk_ids, chunk_slices, sr, model=model)
+                total_tagged += len(tagged)
+
             logger.info(
-                "Biometric pass complete for tx #%d (%d/%d segments classified)",
+                "Biometric pass complete for tx #%d (%d/%d segments classified, %d tagged)",
                 tx_id,
                 len(ids),
                 len(segment_ids),
+                total_tagged,
             )
         else:
             logger.info(

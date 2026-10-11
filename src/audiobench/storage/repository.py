@@ -30,6 +30,23 @@ logger = get_logger("storage.repository")
 class TranscriptionRepository:
     """CRUD operations for transcription persistence."""
 
+    @staticmethod
+    def _copy_with_reflink(src: Path, dst: Path) -> None:
+        """Copy a file, attempting a CoW reflink first to avoid duplicating disk storage."""
+        import subprocess
+        try:
+            res = subprocess.run(
+                ["cp", "--reflink=auto", "--preserve=mode,timestamps", str(src), str(dst)],
+                capture_output=True,
+                check=False,
+            )
+            if res.returncode == 0:
+                return
+        except Exception:
+            pass
+        import shutil
+        shutil.copy2(str(src), str(dst))
+
     def _import_to_library(self, original_path: str, move: bool = False) -> str:
         """Import an audio file into the managed data/library directory.
 
@@ -68,9 +85,9 @@ class TranscriptionRepository:
                         moved_pairs.append((target_path, orig))
                     except OSError as e:
                         logger.warning("Failed to move %s, falling back to copy: %s", orig, e)
-                        shutil.copy2(str(orig), str(target_path))
+                        self._copy_with_reflink(orig, target_path)
                 else:
-                    shutil.copy2(str(orig), str(target_path))
+                    self._copy_with_reflink(orig, target_path)
 
             # Move sidecars alongside the audio file
             for ext in (".cue", ".srt", ".vtt", ".json"):
@@ -107,6 +124,7 @@ class TranscriptionRepository:
         on_phase: object | None = None,
         overwrite: bool = False,
         privacy_tier: int = 0,
+        is_audiobook: bool = False,
     ) -> int:
         """
         Save a complete transcription to the database.
@@ -121,6 +139,7 @@ class TranscriptionRepository:
                           0 = public (default, biometric pass may upgrade).
                           2 = intimate (--sensitive flag, stamps all segments Tier 2
                               regardless of voiceprint match).
+            is_audiobook: If True, marks file as verified audiobook (Class A bypass).
 
         Returns:
             The transcription record ID.
@@ -263,16 +282,80 @@ class TranscriptionRepository:
                 tx_record.id, len(transcript.segments), privacy_tier,
             )
 
-            # ── Background biometric pass ──────────────────────────────────────────
-            # Only run if: voiceprint enrolled AND segments not already manually
-            # stamped at Tier 2 via --sensitive (biometric pass would be redundant).
-            # This is fire-and-forget in a daemon thread so it never blocks the REPL.
+            # ── Media Classification & Biometric Firewall ─────────────────────────
+            # Class A (Hard Proof): Autonomous bypass — no biometric pass needed.
+            # Class B (Soft Heuristic): Ambiguous — deferred to pending review,
+            #                          preventing runaway ECAPA-TDNN CPU burn.
+            # Class C (Generic Audio): Normal path — evaluate voiceprint if enrolled.
             if privacy_tier < 2:
+                from audiobench.media.classifier import classify_media
+
                 audio_path = audio_metadata.file_path if audio_metadata else None
-                tx_id_for_pass = tx_record.id
-                self._schedule_biometric_pass(
-                    saved_segment_ids, audio_path, tx_id_for_pass, run_inline=False
+                meta_dict: dict[str, Any] = {}
+                if audio_record:
+                    try:
+                        meta_dict["tags"] = json.loads(audio_record.tags) if audio_record.tags else {}
+                    except Exception:
+                        meta_dict["tags"] = {}
+                    meta_dict["title"] = audio_record.track_title or audio_record.file_name
+                    meta_dict["genre"] = audio_record.genre
+                elif audio_metadata:
+                    meta_dict["title"] = audio_metadata.file_name
+
+                classification = classify_media(
+                    file_path=audio_path,
+                    transcript=transcript,
+                    metadata=meta_dict,
+                    duration_seconds=transcript.duration_seconds if transcript else 0.0,
+                    explicit_flag=is_audiobook,
                 )
+
+                if classification.is_autonomous_bypass:
+                    if audio_record:
+                        tags_data = meta_dict.get("tags") or {}
+                        if isinstance(tags_data, dict):
+                            tags_data.pop("pending_privacy_review", None)
+                            tags_data["audiobook"] = True
+                            tags_data["classification"] = "class_a"
+                            tags_data["autonomous_bypass"] = True
+                            if is_audiobook:
+                                tags_data["user_confirmed"] = True
+                            audio_record.tags = json.dumps(tags_data)
+                        elif isinstance(tags_data, list):
+                            if "pending_privacy_review" in tags_data:
+                                tags_data.remove("pending_privacy_review")
+                            if "audiobook" not in tags_data:
+                                tags_data.append("audiobook")
+                            audio_record.tags = json.dumps(tags_data)
+                        session.commit()
+                    logger.info(
+                        "Autonomous biometric bypass for tx #%d: verified audiobook (%s)",
+                        tx_record.id,
+                        ", ".join(classification.evidence),
+                    )
+                elif classification.category == "class_b_soft_heuristic":
+                    if audio_record:
+                        tags_data = meta_dict.get("tags") or {}
+                        if isinstance(tags_data, dict):
+                            tags_data["pending_privacy_review"] = classification.review_reason or "likely_audiobook"
+                            tags_data["detected_title"] = classification.detected_title
+                            tags_data["detected_author"] = classification.detected_author
+                            audio_record.tags = json.dumps(tags_data)
+                        elif isinstance(tags_data, list):
+                            if "pending_privacy_review" not in tags_data:
+                                tags_data.append("pending_privacy_review")
+                            audio_record.tags = json.dumps(tags_data)
+                        session.commit()
+                    logger.info(
+                        "Class B soft audiobook heuristic for tx #%d (%s) — tagged pending_privacy_review, skipping biometric flood",
+                        tx_record.id,
+                        classification.review_reason,
+                    )
+                else:
+                    tx_id_for_pass = tx_record.id
+                    self._schedule_biometric_pass(
+                        saved_segment_ids, audio_path, tx_id_for_pass, run_inline=False
+                    )
 
 
 
@@ -303,6 +386,62 @@ class TranscriptionRepository:
         data/logs/biometric_worker.log and are greppable.  If failures accumulate,
         the correct escalation is a biometric_status column + daemon sweep pickup.
         """
+        # ── Universal Media Classification & Firewall ─────────────────────────
+        try:
+            from audiobench.media.classifier import classify_media
+
+            with get_session() as session:
+                tx = session.get(TranscriptionRecord, tx_id)
+                audio_rec = session.get(AudioFileRecord, tx.audio_file_id) if tx and tx.audio_file_id else None
+                meta_dict: dict[str, Any] = {}
+                if audio_rec:
+                    try:
+                        meta_dict["tags"] = json.loads(audio_rec.tags) if audio_rec.tags else {}
+                    except Exception:
+                        meta_dict["tags"] = {}
+                    meta_dict["title"] = audio_rec.track_title or audio_rec.file_name
+                    meta_dict["genre"] = audio_rec.genre
+
+                tags_data = meta_dict.get("tags") or {}
+                is_confirmed = isinstance(tags_data, dict) and (tags_data.get("audiobook") or tags_data.get("user_confirmed"))
+
+                classification = classify_media(
+                    file_path=audio_path,
+                    transcript_text=tx.full_text if tx else None,
+                    metadata=meta_dict,
+                    duration_seconds=tx.duration_seconds if tx else 0.0,
+                    explicit_flag=bool(is_confirmed),
+                )
+
+                if classification.is_autonomous_bypass:
+                    if audio_rec and isinstance(tags_data, dict):
+                        tags_data.pop("pending_privacy_review", None)
+                        tags_data["audiobook"] = True
+                        tags_data["classification"] = "class_a"
+                        tags_data["autonomous_bypass"] = True
+                        audio_rec.tags = json.dumps(tags_data)
+                        session.commit()
+                    logger.info(
+                        "Autonomous biometric bypass for tx #%d: verified audiobook (%s)",
+                        tx_id, ", ".join(classification.evidence),
+                    )
+                    return
+
+                if classification.category == "class_b_soft_heuristic":
+                    if audio_rec and isinstance(tags_data, dict):
+                        tags_data["pending_privacy_review"] = classification.review_reason or "likely_audiobook"
+                        tags_data["detected_title"] = classification.detected_title
+                        tags_data["detected_author"] = classification.detected_author
+                        audio_rec.tags = json.dumps(tags_data)
+                        session.commit()
+                    logger.info(
+                        "Class B soft audiobook heuristic for tx #%d (%s) — tagged pending_privacy_review, skipping biometric flood",
+                        tx_id, classification.review_reason,
+                    )
+                    return
+        except Exception as exc:
+            logger.debug("Firewall pre-check skipped on error: %s", exc)
+
         if run_inline:
             # ── Daemon process path — thread is safe; process lifetime >> thread ──
             import threading
@@ -369,7 +508,6 @@ class TranscriptionRepository:
                 # voiceprint module unavailable (SpeechBrain not installed) — skip silently.
                 return
 
-            import json
             from pathlib import Path
 
             from audiobench.jobs.scheduler import enqueue, ensure_worker
@@ -414,7 +552,7 @@ class TranscriptionRepository:
             tx_record = TranscriptionRecord(
                 audio_file_id=None,
                 source="live",
-                file_name="🎤 Live session",
+                file_name="Live session",
                 full_text=transcript.text,
                 language=transcript.language,
                 language_probability=transcript.language_probability,
@@ -444,9 +582,83 @@ class TranscriptionRepository:
                 "Saved live session #%d (%d segments)", tx_record.id, len(transcript.segments)
             )
 
-
-
             return tx_record.id
+
+    def save_voice_chat_session(
+        self,
+        conversation_id: int,
+        audio_file_path: str | None,
+        turns: list[dict],
+        duration_seconds: float,
+        model_name: str = "gemini-2.5-flash",
+        engine: str = "gemini-live",
+    ) -> tuple[int | None, int, list[int]]:
+        """Save a voice chat session as an audio file, transcription, and segments.
+
+        Returns:
+            Tuple of (audio_file_id, transcription_id, list of segment_ids).
+        """
+        from pathlib import Path
+
+        with get_session() as session:
+            audio_file_id = None
+            if audio_file_path and Path(audio_file_path).exists():
+                p = Path(audio_file_path)
+                audio_rec = AudioFileRecord(
+                    file_path=str(p.resolve()),
+                    file_name=p.name,
+                    file_size_bytes=p.stat().st_size,
+                    format=p.suffix.lstrip(".").lower() or "wav",
+                    duration_seconds=duration_seconds,
+                    sample_rate=16000,
+                    channels=1,
+                )
+                session.add(audio_rec)
+                session.flush()
+                audio_file_id = audio_rec.id
+
+            full_text = "\n".join(t.get("text", "").strip() for t in turns if t.get("text"))
+            word_count = len(full_text.split())
+
+            tx_record = TranscriptionRecord(
+                audio_file_id=audio_file_id,
+                source="voice_chat",
+                file_name=f"Voice Chat #{conversation_id}",
+                full_text=full_text,
+                language="en",
+                language_probability=1.0,
+                engine=engine,
+                model_name=model_name,
+                duration_seconds=duration_seconds,
+                word_count=word_count,
+                segment_count=len(turns),
+                pipeline_phase="complete",
+            )
+            session.add(tx_record)
+            session.flush()
+
+            segment_ids = []
+            for idx, turn in enumerate(turns):
+                seg_record = SegmentRecord(
+                    transcription_id=tx_record.id,
+                    segment_index=idx,
+                    text=turn.get("text", ""),
+                    start_time=turn.get("start_time", 0.0),
+                    end_time=turn.get("end_time", 0.0),
+                    speaker=turn.get("speaker", "User" if turn.get("role") == "user" else "Assistant"),
+                )
+                session.add(seg_record)
+                session.flush()
+                segment_ids.append(seg_record.id)
+
+            session.commit()
+            logger.info(
+                "Saved voice chat session for conv #%d: tx #%d (%d segments)",
+                conversation_id,
+                tx_record.id,
+                len(segment_ids),
+            )
+            return audio_file_id, tx_record.id, segment_ids
 
     def find_by_hash(self, file_hash: str) -> TranscriptionRecord | None:
         """Find an existing transcription by audio file hash (deduplication).
@@ -499,12 +711,12 @@ class TranscriptionRepository:
             results = []
             for rec in records:
                 if rec.file_name:
-                    label = rec.file_name
+                    label = rec.file_name.replace("\U0001f3a4 ", "").replace("\U0001f4e5 ", "Imported: ")
                 elif rec.source == "live":
-                    label = "🎤 Live session"
+                    label = "Live session"
                 elif rec.source == "reimport":
                     audio = rec.audio_file
-                    label = "📥 " + (audio.file_name if audio else "Imported transcript")
+                    label = "Imported: " + (audio.file_name if audio else "transcript")
                 else:
                     audio = rec.audio_file
                     label = audio.file_name if audio else "unknown"
@@ -678,6 +890,7 @@ class TranscriptionRepository:
         query: str,
         limit: int = 10,
         session: "ReplSession | None" = None,
+        community_id: int | None = None,
     ) -> list[dict]:
         """Search transcriptions by text content.
 
@@ -688,6 +901,7 @@ class TranscriptionRepository:
                 Tier 0), text_preview is replaced with "[REDACTED]" for any
                 transcript that contains segments with privacy_tier >= 2.
                 Uses a single EXISTS subquery per result — no N+1 penalty.
+            community_id: Optional community ID to restrict search within a single school.
 
         Returns:
             List of matching transcription dicts.
@@ -699,6 +913,18 @@ class TranscriptionRepository:
 
             tokens = [t.strip() for t in query.split() if t.strip()]
             filters = [TranscriptionRecord.full_text.ilike(f"%{t}%") for t in tokens]
+
+            if community_id is not None:
+                from audiobench.storage.models import ExpressionRecord
+                matching_tids = (
+                    db_session.query(ExpressionRecord.source_id)
+                    .filter(
+                        ExpressionRecord.community_id == community_id,
+                        ExpressionRecord.source_type == "transcription_chunk",
+                    )
+                    .distinct()
+                )
+                filters.append(TranscriptionRecord.id.in_(matching_tids))
 
             records = (
                 db_session.query(TranscriptionRecord)
@@ -794,12 +1020,12 @@ class TranscriptionRepository:
             results = []
             for rec in records:
                 if rec.file_name:
-                    label = rec.file_name
+                    label = rec.file_name.replace("\U0001f3a4 ", "").replace("\U0001f4e5 ", "Imported: ")
                 elif rec.source == "live":
-                    label = "🎤 Live session"
+                    label = "Live session"
                 elif rec.source == "reimport":
                     audio = rec.audio_file
-                    label = "📥 " + (audio.file_name if audio else "Imported transcript")
+                    label = "Imported: " + (audio.file_name if audio else "transcript")
                 else:
                     audio = rec.audio_file
                     label = audio.file_name if audio else "unknown"
@@ -930,12 +1156,12 @@ class TranscriptionRepository:
 
             data = {
                 "id": rec.id,
-                "file_name": rec.file_name
+                "file_name": (rec.file_name.replace("\U0001f3a4 ", "").replace("\U0001f4e5 ", "Imported: ") if rec.file_name else None)
                 or (
-                    "🎤 Live session"
+                    "Live session"
                     if rec.source == "live"
                     else (
-                        "📥 " + (rec.audio_file.file_name if rec.audio_file else "Imported transcript")
+                        "Imported: " + (rec.audio_file.file_name if rec.audio_file else "transcript")
                         if rec.source == "reimport"
                         else (rec.audio_file.file_name if rec.audio_file else "unknown")
                     )
@@ -1523,3 +1749,112 @@ class TranscriptionRepository:
             if rec:
                 rec.failure_reason = "alignment_exhausted"
                 session.commit()
+
+    def get_pending_privacy_reviews(self) -> list[dict[str, Any]]:
+        """Return all audio files currently tagged with pending_privacy_review."""
+        with get_session() as session:
+            records = session.query(AudioFileRecord).all()
+            pending = []
+            for r in records:
+                if not r.tags:
+                    continue
+                try:
+                    data = json.loads(r.tags)
+                except Exception:
+                    continue
+
+                is_pending = False
+                reason = "likely_audiobook"
+                title = r.track_title or r.file_name
+                author = None
+
+                if isinstance(data, dict):
+                    if "pending_privacy_review" in data:
+                        is_pending = True
+                        reason = data.get("pending_privacy_review") or reason
+                        title = data.get("detected_title") or title
+                        author = data.get("detected_author")
+                elif isinstance(data, list):
+                    if "pending_privacy_review" in data:
+                        is_pending = True
+
+                if is_pending:
+                    pending.append({
+                        "id": r.id,
+                        "file_name": r.file_name,
+                        "file_path": r.file_path,
+                        "duration_seconds": r.duration_seconds,
+                        "reason": reason,
+                        "detected_title": title,
+                        "detected_author": author,
+                    })
+            return pending
+
+    def resolve_privacy_review(self, audio_file_id: int, as_audiobook: bool) -> bool:
+        """Resolve a pending privacy review for an audio file.
+
+        If as_audiobook is True:
+          - Marks file as verified audiobook (tags: audiobook=True, user_confirmed=True)
+          - Removes pending_privacy_review
+          - Sets privacy_tier = 0 on all associated transcriptions and segments
+        If as_audiobook is False:
+          - Removes pending_privacy_review
+          - Launches biometric pass if voiceprint is enrolled (since it's a personal/generic file)
+        """
+        with get_session() as session:
+            record = session.get(AudioFileRecord, audio_file_id)
+            if not record:
+                return False
+
+            try:
+                data = json.loads(record.tags) if record.tags else {}
+            except Exception:
+                data = {}
+
+            if isinstance(data, dict):
+                data.pop("pending_privacy_review", None)
+                if as_audiobook:
+                    data["audiobook"] = True
+                    data["user_confirmed"] = True
+                record.tags = json.dumps(data)
+            elif isinstance(data, list):
+                if "pending_privacy_review" in data:
+                    data.remove("pending_privacy_review")
+                if as_audiobook and "audiobook" not in data:
+                    data.append("audiobook")
+                record.tags = json.dumps(data)
+
+            tx_records = session.query(TranscriptionRecord).filter_by(audio_file_id=record.id).all()
+
+            if as_audiobook:
+                for tx in tx_records:
+                    session.query(SegmentRecord).filter_by(transcription_id=tx.id).update(
+                        {"privacy_tier": 0}, synchronize_session=False
+                    )
+                session.commit()
+                logger.info(
+                    "Resolved audio file #%d as Audiobook (Tier 0, user-confirmed)",
+                    audio_file_id,
+                )
+            else:
+                session.commit()
+                # Schedule biometric pass for all segments of this audio file
+                for tx in tx_records:
+                    segs = session.query(SegmentRecord).filter_by(transcription_id=tx.id).all()
+                    seg_ids = [s.id for s in segs]
+                    if seg_ids:
+                        self._schedule_biometric_pass(seg_ids, record.file_path, tx.id, run_inline=False)
+                logger.info(
+                    "Resolved audio file #%d as Generic Audio — queued biometric pass",
+                    audio_file_id,
+                )
+            return True
+
+    def resolve_all_privacy_reviews(self, as_audiobook: bool) -> int:
+        """Batch-resolve all pending privacy reviews."""
+        pending = self.get_pending_privacy_reviews()
+        resolved = 0
+        for item in pending:
+            if self.resolve_privacy_review(item["id"], as_audiobook=as_audiobook):
+                resolved += 1
+        return resolved

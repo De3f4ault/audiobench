@@ -164,8 +164,41 @@ def doctor() -> None:
     checks.append(("piper-tts", "✓" if piper else "–", piper or "not found (optional)"))
 
     # ollama
-    ollama = shutil.which("ollama")
-    checks.append(("ollama", "✓" if ollama else "–", ollama or "not found (optional)"))
+    ollama_bin = shutil.which("ollama")
+    ollama_status = "–"
+    ollama_detail = ollama_bin or "not found (optional)"
+    try:
+        import json
+        import urllib.request
+        from audiobench.core.settings import get_settings
+        settings = get_settings()
+        base_url = getattr(settings, "ollama_base_url", "http://localhost:11434").rstrip("/")
+        req = urllib.request.Request(f"{base_url}/api/tags", headers={"User-Agent": "audiobench-doctor"})
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            models = [m.get("name", "") for m in data.get("models", [])]
+            default_model = getattr(settings, "ollama_model", "gpt-oss:120b-cloud")
+            has_default = default_model in models or any(m.startswith(default_model.split(":")[0]) for m in models)
+            if has_default:
+                ollama_status = "✓"
+                ollama_detail = f"running ({default_model} ready)"
+            else:
+                ollama_status = "✓"
+                ollama_detail = f"running ({len(models)} models, default {default_model} not loaded)"
+    except Exception:
+        if ollama_bin:
+            ollama_status = "–"
+            ollama_detail = f"{ollama_bin} (daemon not running)"
+    checks.append(("ollama", ollama_status, ollama_detail))
+
+    # Gemini API
+    import os
+    gemini_key = getattr(get_settings(), "gemini_api_key", None) or os.environ.get("GEMINI_API_KEY")
+    if gemini_key:
+        masked = f"{gemini_key[:4]}...{gemini_key[-4:]}" if len(gemini_key) > 8 else "configured"
+        checks.append(("Gemini API", "✓", f"API key {masked}"))
+    else:
+        checks.append(("Gemini API", "–", "GEMINI_API_KEY not configured (optional)"))
 
     # CUDA
     try:
@@ -242,10 +275,12 @@ def status() -> None:
         total_count = len(records)
         total_duration = sum(r.get("duration", 0) or 0 for r in records)
         total_words = sum(r.get("word_count", 0) or 0 for r in records)
+        pending_reviews = repo.get_pending_privacy_reviews()
     except Exception:
         total_count = 0
         total_duration = 0
         total_words = 0
+        pending_reviews = []
 
     # Disk usage
     def dir_size(path: Path) -> int:
@@ -275,6 +310,13 @@ def status() -> None:
     table.add_row("Total Audio", f"{hours:.1f} hours")
     table.add_row("Total Words", f"{total_words:,}")
     table.add_row("Database Size", format_size(db_size))
+    if pending_reviews:
+        table.add_row(
+            "Pending Privacy Reviews",
+            f"[bold yellow]{len(pending_reviews)}[/] (run [bold cyan]audiobench review audiobooks[/])",
+        )
+    else:
+        table.add_row("Pending Privacy Reviews", "[dim]0[/]")
 
     # LanceDB stats
     lancedb_size = dir_size(settings.lancedb_path)
@@ -562,7 +604,7 @@ def cleanup(
 
     prefix = "[DRY RUN] " if dry_run else ""
     for action in actions:
-        icon = "👁" if dry_run else "✓"
+        icon = "*" if dry_run else "✓"
         console.print(f"  [{SUCCESS}]{icon}[/] {prefix}{action}")
 
 
