@@ -23,6 +23,7 @@ Responsibilities
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 
@@ -40,6 +41,7 @@ class SearchSessionSweep(IntelligenceTask):
     """Idle-time enrichment task for the search knowledge layer."""
 
     INTERVAL_SECONDS: int = 300  # same cadence as the RAG sweep
+    IS_INFERENCE_TASK: bool = True
 
     # ── Auto-summarize ─────────────────────────────────────────────────
     MIN_QUERIES_FOR_AUTO_SUMMARY: int = 5
@@ -56,13 +58,14 @@ class SearchSessionSweep(IntelligenceTask):
     # ── Embedding dim ──────────────────────────────────────────────────
     EMBED_DIM: int = 768
 
-    async def run(self) -> None:
+    async def run(self) -> int:
         logger.info("SearchSessionSweep: starting run")
         await self._repair_missing_thematic_links()
-        await self._auto_summarize_sessions()
+        summaries = await self._auto_summarize_sessions()
         await self._detect_session_stitching()
         await self._detect_knowledge_gap()
         logger.info("SearchSessionSweep: run complete")
+        return summaries
 
     # ------------------------------------------------------------------
     # 0. Self-healing: repair THEMATIC links missed by prior bug
@@ -252,22 +255,26 @@ class SearchSessionSweep(IntelligenceTask):
 
         if not rows:
             logger.debug("SearchSessionSweep: no sessions need auto-summary")
-            return
+            return 0
 
         logger.info(
             "SearchSessionSweep: auto-summarizing %d sessions", len(rows)
         )
+        summarized_count = 0
 
         for session_id in rows:
             try:
                 await asyncio.get_event_loop().run_in_executor(
                     None, self._generate_and_save_summary, session_id
                 )
+                summarized_count += 1
             except Exception as exc:
                 logger.error(
                     "SearchSessionSweep: auto-summary failed for session %d: %s",
                     session_id, exc,
                 )
+
+        return summarized_count
 
     def _generate_and_save_summary(self, session_id: int) -> None:
         """Synchronous helper: generate summary and save to session_store."""
@@ -519,14 +526,74 @@ class SearchSessionSweep(IntelligenceTask):
         if distance <= self.GAP_DRIFT_THRESHOLD:
             return
 
-        # Emit daemon_proposal
-        content = (
-            f"Knowledge gap detected (distance={distance:.3f}, "
-            f"threshold={self.GAP_DRIFT_THRESHOLD}).\n"
-            f"Your search queries over the last {self.GAP_WINDOW_DAYS} days "
-            f"cluster around topics not well covered by your current audio library.\n"
-            f"Consider ingesting more content aligned with your recent research focus."
+        # Deduplication check: do not emit duplicate if a knowledge_gap proposal is already pending or recently confirmed
+        cooldown_cutoff = time.time() - 7 * 86400  # 7-day cooldown for confirmed proposals
+        with get_session() as session:
+            existing = session.execute(
+                sql_text("""
+                SELECT id FROM expressions
+                WHERE source_type = 'daemon_proposal'
+                  AND created_at >= datetime(:cutoff, 'unixepoch')
+                  AND (
+                      inference_status IN ('proposed', 'deferred')
+                      OR (inference_status = 'confirmed' AND created_at >= datetime(:cooldown, 'unixepoch'))
+                  )
+                  AND (
+                      content LIKE '%"proposal_type": "knowledge_gap"%'
+                      OR content LIKE 'Knowledge gap detected%'
+                  )
+                LIMIT 1
+                """),
+                {"cutoff": cutoff, "cooldown": cooldown_cutoff}
+            ).fetchone()
+            if existing:
+                logger.debug(
+                    "SearchSessionSweep: recent gap proposal already pending or confirmed (#%d) — skipping emission",
+                    existing[0]
+                )
+                return
+
+            # Fetch query texts for top search queries
+            from sqlalchemy import bindparam
+            stmt = sql_text("""
+                SELECT id, content FROM expressions
+                WHERE id IN :ids
+                ORDER BY created_at DESC
+            """).bindparams(bindparam("ids", expanding=True))
+            query_rows = session.execute(stmt, {"ids": list(search_ids[:30])}).fetchall()
+
+        id_to_content = {r[0]: (r[1] or "").strip() for r in query_rows if r[1]}
+        # Find medoid query: the search query whose embedding is closest to search_centroid
+        medoid_id = min(
+            search_vecs.keys(),
+            key=lambda eid: 1.0 - float(np.dot(search_vecs[eid], search_centroid))
         )
+        medoid_text = id_to_content.get(medoid_id, "")
+        query_texts = [id_to_content[eid] for eid in search_ids if eid in id_to_content and id_to_content[eid]]
+
+        from audiobench.daemon.intelligence.gap_naming import name_knowledge_gap
+        title, diagnostic, rec, name_source = name_knowledge_gap(query_texts, medoid_text)
+
+        # Emit DaemonProposalEnvelope
+        envelope = {
+            "proposal_type": "knowledge_gap",
+            "schema_version": 2,
+            "title": title,
+            "summary": f"Query cluster diverges from audio corpus (distance {distance:.3f} > {self.GAP_DRIFT_THRESHOLD:.2f})",
+            "evidence": f"Centroid distance {distance:.3f} vs threshold {self.GAP_DRIFT_THRESHOLD:.2f} over {self.GAP_WINDOW_DAYS} days",
+            "payload": {
+                "distance": distance,
+                "threshold": self.GAP_DRIFT_THRESHOLD,
+                "window_days": self.GAP_WINDOW_DAYS,
+                "diagnostic": diagnostic,
+                "recommended_ingestion": rec,
+                "stranded_queries": query_texts,
+                "name_source": name_source,
+                "medoid_query": medoid_text,
+            },
+        }
+        content = json.dumps(envelope)
+
         try:
             from audiobench.daemon.server import _get_store
             store_obj = _get_store()
@@ -537,8 +604,8 @@ class SearchSessionSweep(IntelligenceTask):
                     inference_status="proposed",
                 )
                 logger.info(
-                    "SearchSessionSweep: knowledge gap proposal emitted (distance=%.4f)",
-                    distance,
+                    "SearchSessionSweep: knowledge gap proposal emitted (distance=%.4f, title='%s', source=%s)",
+                    distance, title, name_source
                 )
         except Exception as exc:
             logger.warning(

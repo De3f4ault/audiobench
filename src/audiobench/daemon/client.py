@@ -370,17 +370,36 @@ class DaemonClient:
         return self._send("reject_inference", {"expression_id": expression_id})
 
     def authorize_proposal(self, expression_id: int) -> dict:
-        """Authorize a daemon proposal to hot-register an operator."""
+        """Authorize a daemon proposal to hot-register an operator or acknowledge advisory."""
         return self._send("authorize_proposal", {"expression_id": expression_id})
+
+    def defer_proposal(self, expression_id: int) -> dict:
+        """Defer a daemon proposal (sets inference_status to 'deferred')."""
+        return self._send("defer_proposal", {"expression_id": expression_id})
+
+    def reject_proposal(self, expression_id: int) -> dict:
+        """Reject a daemon proposal (sets inference_status to 'rejected' without debiting calibration)."""
+        return self._send("reject_proposal", {"expression_id": expression_id})
 
     def get_inferences(self) -> list[dict]:
         """Return proposed system inferences (system_inference, drift_observation, potential_relation)."""
         result = self._send("get_inferences", {})
         return result.get("inferences", []) if result else []
-
-    def get_proposals(self) -> list[dict]:
-        """Return pending daemon proposals (proposed or deferred)."""
-        result = self._send("get_proposals", {})
+    def get_proposals(
+        self,
+        expression_id: int | None = None,
+        include_all: bool = False,
+        status: str | None = None,
+    ) -> list[dict]:
+        """Return pending daemon proposals (proposed or deferred), or specific proposal by ID."""
+        args: dict[str, Any] = {}
+        if expression_id is not None:
+            args["expression_id"] = expression_id
+        if include_all:
+            args["include_all"] = True
+        if status is not None:
+            args["status"] = status
+        result = self._send("get_proposals", args)
         return result.get("proposals", []) if result else []
 
     def register_process(self, name: str, pid: int | None = None) -> None:

@@ -1,7 +1,8 @@
+import json
 from textual.app import ComposeResult
-from textual.containers import Vertical
-from textual.widgets import Static, DataTable
 from textual.binding import Binding
+from textual.containers import Vertical
+from textual.widgets import DataTable, Static
 
 from audiobench.daemon.client import DaemonClient
 
@@ -12,12 +13,11 @@ class ProposalsFeed(Static):
     Polling: refreshes every 10s via the Observatory app's tick.
     Key bindings:
         [a]  Authorize selected proposal → calls DaemonClient.authorize_proposal()
-        [d]  Defer proposal (sets status to 'deferred', no daemon call needed)
-        [r]  Reject selected proposal    → calls DaemonClient.reject_inference()
+        [d]  Defer proposal              → calls DaemonClient.defer_proposal()
+        [r]  Reject selected proposal    → calls DaemonClient.reject_proposal()
 
-    Proposals are rejected via reject_inference() — same path, same status
-    transition ('rejected'). The difference from an inference rejection is
-    semantic (it's a proposal, not an inference), not structural.
+    Proposals are rejected via reject_proposal() without debiting
+    audio inference calibration stats.
     """
 
     BINDINGS = [
@@ -40,7 +40,7 @@ class ProposalsFeed(Static):
 
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
-        table.add_columns("ID", "Status", "Content Preview")
+        table.add_columns("ID", "Type", "Status", "Title / Summary")
         table.cursor_type = "row"
         self._refresh_feed()
 
@@ -61,9 +61,21 @@ class ProposalsFeed(Static):
             self._rows = []
 
         for prop in self._rows:
-            preview = (prop.get("content") or "")[:80].replace("\n", " ")
+            content = (prop.get("content") or "").strip()
+            prop_type = "legacy"
+            preview = content[:80].replace("\n", " ")
+            if content.startswith("{"):
+                try:
+                    data = json.loads(content)
+                    if isinstance(data, dict):
+                        prop_type = data.get("proposal_type", "operator" if "operator_template" in data else "proposal")
+                        preview = data.get("title") or data.get("summary") or preview
+                except Exception:
+                    pass
+
             table.add_row(
                 str(prop["id"]),
+                prop_type,
                 prop.get("inference_status", "proposed"),
                 preview,
                 key=str(prop["id"]),
@@ -77,21 +89,33 @@ class ProposalsFeed(Static):
             self.notify("No proposal selected", severity="warning")
             return
         try:
-            self._client.authorize_proposal(self._selected_id)
-            self.notify(f"Authorized proposal #{self._selected_id} — operator hot-registered", timeout=3)
+            res = self._client.authorize_proposal(self._selected_id)
+            action = res.get("action") if isinstance(res, dict) else "authorized"
+            if action == "authorized":
+                self.notify(f"Authorized proposal #{self._selected_id} — operator hot-registered", timeout=3)
+            else:
+                self.notify(f"Acknowledged proposal #{self._selected_id}", timeout=3)
             self._refresh_feed()
         except Exception as e:
             self.notify(f"Error: {e}", severity="error")
 
     def action_defer_proposal(self) -> None:
-        self.notify("Defer not yet implemented", severity="warning", timeout=2)
+        if self._selected_id is None:
+            self.notify("No proposal selected", severity="warning")
+            return
+        try:
+            self._client.defer_proposal(self._selected_id)
+            self.notify(f"Deferred proposal #{self._selected_id} (30d)", timeout=2)
+            self._refresh_feed()
+        except Exception as e:
+            self.notify(f"Error: {e}", severity="error")
 
     def action_reject_proposal(self) -> None:
         if self._selected_id is None:
             self.notify("No proposal selected", severity="warning")
             return
         try:
-            self._client.reject_inference(self._selected_id)
+            self._client.reject_proposal(self._selected_id)
             self.notify(f"Rejected proposal #{self._selected_id}", timeout=2)
             self._refresh_feed()
         except Exception as e:

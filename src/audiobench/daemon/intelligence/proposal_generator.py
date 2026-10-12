@@ -1,24 +1,34 @@
+import json
 import logging
 import time
-import json
+
 from sqlalchemy import text as sql_text
 
-from .scheduler import IntelligenceTask
-from audiobench.daemon.server import _get_store
 from audiobench.core.db_session import get_session
 from audiobench.daemon.intelligence.calibration import get_calibration_tracker
+from audiobench.daemon.server import _get_store
+
+from .scheduler import IntelligenceTask
 
 logger = logging.getLogger("audiobench.daemon.intelligence.proposal_generator")
 
 class ProposalGenerator(IntelligenceTask):
     INTERVAL_SECONDS = 7 * 86400  # 1 week
+    IS_INFERENCE_TASK = False
 
     async def run(self) -> None:
         logger.info("Running ProposalGenerator...")
+        # Sweep stale pending operator proposals using the grace period guardrail
+        try:
+            from .operator_registry import get_operator_registry
+            get_operator_registry().get_pending_operator_proposals()
+        except Exception as e:
+            logger.warning("ProposalGenerator: error sweeping stale operator proposals: %s", e)
+
         store = _get_store()
         tracker = get_calibration_tracker()
         now = time.time()
-        
+
         with get_session() as session:
             # Check days of data
             earliest_ts = session.execute(
@@ -27,7 +37,7 @@ class ProposalGenerator(IntelligenceTask):
                 WHERE source_type = 'daemon_calibration'
                 """)
             ).scalar()
-            
+
             if earliest_ts is None:
                 return
 
@@ -50,12 +60,12 @@ class ProposalGenerator(IntelligenceTask):
             if days_of_data < 30:
                 logger.info("Not enough calibration data (%d days). Needs >= 30.", days_of_data)
                 return
-            
+
             # Note: Hardcoded to one operator template for Phase 5 tests/stubs
             operator_template = "LectureModeOperator"
-            schema_version = 1
-            parameters_json = json.dumps({"frequency_multiplier": 1.5})
-            
+            schema_version = 2
+            parameters = {"frequency_multiplier": 1.5}
+
             for region_id, stats in tracker.stats.items():
                 if stats.confirm_rate >= 0.70 and stats.total_inferences >= 20:
                     # Check for existing proposal
@@ -69,21 +79,33 @@ class ProposalGenerator(IntelligenceTask):
                         LIMIT 1
                         """),
                         {
-                            "region_like": f"%region {region_id}%",
-                            "op_like": f"%Activate {operator_template}%"
+                            "region_like": f"%{region_id}%",
+                            "op_like": f"%{operator_template}%"
                         }
                     ).fetchone()
-                    
+
                     if existing:
                         continue
-                    
-                    content = (
-                        f"Proposal: Activate {operator_template} for region {region_id}.\n"
-                        f"Evidence: confirm_rate={stats.confirm_rate:.2f} across {stats.total_inferences} inferences over {days_of_data} days.\n"
-                        f"Proposed parameters: {parameters_json}.\n"
-                        f"Schema version: {schema_version}."
+
+                    evidence = (
+                        f"confirm_rate={stats.confirm_rate:.2f} across "
+                        f"{stats.total_inferences} inferences over {days_of_data} days"
                     )
-                    
+                    envelope = {
+                        "proposal_type": "operator",
+                        "schema_version": schema_version,
+                        "title": f"Enable {operator_template} for {region_id}",
+                        "summary": f"Tune runtime frequency ({parameters.get('frequency_multiplier', 1.0)}x) based on {stats.confirm_rate:.0%} confirm rate",
+                        "evidence": evidence,
+                        "payload": {
+                            "region_id": str(region_id),
+                            "operator_template": operator_template,
+                            "parameters": parameters,
+                            "schema_version": schema_version,
+                        },
+                    }
+                    content = json.dumps(envelope)
+
                     try:
                         store.add_expression(
                             source_type="daemon_proposal",

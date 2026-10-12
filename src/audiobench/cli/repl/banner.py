@@ -10,6 +10,8 @@ from audiobench.cli.display.theme import (
     APP_VERSION,
     BOLD,
     DIM,
+    ERROR,
+    WARNING,
     console,
     format_duration,
 )
@@ -55,57 +57,67 @@ def print_full_help(session: ReplSession) -> None:
 
   [{BOLD}]2. Context-aware[/] [{DIM}](current: {ctx_label}{ctx_name})[/]
      When context is set, these auto-fill the transcript ID:
-     [{ACCENT}]show[/]   [{ACCENT}]ask "..."[/]   [{ACCENT}]summarize[/]   \
-[{ACCENT}]vocab[/]   [{ACCENT}]export -f srt[/]
+     [{ACCENT}]show[/]   [{ACCENT}]ask "..."[/]   [{ACCENT}]summarize[/]   [{ACCENT}]vocab[/]   [{ACCENT}]export -f srt[/]
 
-  [{BOLD}]3. Context commands[/] [{DIM}](quick actions on context)[/]
-     [{ACCENT}]\\stats[/]  [{ACCENT}]\\show[/]  [{ACCENT}]\\focus[/]  \
-[{ACCENT}]\\ls[/]
-     [{ACCENT}]\\ask "..."[/]  [{ACCENT}]\\chat[/]  [{ACCENT}]\\summarize[/]  \
-[{ACCENT}]\\search[/]  [{ACCENT}]\\help[/]
+  [{BOLD}]3. Knowledge Graph & Cross-Work Intelligence[/]
+     [{ACCENT}]\\synthesize "topic"[/]       Dialectic synthesis across library via Graph MMR
+     [{ACCENT}]\\suggest[/]                  Next Listen recommendations & bridge discovery
+     [{ACCENT}]\\related[/]                  Explore semantic relatives for focused file
+     [{ACCENT}]\\play cite <n>[/]            Listen to cited segment directly in daemon
+     [{ACCENT}]\\bookmark cite <n>[/]        Save smart bookmark card from synthesis citation
+     [{ACCENT}]\\graph seed[/]               Seed cross-work semantic edges in background
+     [{ACCENT}]\\proposals[/]                Review & authorize daemon proposals (knowledge gaps & operators)
 
-  [{BOLD}]4. Shell Passthrough[/]
-     [{ACCENT}]!ls -la[/]  [{ACCENT}]!pwd[/]  [{ACCENT}]!ffmpeg -i ...[/]
+  [{BOLD}]4. Context & Action Commands[/] [{DIM}](quick actions on context)[/]
+     [{ACCENT}]\\show[/]   [{ACCENT}]\\stats[/]   [{ACCENT}]\\focus[/]   [{ACCENT}]\\ls[/]   [{ACCENT}]\\info[/]
+     [{ACCENT}]\\chat[/]   [{ACCENT}]\\ask "..."[/]   [{ACCENT}]\\summarize[/]   [{ACCENT}]\\search[/]   [{ACCENT}]\\bookmark[/]
 
   [{BOLD}]5. Dot-commands — Semantic Layer[/]
      [{ACCENT}].search[/] [{DIM}]"concept"[/]   LanceDB ANN — cross-source, no LLM
      [{ACCENT}].help[/]               Dot-command reference
 
-  [{BOLD}]6. Search Modes[/]
+  [{BOLD}]6. Search & Synthesis Modes[/]
      [{ACCENT}]\\search[/] [{DIM}]"keyword"[/]  SQLite FTS — instant, exact text
      [{ACCENT}].search[/] [{DIM}]"concept"[/]  LanceDB    — semantic, all sources
-     [{ACCENT}]?[/] [{DIM}]"question"[/]       LLM synthesis — generates answer
+     [{ACCENT}]?[/] [{DIM}]"question"[/]       LLM synthesis — focused transcript
+     [{ACCENT}]\\synthesize[/] [{DIM}]"topic"[/] Knowledge graph — library-wide synthesis
 
   [{BOLD}]7. Shortcuts[/]
      [{ACCENT}]$last[/]  Expands to context ID ({ctx_label})
-     [{ACCENT}]? ...[/]  AI question shorthand: \
-[{ACCENT}]? what are the key points?[/]
+     [{ACCENT}]? ...[/]  AI question shorthand: [{ACCENT}]? what are the key points?[/]
+     [{ACCENT}]!ls -la[/] Shell escape passthrough
 
-  [{BOLD}]8. Meta[/]
-     [{ACCENT}]help[/] [{ACCENT}]/help[/]  This help       \
-[{ACCENT}]/commands[/]  All commands
-     [{ACCENT}]/clear[/]  Clear screen     \
-[{ACCENT}]/context[/]  Show context
-     [{ACCENT}]/exit[/]  Quit             \
-[{ACCENT}]!<cmd>[/]    Shell escape
+  [{BOLD}]8. Help & Meta[/]
+     [{ACCENT}]help[/] [{ACCENT}]/help[/]      REPL overview
+     [{ACCENT}]\\help <cmd>[/]      Detailed command docs & tips (e.g. \\help synthesize)
+     [{ACCENT}]/commands[/]        List all CLI commands
+     [{ACCENT}]/clear[/]           Clear screen
+     [{ACCENT}]/context[/]         Show focused entity
+     [{ACCENT}]/exit[/]            Quit REPL
 """)
 
 
 # Rotating tips — one shown per session (changes daily)
 _TIPS = [
     f"Run commands in the background with [{ACCENT}]transcribe file.mp4 &[/] — stay in the REPL while it processes.",
-    f"Use [{ACCENT}]work <file>[/] to set context on an audio file before transcribing — commands like .play and .info work immediately.",
+    f"Use [{ACCENT}]work <file>[/] to set context on an audio file before transcribing — commands like \\play and \\info work immediately.",
     f"[{ACCENT}]? what were the action items?[/] — the [b]?[/] shorthand routes your question to the current transcript's AI.",
-    f"[{ACCENT}].find 'keyword'[/] jumps to every segment where that word appears, with timestamps.",
-    f"[{ACCENT}].export srt[/] / [b].export json[/] — re-export the current transcript without re-transcribing.",
-    f"[{ACCENT}]/context[/] shows a full summary of the current file and transcript focus.",
-    f"[{ACCENT}].next[/] / [b].prev[/] navigate through your transcription history without leaving the REPL.",
-    f"[{ACCENT}]transcribe --diarize meeting.m4a[/] identifies speakers. Run [b].diarize[/] afterwards to re-run it interactively.",
-    f"[{ACCENT}].edit[/] opens the transcript in $EDITOR — changes are saved back to the database.",
-    f"[{ACCENT}]preset create meeting --model large-v3 --accurate[/] saves your preferred settings as a named preset.",
-    f"[{ACCENT}].chat[/] opens a full conversational AI session over the current transcript.",
-    f"[{ACCENT}].jobs[/] shows all background transcription jobs and their status at a glance.",
+    f"[{ACCENT}]\\search 'keyword'[/] or [{ACCENT}].search 'keyword'[/] searches semantic memory and transcripts.",
+    f"[{ACCENT}]\\show[/] prints the current transcript text directly in the terminal.",
+    f"[{ACCENT}]\\context[/] shows a full summary of the current file and transcript focus.",
+    f"[{ACCENT}]\\focus <id>[/] or [{ACCENT}].use <id>[/] loads any transcript or audio file into the active session.",
+    f"[{ACCENT}]transcribe --diarize meeting.m4a[/] identifies speakers and marks voiceprints.",
+    f"[{ACCENT}]\\related[/] shows semantic connections, works, and expressions linked to the focused file.",
+    f"[{ACCENT}]\\synthesize 'concept'[/] (or [{ACCENT}]\\synth[/]) synthesizes cross-work ideas across your entire library.",
+    f"After [{ACCENT}]\\synthesize[/], use [{ACCENT}]\\play cite 1[/] to listen to the source or [{ACCENT}]\\bookmark cite 1[/] to save it.",
+    f"[{ACCENT}]\\suggest[/] surfaces high-affinity Next Listen paths and triadic consensus connections.",
+    f"Type [{ACCENT}]\\help <command>[/] (e.g. [{ACCENT}]\\help synthesize[/]) for syntax, options, and flywheel tips.",
+    f"preset create meeting --model large-v3 --accurate saves your preferred settings as a named preset.",
+    f"[{ACCENT}]\\chat[/] opens a conversational AI session over the current transcript.",
+    f"[{ACCENT}]\\jobs[/] or [{ACCENT}]jobs[/] shows all background transcription jobs and their status at a glance.",
 ]
+
+
 
 
 def _pick_tip() -> str:
@@ -123,13 +135,19 @@ def print_onboarding(session: ReplSession) -> None:
             # ── Returning user: show recent transcriptions ──
             console.print(f"  [{BOLD}]Recent transcriptions:[/]")
             for r in records:
+                status = r.get("status") or r.get("pipeline_phase") or "complete"
                 duration = r.get("duration", 0) or 0
                 dur_str = format_duration(duration) if duration else "?"
+                if status == "failed":
+                    status_str = f"[{ERROR}]failed (0 words)[/]"
+                elif status in ("transcribing", "queued", "running"):
+                    status_str = f"[{WARNING}]in progress[/]"
+                else:
+                    status_str = f"[{DIM}]{r.get('word_count', 0):>5,} words  {dur_str:>8}[/]"
                 console.print(
                     f"    [{ACCENT}]#{r['id']:<4}[/] "
-                    f"{r.get('file_name', '?'):<30} "
-                    f"[{DIM}]{r.get('word_count', 0):>5,} words "
-                    f" {dur_str:>8}[/]"
+                    f"{r.get('file_name', '?'):<35} "
+                    f"{status_str}"
                 )
             # Quick-start tip: load the most recent file
             most_recent_file = records[0].get("file_name", "<file>")
@@ -159,6 +177,21 @@ def print_onboarding(session: ReplSession) -> None:
             console.print(
                 f"  [{DIM}]Type[/] [{ACCENT}]help[/] [{DIM}]for a full guide, or[/] [{ACCENT}]/commands[/] [{DIM}]to see everything.[/]"
             )
+
+        # Check for pending proposals (shown for both first-run and returning sessions)
+        try:
+            from audiobench.cli.repl.backslash_commands import _fetch_daemon_proposals
+
+            pending_props = _fetch_daemon_proposals()
+            if pending_props:
+                count = len(pending_props)
+                plural = "proposal" if count == 1 else "proposals"
+                console.print(
+                    f"\n  [{BOLD}][{WARNING}]Pending Proposals:[/] [{BOLD}]{count} {plural}[/] "
+                    f"[{DIM}](type[/] [{ACCENT}]\\proposals[/] [{DIM}]to inspect and authorize)[/]"
+                )
+        except Exception:
+            pass
     except Exception:
         console.print(
             f"  [{DIM}]Type[/] [{ACCENT}]help[/] "

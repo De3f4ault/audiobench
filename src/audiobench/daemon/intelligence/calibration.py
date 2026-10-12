@@ -1,11 +1,12 @@
 import json
 import logging
-from collections import deque
 import time
+from collections import deque
+
 from sqlalchemy import text as sql_text
 
-from audiobench.daemon.server import _get_store
 from audiobench.core.db_session import get_session
+from audiobench.daemon.server import _get_store
 
 logger = logging.getLogger("audiobench.daemon.intelligence.calibration")
 
@@ -19,7 +20,7 @@ class RegionStats:
     @property
     def confirm_rate(self) -> float:
         # Laplace smoothing
-        return (self.confirm_count + 1) / (self.confirm_count + self.reject_count + 2)
+        return float((self.confirm_count + 1) / (self.confirm_count + self.reject_count + 2))
 
     def record(self, vote: str, timestamp: float):
         self.total_inferences += 1
@@ -49,10 +50,11 @@ class CalibrationTracker:
                     sql_text("""
                     SELECT content FROM expressions
                     WHERE source_type = 'daemon_calibration'
+                      AND (calibration_key = 'tracker_stats' OR (calibration_key IS NULL AND content LIKE '%"stats"%'))
                     ORDER BY created_at DESC LIMIT 1
                     """)
                 ).fetchone()
-                
+
                 if row and row[0]:
                     data = json.loads(row[0])
                     for k, v in data.get("stats", {}).items():
@@ -62,14 +64,33 @@ class CalibrationTracker:
                             inferences=v.get("inferences", 0),
                             samples=v.get("samples", [])
                         )
+
+                # Bootstrap from confirmed/rejected expressions if no snapshot populated stats
+                if not self.stats:
+                    confirmed_rows = session.execute(
+                        sql_text("""
+                        SELECT e.id, e.inference_status, tx.audio_file_id, e.speaker
+                        FROM expressions e
+                        LEFT JOIN expression_segment_map esm ON e.id = esm.expression_id
+                        LEFT JOIN segments s ON esm.segment_id = s.id
+                        LEFT JOIN transcriptions tx ON s.transcription_id = tx.id
+                        WHERE e.source_type IN ('system_inference', 'drift_observation', 'potential_relation')
+                          AND e.inference_status IN ('confirmed', 'rejected')
+                        """)
+                    ).fetchall()
+                    for eid, status, afid, spk in confirmed_rows:
+                        region = f"{afid or 'unknown'}:{spk or 'all'}"
+                        if region not in self.stats:
+                            self.stats[region] = RegionStats()
+                        self.stats[region].record("confirm" if status == "confirmed" else "reject", 0.0)
         except Exception as e:
             logger.error(f"Failed to load calibration: {e}")
 
-    def _get_region_for_inference(self, expression_id: int) -> str:
+    def _get_region_for_inference(self, expression_id: int) -> str | None:
         with get_session() as session:
             row = session.execute(
                 sql_text("""
-                SELECT tx.audio_file_id, e.speaker
+                SELECT tx.audio_file_id, e.speaker, e.source_type
                 FROM expressions e
                 LEFT JOIN expression_segment_map esm ON e.id = esm.expression_id
                 LEFT JOIN segments s ON esm.segment_id = s.id
@@ -78,15 +99,20 @@ class CalibrationTracker:
                 """),
                 {"eid": expression_id}
             ).fetchone()
-            
+
             if row:
                 audio_file_id = row[0] or "unknown"
-                speaker = row[1] or "all"
+                speaker = row[1] if len(row) > 1 and row[1] else "all"
+                source_type = row[2] if len(row) > 2 else "system_inference"
+                if source_type not in ("system_inference", "drift_observation", "potential_relation"):
+                    return None
                 return f"{audio_file_id}:{speaker}"
-        return "unknown:all"
+            return None
 
     def record_confirm(self, inference_expression_id: int) -> None:
         region = self._get_region_for_inference(inference_expression_id)
+        if region is None:
+            return
         if region not in self.stats:
             self.stats[region] = RegionStats()
         self.stats[region].record("confirm", time.time())
@@ -95,6 +121,8 @@ class CalibrationTracker:
 
     def record_reject(self, inference_expression_id: int) -> None:
         region = self._get_region_for_inference(inference_expression_id)
+        if region is None:
+            return
         if region not in self.stats:
             self.stats[region] = RegionStats()
         self.stats[region].record("reject", time.time())
@@ -123,12 +151,13 @@ class CalibrationTracker:
                     "inferences": v.total_inferences,
                     "samples": list(v.samples_by_timestamp)
                 }
-            
+
             try:
                 store = _get_store()
                 store.add_expression(
                     source_type="daemon_calibration",
-                    content=json.dumps({"stats": stats_dict})
+                    content=json.dumps({"stats": stats_dict}),
+                    calibration_key="tracker_stats",
                 )
             except Exception as e:
                 logger.error(f"Failed to flush: {e}")

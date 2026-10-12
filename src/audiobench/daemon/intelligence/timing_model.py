@@ -1,11 +1,12 @@
 import json
 import logging
-import numpy as np
 from collections import deque
+
+import numpy as np
 from sqlalchemy import text as sql_text
 
-from audiobench.daemon.server import _get_store
 from audiobench.core.db_session import get_session
+from audiobench.daemon.server import _get_store
 
 logger = logging.getLogger("audiobench.daemon.intelligence.timing_model")
 
@@ -45,10 +46,11 @@ class TimingModel:
                     sql_text("""
                     SELECT content FROM expressions
                     WHERE source_type = 'daemon_calibration'
+                      AND (calibration_key = 'timing_stats' OR (calibration_key IS NULL AND content LIKE '%"timing_stats"%'))
                     ORDER BY created_at DESC LIMIT 1
                     """)
                 ).fetchone()
-                
+
                 if row and row[0]:
                     data = json.loads(row[0])
                     for k, v in data.get("timing_stats", {}).items():
@@ -63,7 +65,7 @@ class TimingModel:
         if verb not in self.timers:
             self.timers[verb] = VerbTimer()
         self.timers[verb].record(duration_ms)
-        
+
         self._unflushed_events += 1
         if self._unflushed_events >= 20:
             self._unflushed_events = 0
@@ -72,7 +74,7 @@ class TimingModel:
     def predict_duration(self, verb: str) -> float:
         if verb not in self.timers or self.timers[verb].ema_ms is None:
             return 1000.0
-        return self.timers[verb].ema_ms
+        return float(self.timers[verb].ema_ms)
 
     def get_summary(self) -> dict:
         summary = {}
@@ -92,7 +94,8 @@ class TimingModel:
             store = _get_store()
             store.add_expression(
                 source_type="daemon_calibration",
-                content=json.dumps({"timing_stats": stats_dict})
+                content=json.dumps({"timing_stats": stats_dict}),
+                calibration_key="timing_stats",
             )
         except Exception as e:
             logger.error(f"Failed to flush timing model: {e}")
