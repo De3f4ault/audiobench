@@ -1833,6 +1833,7 @@ async def _serve(socket_path: Path, pid_path: Path) -> None:
     from audiobench.daemon.intelligence.search_session_sweep import SearchSessionSweep
     from audiobench.daemon.intelligence.chapter_embedder import ChapterEmbedder
     from audiobench.daemon.intelligence.work_linker import WorkLinker
+    from audiobench.daemon.intelligence.community_naming import CommunityNamingTask
 
     # Load dynamic operators
     get_operator_registry().load_from_db(_get_store() if _memory_store else None)
@@ -1846,6 +1847,7 @@ async def _serve(socket_path: Path, pid_path: Path) -> None:
     scheduler.register(BlindSpotDetector())
     scheduler.register(ProposalGenerator())
     scheduler.register(SearchSessionSweep())   # search knowledge layer
+    scheduler.register(CommunityNamingTask())  # Schools of Thought LLM naming sweep
     asyncio.create_task(scheduler.run_loop())
 
     from audiobench.memory.graph_linker import drain_pending_links_loop
