@@ -329,7 +329,10 @@ def link_expressions_batch(
                     if db_url.startswith("sqlite:///"):
                         db_p = db_url.replace("sqlite:///", "")
                         with sqlite3.connect(db_p) as c_conn:
-                            assign_incremental(c_conn, valid_src_eids)
+                            affected_eids = set(valid_src_eids)
+                            for edge in edges_to_insert:
+                                affected_eids.add(edge["to_id"])
+                            assign_incremental(c_conn, list(affected_eids))
                 except Exception as inc_err:
                     logger.debug("assign_incremental skipped: %s", inc_err)
 
@@ -358,7 +361,20 @@ def drain_pending_links(batch_size: int = 50) -> IngestLinkResult:
     if not batch_ids:
         return IngestLinkResult(0, 0, 0.0, [])
 
-    return link_expressions_batch(batch_ids)
+    try:
+        return link_expressions_batch(batch_ids)
+    except Exception:
+        # Re-enqueue expressions on transient failure so they are not lost
+        for eid in batch_ids:
+            try:
+                _pending_queue.put_nowait(eid)
+            except queue.Full:
+                logger.warning(
+                    "Failed to re-queue expression %d after linking error: queue full",
+                    eid,
+                )
+        raise
+
 
 
 async def drain_pending_links_loop(poll_interval: float = 2.0) -> None:
@@ -408,14 +424,16 @@ def seed_unlinked_islands(
                 SELECT e.id
                 FROM expressions e
                 WHERE e.source_type = 'audio_transcript'
+                  AND e.graph_role = 'sweep_chunk'
                   AND e.work_id IS NOT NULL
                   AND NOT EXISTS (
-                      SELECT 1 FROM expression_relations r
+                      SELECT 1 FROM expression_relations r INDEXED BY ix_expression_relations_from_expression_id
                       WHERE r.from_expression_id = e.id
                         AND r.relation_type = 'semantic'
                   )
                 ORDER BY e.work_id, e.id
                 LIMIT :limit
+
             """),
             {"limit": limit},
         ).fetchall()

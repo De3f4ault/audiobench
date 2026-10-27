@@ -14,6 +14,7 @@ Enforces the 'last_embedded_at' dirty-flag discipline:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -35,6 +36,7 @@ class ChapterEmbedder(IntelligenceTask):
 
     INTERVAL_SECONDS: int = 300  # Run every 5 minutes during idle window
     BATCH_SIZE: int = 20         # Process up to 20 chapters per cycle to stay within budget
+    IS_INFERENCE_TASK: bool = True
 
     def __init__(self, memory_store: MemoryStore | None = None) -> None:
         self._store = memory_store
@@ -52,21 +54,22 @@ class ChapterEmbedder(IntelligenceTask):
                     logger.debug("ChapterEmbedder: could not obtain MemoryStore: %s", e)
         return self._store
 
-    async def run(self) -> None:
+    async def run(self) -> int:
         """Run chapter embedding cycle."""
-        await asyncio.to_thread(self._run_sync)
+        return await asyncio.to_thread(self._run_sync)
 
-    def _run_sync(self) -> None:
+    def _run_sync(self) -> int:
         store = self._get_store()
         if store is None:
             logger.debug("ChapterEmbedder: MemoryStore unavailable, skipping run")
-            return
+            return 0
 
         with get_session() as session:
             # Query chapters needing embedding
             unembedded = session.execute(
                 sql_text("""
                     SELECT c.id, c.audio_file_id, c.title, c.summary,
+                           c.start_time, c.end_time,
                            af.work_id, w.title as work_title, w.author
                     FROM chapters c
                     JOIN audio_files af ON c.audio_file_id = af.id
@@ -78,16 +81,18 @@ class ChapterEmbedder(IntelligenceTask):
                 {"limit": self.BATCH_SIZE},
             ).fetchall()
 
-            if not unembedded:
-                logger.debug("ChapterEmbedder: no unembedded chapters found")
-                return
+        if not unembedded:
+            logger.debug("ChapterEmbedder: no unembedded chapters found")
+            return 0
 
-            logger.info("ChapterEmbedder: processing %d unembedded chapters", len(unembedded))
+        logger.info("ChapterEmbedder: processing %d unembedded chapters", len(unembedded))
+        embedded_count = 0
 
-            for cid, afid, title, summary, work_id, work_title, author in unembedded:
-                # 1. Gather text content: prefer summary if available, else first ~3000 chars of segments
-                text_content = summary
-                if not text_content:
+        for cid, afid, title, summary, start_time, end_time, work_id, work_title, author in unembedded:
+            # 1. Gather text content: prefer summary if available, else first ~3000 chars of segments
+            text_content = summary
+            if not text_content:
+                with get_session() as session:
                     seg_rows = session.execute(
                         sql_text("""
                             SELECT text FROM segments
@@ -97,27 +102,49 @@ class ChapterEmbedder(IntelligenceTask):
                         {"cid": cid},
                     ).fetchall()
                     combined = " ".join(r[0].strip() for r in seg_rows if r[0])
+                    if not combined:
+                        # Fallback: query segments by audio file and timestamp window if segment.chapter_id is unlinked
+                        time_seg_rows = session.execute(
+                            sql_text("""
+                                SELECT s.text FROM segments s
+                                JOIN transcriptions t ON s.transcription_id = t.id
+                                WHERE t.audio_file_id = :afid
+                                  AND s.start_time >= :start_time
+                                  AND s.start_time < :end_time
+                                ORDER BY s.segment_index ASC
+                            """),
+                            {
+                                "afid": afid,
+                                "start_time": start_time or 0.0,
+                                "end_time": end_time if (end_time and end_time > (start_time or 0.0)) else 1e9,
+                            },
+                        ).fetchall()
+                        combined = " ".join(r[0].strip() for r in time_seg_rows if r[0])
                     if combined:
                         text_content = combined[:3000]
 
-                if not text_content or len(text_content.strip()) < 20:
-                    # Not enough text to embed; mark embedded to avoid infinite loop
+            if not text_content or len(text_content.strip()) < 20:
+                # Not enough text to embed; mark embedded to avoid infinite loop
+                with get_session() as session:
                     session.execute(
                         sql_text("UPDATE chapters SET last_embedded_at = :now WHERE id = :cid"),
                         {"now": datetime.now(UTC), "cid": cid},
                     )
-                    continue
+                    session.commit()
+                continue
 
-                # 2. Build contextual prefix
-                prefix = build_context_prefix(
-                    author=author,
-                    work_title=work_title,
-                    chapter_title=title,
-                )
-                prefixed_content = f"{prefix}{text_content.strip()}"
+            # 2. Build contextual prefix
+            prefix = build_context_prefix(
+                author=author,
+                work_title=work_title,
+                chapter_title=title,
+            )
+            prefixed_content = f"{prefix}{text_content.strip()}"
+            clean_content = text_content.strip()
+            content_hash = hashlib.sha256(clean_content.encode("utf-8")).hexdigest()
 
-                # 3. Create or update expression in SQLite
-                # Check if an expression for this chapter already exists
+            # 3. Quick SQLite write: Create or update expression and commit immediately (<3ms lock)
+            with get_session() as session:
                 existing_expr_id = session.execute(
                     sql_text("""
                         SELECT id FROM expressions
@@ -131,13 +158,14 @@ class ChapterEmbedder(IntelligenceTask):
                     session.execute(
                         sql_text("""
                             INSERT INTO expressions (
-                                content, source_type, source_id, work_id, chapter_id, graph_role, privacy_tier, created_at
+                                content, content_hash, source_type, source_id, work_id, chapter_id, graph_role, privacy_tier, created_at
                             ) VALUES (
-                                :content, 'chapter_summary', :cid, :work_id, :cid, 'sweep_passage', 0, :now
+                                :content, :content_hash, 'chapter_summary', :cid, :work_id, :cid, 'sweep_passage', 0, :now
                             )
                         """),
                         {
-                            "content": text_content.strip(),
+                            "content": clean_content,
+                            "content_hash": content_hash,
                             "cid": cid,
                             "work_id": work_id,
                             "now": datetime.now(UTC),
@@ -149,38 +177,43 @@ class ChapterEmbedder(IntelligenceTask):
                     session.execute(
                         sql_text("""
                             UPDATE expressions
-                            SET content = :content, work_id = :work_id, chapter_id = :cid
+                            SET content = :content, content_hash = :content_hash, work_id = :work_id, chapter_id = :cid
                             WHERE id = :eid
                         """),
                         {
-                            "content": text_content.strip(),
+                            "content": clean_content,
+                            "content_hash": content_hash,
                             "work_id": work_id,
                             "cid": cid,
                             "eid": expr_id,
                         },
                     )
+                session.commit()
 
-                # 4. Embed and write into LanceDB
-                try:
-                    store.write_node(
-                        expression_id=expr_id,
-                        content=prefixed_content,
-                        source_type="chapter_summary",
-                        chapter_id=cid,
-                        chapter_title=title,
-                        author=author,
-                        work_id=work_id,
-                        audio_file_id=afid,
-                    )
-                except Exception as e:
-                    logger.error("ChapterEmbedder: failed to write node for chapter %d: %s", cid, e)
-                    continue
+            # 4. Embed and write into LanceDB (outside any SQLite transaction)
+            try:
+                store.write_node(
+                    expression_id=expr_id,
+                    content=prefixed_content,
+                    source_type="chapter_summary",
+                    chapter_id=cid,
+                    chapter_title=title,
+                    author=author,
+                    work_id=work_id,
+                    audio_file_id=afid,
+                )
+                embedded_count += 1
+            except Exception as e:
+                logger.error("ChapterEmbedder: failed to write node for chapter %d: %s", cid, e)
+                continue
 
-                # 5. Mark chapter dirty flag as clean
+            # 5. Quick SQLite update: Mark chapter dirty flag clean and commit immediately (<1ms lock)
+            with get_session() as session:
                 session.execute(
                     sql_text("UPDATE chapters SET last_embedded_at = :now WHERE id = :cid"),
                     {"now": datetime.now(UTC), "cid": cid},
                 )
+                session.commit()
 
-            session.commit()
-            logger.info("ChapterEmbedder: batch complete")
+        logger.info("ChapterEmbedder: batch complete (%d embedded)", embedded_count)
+        return embedded_count

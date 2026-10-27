@@ -80,6 +80,34 @@ class TestQueueAndDrain:
             enqueued = enqueue_for_linking([1, 2, 3])
             assert enqueued == 0
 
+    def test_drain_requeues_on_failure(self) -> None:
+        """Verify expressions popped during drain are restored to queue if linking fails."""
+        import sqlite3
+        from audiobench.memory.graph_linker import _pending_queue
+
+        # Drain any leftover items first
+        while not _pending_queue.empty():
+            try:
+                _pending_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        enqueue_for_linking([800001, 800002])
+        assert get_pending_queue_size() == 2
+
+        with patch("audiobench.memory.graph_linker.link_expressions_batch") as mock_link:
+            mock_link.side_effect = sqlite3.OperationalError("database is locked")
+            with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                drain_pending_links(batch_size=10)
+
+        # The popped items must be restored to _pending_queue
+        assert get_pending_queue_size() == 2
+        restored_ids = []
+        while not _pending_queue.empty():
+            restored_ids.append(_pending_queue.get_nowait())
+        assert sorted(restored_ids) == [800001, 800002]
+
+
 
 class TestLinkExpressionsBatchMocked:
     def test_empty_input_returns_zero(self) -> None:

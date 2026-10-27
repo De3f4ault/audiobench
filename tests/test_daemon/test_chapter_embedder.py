@@ -114,3 +114,88 @@ def test_chapter_embedder_fallback_to_singleton(monkeypatch):
     store = embedder._get_store()
     assert store is mock_ms
 
+
+def test_chapter_embedder_timestamp_fallback():
+    mock_store = MagicMock()
+    embedder = ChapterEmbedder(memory_store=mock_store)
+
+    with get_session() as session:
+        work = WorkRecord(title="Letters from a Stoic", author="Seneca")
+        session.add(work)
+        session.flush()
+
+        af = AudioFileRecord(
+            file_path="/tmp/seneca_stoic.mp3",
+            file_name="seneca_stoic.mp3",
+            format="mp3",
+            work_id=work.id,
+        )
+        session.add(af)
+        session.flush()
+
+        tx = TranscriptionRecord(
+            audio_file_id=af.id,
+            source="test",
+            full_text="Letters transcript",
+        )
+        session.add(tx)
+        session.flush()
+
+        # Chapter needing embedding (start=50, end=150)
+        chap = ChapterRecord(
+            audio_file_id=af.id,
+            chapter_index=1,
+            title="Letter II: On Discursiveness in Reading",
+            start_time=50.0,
+            end_time=150.0,
+            last_embedded_at=None,
+        )
+        session.add(chap)
+        session.flush()
+
+        # Segment with NO chapter_id, but start_time within chapter window (start=60, end=90)
+        seg = SegmentRecord(
+            transcription_id=tx.id,
+            segment_index=0,
+            text="To be everywhere is to be nowhere. People who spend their whole life traveling end up having plenty of places where they can find hospitality.",
+            start_time=60.0,
+            end_time=90.0,
+            chapter_id=None,  # Unlinked segment
+        )
+        session.add(seg)
+        session.commit()
+
+        tx_id = tx.id
+        chap_id = chap.id
+        work_id = work.id
+        af_id = af.id
+
+    # Run one sync cycle
+    embedded = embedder._run_sync()
+    assert embedded == 1
+
+    # Verify write_node received the unlinked segment text via timestamp recovery
+    assert mock_store.write_node.called
+    kwargs = mock_store.write_node.call_args.kwargs
+    assert kwargs["source_type"] == "chapter_summary"
+    assert kwargs["chapter_id"] == chap_id
+    assert kwargs["author"] == "Seneca"
+    assert "Letter II" in kwargs["content"]
+    assert "To be everywhere is to be nowhere" in kwargs["content"]
+
+    # Verify chapter flag is clean
+    with get_session() as session:
+        updated_chap = session.query(ChapterRecord).filter_by(id=chap_id).first()
+        assert updated_chap.last_embedded_at is not None
+
+        # Cleanup
+        session.delete(seg)
+        session.delete(updated_chap)
+        tx_row = session.query(TranscriptionRecord).filter_by(id=tx_id).first()
+        if tx_row:
+            session.delete(tx_row)
+        session.delete(session.query(AudioFileRecord).filter_by(id=af_id).first())
+        session.delete(session.query(WorkRecord).filter_by(id=work_id).first())
+        session.commit()
+
+
