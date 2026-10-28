@@ -67,8 +67,28 @@ class SearchSlashCompleter(Completer):
                         )
 
 
+def _clean_passage_snippet(content: str, max_chars: int = 50) -> str:
+    """Truncate passage cleanly at a word boundary with quotation marks."""
+    cleaned = " ".join(content.strip().split())
+    if len(cleaned) <= max_chars:
+        return f'"{cleaned}"'
+    truncated = cleaned[:max_chars]
+    last_space = truncated.rfind(" ")
+    if last_space > 20:
+        truncated = truncated[:last_space]
+    truncated = truncated.rstrip(",;:-.?! ")
+    return f'"{truncated}…"'
+
+
 class SearchSemanticCompleter(Completer):
-    """Semantic fragment completions for plain query text (triggered on Tab)."""
+    """Multi-bucket knowledge & semantic completer for plain query text (triggered on Tab).
+
+    Surfaces 4 distinct cognitive tiers:
+      1. [History] Recent past search queries
+      2. [Author] / [Book] Canonical entities from indexed works
+      3. [School] Discovered philosophical communities
+      4. [Passage] Attributed concept passages from the daemon vector index
+    """
 
     _debounce_ms: int = 150
 
@@ -84,39 +104,180 @@ class SearchSemanticCompleter(Completer):
     def get_completions(self, document, complete_event):
         if not getattr(self._state, "autocomplete", True):
             return
-        if self._client is None:
+
+        raw_text = document.text_before_cursor
+        trimmed = raw_text.strip()
+        if raw_text.startswith("/") or len(trimmed) < 2:
             return
-        text = document.text_before_cursor
-        if text.startswith("/") or len(text.strip()) < 3:
-            return
-        self._latest = text
-        time.sleep(self._debounce_ms / 1000.0)
-        if self._latest != text:
-            return
+
+        # Only debounce during continuous typing; Tab requests proceed immediately
+        if not complete_event.completion_requested:
+            self._latest = raw_text
+            time.sleep(self._debounce_ms / 1000.0)
+            if self._latest != raw_text:
+                return
+
+        word = document.get_word_before_cursor(WORD=True)
+        seen_displays: set[str] = set()
+
+        # ── 1. Query History ([History]) ─────────────────────────────────────
         try:
-            results = self._client.autocomplete(text, top_k=6)
-            for r in results:
-                content = r.get("text", "")
-                if not content:
-                    continue
-                clean_content = " ".join(content.split())
-                speaker = r.get("speaker")
-                source_type = r.get("source_type")
-                display = clean_content if len(clean_content) <= 65 else clean_content[:62] + "…"
-                if speaker:
-                    meta = f"[{speaker}]"
-                elif source_type and source_type != "audio_transcript":
-                    meta = f"[{source_type}]"
-                else:
-                    meta = ""
-                yield Completion(
-                    clean_content,
-                    start_position=-len(text),
-                    display=display,
-                    display_meta=f"   {meta}" if meta else "",
-                )
+            from audiobench.core.db_session import get_session
+            from sqlalchemy import text as _sql
+
+            with get_session() as sdb:
+                hist_rows = sdb.execute(
+                    _sql("""
+                        SELECT DISTINCT query_text
+                        FROM search_queries
+                        WHERE query_text LIKE :pattern
+                          AND length(query_text) > 3
+                          AND query_text NOT LIKE '/%'
+                          AND query_text NOT LIKE '\\%'
+                        ORDER BY id DESC
+                        LIMIT 3
+                    """),
+                    {"pattern": f"%{trimmed}%"},
+                ).fetchall()
+
+                for h in hist_rows:
+                    q_text = " ".join(h[0].split())
+                    disp_q = q_text if len(q_text) <= 55 else q_text[:52] + "…"
+                    if disp_q not in seen_displays:
+                        seen_displays.add(disp_q)
+                        yield Completion(
+                            q_text,
+                            start_position=-len(raw_text),
+                            display=disp_q,
+                            display_meta=_pad_meta("[History]"),
+                        )
+
+                # ── 2. Entities: Authors & Works ([Author], [Book]) ──────────
+                target_word = word if len(word) >= 2 else trimmed
+                author_rows = sdb.execute(
+                    _sql("""
+                        SELECT author, count(id) as work_count
+                        FROM works
+                        WHERE author LIKE :pattern
+                          AND author IS NOT NULL
+                        GROUP BY author
+                        ORDER BY work_count DESC
+                        LIMIT 2
+                    """),
+                    {"pattern": f"%{target_word}%"},
+                ).fetchall()
+
+                for a_row in author_rows:
+                    author = a_row[0]
+                    w_cnt = a_row[1]
+                    cnt_label = f" ({w_cnt} works)" if w_cnt > 1 else ""
+                    if author not in seen_displays:
+                        seen_displays.add(author)
+                        start_pos = -len(word) if word else -len(raw_text)
+                        yield Completion(
+                            f'author:"{author}"',
+                            start_position=start_pos,
+                            display=author,
+                            display_meta=_pad_meta(f"[Author]{cnt_label}"),
+                        )
+
+                work_rows = sdb.execute(
+                    _sql("""
+                        SELECT title, author
+                        FROM works
+                        WHERE title LIKE :pattern
+                          AND title IS NOT NULL
+                        ORDER BY id DESC
+                        LIMIT 2
+                    """),
+                    {"pattern": f"%{target_word}%"},
+                ).fetchall()
+
+                for w_row in work_rows:
+                    w_title = w_row[0]
+                    w_author = w_row[1] or "Unknown Author"
+                    disp_title = w_title if len(w_title) <= 45 else w_title[:42] + "…"
+                    author_short = w_author.split()[-1] if w_author else ""
+                    meta_suffix = f" {author_short}" if author_short else ""
+                    if disp_title not in seen_displays:
+                        seen_displays.add(disp_title)
+                        start_pos = -len(word) if word else -len(raw_text)
+                        yield Completion(
+                            f'work:"{w_title}"',
+                            start_position=start_pos,
+                            display=disp_title,
+                            display_meta=_pad_meta(f"[Book]{meta_suffix}"),
+                        )
+
+                # ── 3. Schools of Thought ([School]) ─────────────────────────
+                comm_rows = sdb.execute(
+                    _sql("""
+                        SELECT community_id, name
+                        FROM expression_communities
+                        WHERE name LIKE :pattern
+                        ORDER BY community_id ASC
+                        LIMIT 2
+                    """),
+                    {"pattern": f"%{target_word}%"},
+                ).fetchall()
+
+                for c_row in comm_rows:
+                    cid = c_row[0]
+                    c_name = c_row[1]
+                    disp_name = f"#{cid} {c_name}" if len(c_name) <= 42 else f"#{cid} {c_name[:37]}…"
+                    if disp_name not in seen_displays:
+                        seen_displays.add(disp_name)
+                        start_pos = -len(word) if word else -len(raw_text)
+                        yield Completion(
+                            f"school:{cid}",
+                            start_position=start_pos,
+                            display=disp_name,
+                            display_meta=_pad_meta("[School]"),
+                        )
         except Exception:
             pass
+
+        # ── 4. Attributed Concept Passages ([Passage]) ───────────────────────
+        if self._client is not None:
+            try:
+                results = self._client.autocomplete(trimmed, top_k=4)
+                for r in results:
+                    content = r.get("text", "")
+                    if not content:
+                        continue
+                    clean_content = " ".join(content.split())
+                    disp_snippet = _clean_passage_snippet(clean_content, max_chars=48)
+                    if disp_snippet in seen_displays:
+                        continue
+                    seen_displays.add(disp_snippet)
+
+                    work_title = r.get("work_title")
+                    work_author = r.get("work_author")
+                    speaker = r.get("speaker")
+                    source_type = r.get("source_type")
+
+                    if work_author and work_title:
+                        author_last = work_author.split()[-1] if not work_author.startswith("[") else work_author
+                        short_title = work_title if len(work_title) <= 20 else work_title[:18] + "…"
+                        meta = f"[Passage] {author_last} — {short_title}"
+                    elif work_author:
+                        meta = f"[Passage] {work_author}"
+                    elif speaker:
+                        meta = f"[Passage] {speaker}"
+                    elif source_type and source_type != "audio_transcript":
+                        meta = f"[{source_type}]"
+                    else:
+                        meta = "[Passage]"
+
+                    clean_snippet = disp_snippet.strip('"').rstrip("…")
+                    yield Completion(
+                        f'"{clean_snippet}"',
+                        start_position=-len(raw_text),
+                        display=disp_snippet,
+                        display_meta=_pad_meta(meta),
+                    )
+            except Exception:
+                pass
 
 
 class SearchAutoSuggest(AutoSuggest):

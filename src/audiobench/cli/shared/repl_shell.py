@@ -1,5 +1,8 @@
-import re
+from __future__ import annotations
+
 from pathlib import Path
+import re
+from typing import Any
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory, AutoSuggest
@@ -61,28 +64,28 @@ def make_prompt_session(
     key_bindings = None,
     lexer: Lexer | None = None,
     auto_suggest: AutoSuggest | None = None,
-    complete_while_typing: bool = True,
+    complete_while_typing: bool | Any | None = None,
     slash_completer: Completer | None = None,
 ) -> PromptSession:
     """Build a prompt_toolkit PromptSession configured for a consistent REPL experience.
 
     Features:
-      - Slash-command autocomplete
+      - Adaptive autocomplete (instant on slash commands, Tab-triggered on queries)
       - History tracking
       - Ghost-text auto-suggest
-      - Optional semantic completions
-      - Shared dark-mode popup styles
+      - Multi-bucket semantic completions
+      - Refined dark-mode palette tokens
     """
     history_path.parent.mkdir(parents=True, exist_ok=True)
     
     # Default styling for autocomplete popup and ghost text
     base_style = {
-        "completion-menu":                       "bg:#1e1e1e #cccccc",
-        "completion-menu.completion":            "bg:#1e1e1e #d0d0d0",
-        "completion-menu.completion.current":    "bg:#005f87 #ffffff bold",
-        "completion-menu.meta.completion":       "bg:#1e1e1e #767676",
-        "completion-menu.meta.completion.current": "bg:#005f87 #d0e8f0",
-        "auto-suggestion":                       "#555555",
+        "completion-menu":                       "bg:#141414 #d8d8d8",
+        "completion-menu.completion":            "bg:#141414 #d8d8d8",
+        "completion-menu.completion.current":    "bg:#004f6e #ffffff bold",
+        "completion-menu.meta.completion":       "bg:#141414 #7d8590",
+        "completion-menu.meta.completion.current": "bg:#004f6e #a5f3fc",
+        "auto-suggestion":                       "#4a5568",
     }
     if style_overrides:
         base_style.update(style_overrides)
@@ -91,6 +94,22 @@ def make_prompt_session(
     
     slash = slash_completer or SlashCommandCompleter(slash_commands or [])
     completer = UnifiedCompleter(slash, semantic_completer)
+
+    if complete_while_typing is None:
+        from prompt_toolkit.filters import Condition
+
+        def _should_complete_while_typing() -> bool:
+            try:
+                from prompt_toolkit.application.current import get_app
+                app = get_app()
+                text = app.current_buffer.text_before_cursor
+                return text.lstrip().startswith("/")
+            except Exception:
+                return False
+
+        effective_complete_while_typing = Condition(_should_complete_while_typing)
+    else:
+        effective_complete_while_typing = complete_while_typing
     
     return PromptSession(
         history=FileHistory(str(history_path)),
@@ -100,5 +119,5 @@ def make_prompt_session(
         key_bindings=key_bindings,
         lexer=lexer,
         include_default_pygments_style=False if lexer else True,
-        complete_while_typing=complete_while_typing,
+        complete_while_typing=effective_complete_while_typing,
     )

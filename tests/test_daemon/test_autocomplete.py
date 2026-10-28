@@ -13,10 +13,10 @@ All tests operate against hnswlib directly — no real LanceDB, no real embedder
 MemoryStore is patched so _build_from_store uses injected vectors.
 """
 
+from unittest.mock import patch
+
 import numpy as np
 import pytest
-from unittest.mock import MagicMock, patch
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -107,3 +107,58 @@ def test_lookup_before_build_raises():
 
     with pytest.raises(RuntimeError, match="INDEX_NOT_READY"):
         idx.lookup([0.0] * _DIM, k=3)
+
+
+# ---------------------------------------------------------------------------
+# 4. _handle_autocomplete enriches with work_title and work_author
+# ---------------------------------------------------------------------------
+
+def test_handle_autocomplete_enriches_work_and_author():
+    """_handle_autocomplete must enrich vector hits with work_title and work_author."""
+    from unittest.mock import MagicMock
+    from audiobench.daemon.server import _handle_autocomplete
+
+    mock_index = MagicMock()
+    mock_index.ready = True
+    mock_index.lookup.return_value = [
+        {"expression_id": 101, "text": "Academic psychology discussion"},
+        {"expression_id": 102, "text": "Prior synthesis findings"},
+    ]
+
+    mock_embedder = MagicMock()
+    mock_embedder.encode.return_value = np.zeros(_DIM, dtype=np.float32)
+
+    mock_expr1 = MagicMock(id=101, work_id=13, speaker=None, source_type="audio_transcript")
+    mock_expr2 = MagicMock(id=102, work_id=None, speaker=None, source_type="search_synthesis")
+    mock_repo = MagicMock()
+    mock_repo.get_by_ids.return_value = {101: mock_expr1, 102: mock_expr2}
+
+    mock_work = MagicMock(id=13, title="Poor Charlie's Almanack", author="Charles T. Munger")
+    mock_db = MagicMock()
+    mock_db.query.return_value.filter.return_value.all.return_value = [mock_work]
+    mock_ctx = MagicMock()
+    mock_ctx.__enter__.return_value = mock_db
+    mock_ctx.__exit__.return_value = None
+
+    with patch("audiobench.daemon.autocomplete.get_autocomplete_index", return_value=mock_index), \
+         patch("audiobench.memory.singletons.get_primary_embedder", return_value=mock_embedder), \
+         patch("audiobench.storage.expression_repository.ExpressionRepository", return_value=mock_repo), \
+         patch("audiobench.core.db_session.get_session", return_value=mock_ctx):
+        res = _handle_autocomplete({"prefix": "psychology", "top_k": 2})
+
+    results = res.get("results", [])
+    assert len(results) == 2
+
+    # Audio transcript hit with work metadata
+    r1 = results[0]
+    assert r1["expression_id"] == 101
+    assert r1["work_title"] == "Poor Charlie's Almanack"
+    assert r1["work_author"] == "Charles T. Munger"
+    assert r1["source_type"] == "audio_transcript"
+
+    # Prior synthesis hit with badge author
+    r2 = results[1]
+    assert r2["expression_id"] == 102
+    assert r2["work_author"] == "[Prior Synthesis]"
+    assert r2["source_type"] == "search_synthesis"
+
