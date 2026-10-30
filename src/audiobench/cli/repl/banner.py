@@ -181,13 +181,20 @@ def print_onboarding(session: ReplSession) -> None:
         # Check for pending proposals (shown for both first-run and returning sessions)
         try:
             from audiobench.cli.repl.backslash_commands import _fetch_daemon_proposals
+            from audiobench.daemon.intelligence.proposal_cluster import canonical_cluster_key
 
             pending_props = _fetch_daemon_proposals()
             if pending_props:
-                count = len(pending_props)
-                plural = "proposal" if count == 1 else "proposals"
+                clusters = {}
+                for p in pending_props:
+                    ck = canonical_cluster_key(p.get("content", ""))
+                    clusters.setdefault(ck, []).append(p)
+                cluster_count = len(clusters)
+                total_runs = len(pending_props)
+                plural = "proposal" if cluster_count == 1 else "proposals"
+                runs_note = f" [{DIM}]({total_runs} runs)[/]" if total_runs > cluster_count else ""
                 console.print(
-                    f"\n  [{BOLD}][{WARNING}]Pending Proposals:[/] [{BOLD}]{count} {plural}[/] "
+                    f"\n  [{BOLD}][{WARNING}]Pending Proposals:[/] [{BOLD}]{cluster_count} {plural}[/]{runs_note} "
                     f"[{DIM}](type[/] [{ACCENT}]\\proposals[/] [{DIM}]to inspect and authorize)[/]"
                 )
         except Exception:

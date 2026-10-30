@@ -119,6 +119,12 @@ class ReplSession:
         # Discovered semantic connections from \related
         self.last_related: list[RelatedThought] = []
 
+        # Cited expressions from last synthesis session {1: expr_id1, 2: expr_id2, ...}
+        self.last_synthesis_citations: dict[int, int] = {}
+
+        # Bridges from last bookmark card inspection {1: DialecticBridge, 2: DialecticBridge, ...}
+        self.last_bookmark_bridges: dict[int, Any] = {}
+
     def _get_repo(self):
         """Lazy-init the transcription repository."""
         if self._repo is None:

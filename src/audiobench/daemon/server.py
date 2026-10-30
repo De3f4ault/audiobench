@@ -418,6 +418,16 @@ def _handle_autocomplete(args: dict[str, Any]) -> dict[str, Any]:
         repo = ExpressionRepository()
         expr_map = repo.get_by_ids(expression_ids, session=None)
 
+        work_ids = [expr.work_id for expr in expr_map.values() if expr.work_id is not None]
+        work_map: dict[int, tuple[str | None, str | None]] = {}
+        if work_ids:
+            from audiobench.core.db_session import get_session
+            from audiobench.storage.models import WorkRecord
+            with get_session() as sdb:
+                works = sdb.query(WorkRecord).filter(WorkRecord.id.in_(work_ids)).all()
+                for w in works:
+                    work_map[w.id] = (w.title, w.author)
+
         enriched_results = []
         for r in results:
             expr_id = r.get("expression_id")
@@ -425,6 +435,15 @@ def _handle_autocomplete(args: dict[str, Any]) -> dict[str, Any]:
                 expr = expr_map[expr_id]
                 r["speaker"] = expr.speaker
                 r["source_type"] = expr.source_type
+                r["work_id"] = expr.work_id
+                if expr.work_id and expr.work_id in work_map:
+                    w_title, w_author = work_map[expr.work_id]
+                    r["work_title"] = w_title
+                    r["work_author"] = w_author
+                elif expr.source_type == "search_synthesis":
+                    r["work_author"] = "[Prior Synthesis]"
+                elif expr.source_type == "search_session_summary":
+                    r["work_author"] = "[Past Session]"
                 enriched_results.append(r)
         results = enriched_results
 
@@ -469,8 +488,81 @@ def _handle_reject_inference(args: dict[str, Any]) -> dict[str, Any]:
     return {"status": "ok", "expression_id": expression_id, "action": "rejected"}
 
 
+def _find_cluster_member_ids(session, target_eid: int) -> tuple[list[int], str]:
+    """Find all proposal IDs belonging to the same canonical cluster as target_eid.
+
+    Returns (matching_member_ids, cluster_title).
+    """
+    import json
+    from sqlalchemy import text as sql_text
+    from audiobench.daemon.intelligence.proposal_cluster import canonical_cluster_key
+
+    rows = session.execute(
+        sql_text("SELECT id, content FROM expressions WHERE source_type = 'daemon_proposal'")
+    ).fetchall()
+
+    target_content = None
+    all_proposals = []
+    for r in rows:
+        eid, content = r[0], r[1] or ""
+        all_proposals.append((eid, content))
+        if eid == target_eid:
+            target_content = content
+
+    if target_content is None:
+        return ([target_eid], "")
+
+    target_key = canonical_cluster_key(target_content)
+
+    try:
+        t_data = json.loads(target_content)
+        t_payload = t_data.get("payload", t_data)
+        cluster_title = t_payload.get("title") or t_payload.get("gap_title") or t_data.get("title") or ""
+    except Exception:
+        cluster_title = ""
+
+    matching_ids = []
+    for eid, content in all_proposals:
+        if canonical_cluster_key(content) == target_key:
+            matching_ids.append(eid)
+
+    return (matching_ids or [target_eid], cluster_title)
+
+
+def _update_proposal_statuses(session, member_ids: list[int], status: str) -> None:
+    """Update inference_status for all member IDs in a cluster."""
+    from sqlalchemy import text as sql_text, bindparam
+    if len(member_ids) == 1:
+        session.execute(
+            sql_text("UPDATE expressions SET inference_status = :status WHERE id = :eid AND source_type = 'daemon_proposal'"),
+            {"status": status, "eid": member_ids[0]}
+        )
+    else:
+        session.execute(
+            sql_text("UPDATE expressions SET inference_status = :status WHERE id IN :ids AND source_type = 'daemon_proposal'").bindparams(
+                bindparam("ids", expanding=True)
+            ),
+            {"status": status, "ids": member_ids}
+        )
+    session.commit()
+
+
+def _build_mutation_response(expression_id: int, action: str, member_ids: list[int], cluster_title: str) -> dict[str, Any]:
+    """Construct mutation response dict with optional cascade metadata."""
+    res = {
+        "status": "ok",
+        "expression_id": expression_id,
+        "action": action,
+    }
+    if len(member_ids) > 1:
+        res["cascaded_count"] = len(member_ids)
+        res["member_ids"] = member_ids
+        res["cluster_title"] = cluster_title
+    return res
+
+
 def _handle_authorize_proposal(args: dict[str, Any]) -> dict[str, Any]:
-    """Authorize a daemon_proposal.
+    """Authorize a daemon_proposal (cascading to duplicate runs in the same cluster).
 
     If operator proposal: hot-register operator and mark confirmed.
     If knowledge gap / advisory proposal: mark confirmed in DB and return acknowledged.
@@ -484,6 +576,8 @@ def _handle_authorize_proposal(args: dict[str, Any]) -> dict[str, Any]:
     expression_id = int(args["expression_id"])
 
     with get_session() as session:
+        member_ids, cluster_title = _find_cluster_member_ids(session, expression_id)
+
         row = session.execute(
             sql_text("SELECT content FROM expressions WHERE id = :eid AND source_type = 'daemon_proposal'"),
             {"eid": expression_id}
@@ -495,65 +589,46 @@ def _handle_authorize_proposal(args: dict[str, Any]) -> dict[str, Any]:
         content = (row[0] or "").strip()
         if not content.startswith("{"):
             logger.warning("Legacy plain-text proposal %d authorized without proposal_type; marking confirmed", expression_id)
-            session.execute(
-                sql_text("UPDATE expressions SET inference_status = 'confirmed' WHERE id = :eid"),
-                {"eid": expression_id}
-            )
-            session.commit()
-            return {"status": "ok", "expression_id": expression_id, "action": "acknowledged"}
+            _update_proposal_statuses(session, member_ids, "confirmed")
+            return _build_mutation_response(expression_id, "acknowledged", member_ids, cluster_title)
 
         try:
             data = json.loads(content)
         except Exception:
             logger.warning("Malformed proposal %d JSON; marking confirmed", expression_id)
-            session.execute(
-                sql_text("UPDATE expressions SET inference_status = 'confirmed' WHERE id = :eid"),
-                {"eid": expression_id}
-            )
-            session.commit()
-            return {"status": "ok", "expression_id": expression_id, "action": "acknowledged"}
+            _update_proposal_statuses(session, member_ids, "confirmed")
+            return _build_mutation_response(expression_id, "acknowledged", member_ids, cluster_title)
 
         proposal_type = data.get("proposal_type")
         if proposal_type == "operator" or ("operator_template" in data and proposal_type is None):
             get_operator_registry().authorize(expression_id)
-            return {"status": "ok", "expression_id": expression_id, "action": "authorized"}
+            _update_proposal_statuses(session, member_ids, "confirmed")
+            return _build_mutation_response(expression_id, "authorized", member_ids, cluster_title)
         else:
-            session.execute(
-                sql_text("UPDATE expressions SET inference_status = 'confirmed' WHERE id = :eid"),
-                {"eid": expression_id}
-            )
-            session.commit()
-            return {"status": "ok", "expression_id": expression_id, "action": "acknowledged"}
+            _update_proposal_statuses(session, member_ids, "confirmed")
+            return _build_mutation_response(expression_id, "acknowledged", member_ids, cluster_title)
 
 
 def _handle_defer_proposal(args: dict[str, Any]) -> dict[str, Any]:
-    """Defer a daemon_proposal: set inference_status to 'deferred'."""
-    from sqlalchemy import text as sql_text
+    """Defer a daemon_proposal: set inference_status to 'deferred' across cluster."""
     from audiobench.core.db_session import get_session
 
     expression_id = int(args["expression_id"])
     with get_session() as session:
-        session.execute(
-            sql_text("UPDATE expressions SET inference_status = 'deferred' WHERE id = :eid AND source_type = 'daemon_proposal'"),
-            {"eid": expression_id}
-        )
-        session.commit()
-    return {"status": "ok", "expression_id": expression_id, "action": "deferred"}
+        member_ids, cluster_title = _find_cluster_member_ids(session, expression_id)
+        _update_proposal_statuses(session, member_ids, "deferred")
+    return _build_mutation_response(expression_id, "deferred", member_ids, cluster_title)
 
 
 def _handle_reject_proposal(args: dict[str, Any]) -> dict[str, Any]:
-    """Reject a daemon_proposal: set inference_status to 'rejected' without debiting calibration."""
-    from sqlalchemy import text as sql_text
+    """Reject a daemon_proposal: set inference_status to 'rejected' without debiting calibration across cluster."""
     from audiobench.core.db_session import get_session
 
     expression_id = int(args["expression_id"])
     with get_session() as session:
-        session.execute(
-            sql_text("UPDATE expressions SET inference_status = 'rejected' WHERE id = :eid AND source_type = 'daemon_proposal'"),
-            {"eid": expression_id}
-        )
-        session.commit()
-    return {"status": "ok", "expression_id": expression_id, "action": "rejected"}
+        member_ids, cluster_title = _find_cluster_member_ids(session, expression_id)
+        _update_proposal_statuses(session, member_ids, "rejected")
+    return _build_mutation_response(expression_id, "rejected", member_ids, cluster_title)
 
 
 def _handle_get_inferences(args: dict[str, Any]) -> dict[str, Any]:

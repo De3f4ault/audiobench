@@ -478,3 +478,330 @@ def test_proposals_schema_v2_dual_shapes(repl_session, capsys):
                 if rec:
                     session.delete(rec)
             session.commit()
+
+
+def test_proposals_cluster_deduplication_default_view(repl_session, capsys):
+    """Test that default \\proposals collapses duplicate cluster runs into a single representative row with runs badge."""
+    created_ids = []
+    with get_session() as session:
+        # Create 3 duplicate knowledge gap proposals
+        for i in range(3):
+            rec = ExpressionRecord(
+                content=json.dumps({
+                    "schema_version": 2,
+                    "proposal_type": "knowledge_gap",
+                    "title": "Christian Existential Theology",
+                    "stranded_queries": [
+                        "divine foolishness existentialism",
+                        "paul theology of the cross absurd",
+                    ],
+                }),
+                source_type="daemon_proposal",
+                graph_role="sweep_passage",
+                inference_status="proposed",
+                privacy_tier=0,
+            )
+            session.add(rec)
+            session.flush()
+            created_ids.append(rec.id)
+
+        # Create 1 operator proposal
+        op_rec = ExpressionRecord(
+            content=json.dumps({
+                "proposal_type": "operator",
+                "operator_template": "LectureModeOperator",
+                "title": "Lecture Mode Operator",
+            }),
+            source_type="daemon_proposal",
+            graph_role="sweep_passage",
+            inference_status="proposed",
+            privacy_tier=0,
+        )
+        session.add(op_rec)
+        session.flush()
+        created_ids.append(op_rec.id)
+        session.commit()
+
+    try:
+        cmd_proposals(repl_session, "")
+        out = _read_output(capsys)
+
+        # Knowledge gap cluster should collapse and show 3 runs
+        assert "Christian Existential" in out
+        assert "Theology" in out
+        assert "(3 runs)" in out
+        # Operator proposal should be present as a standalone item without runs badge
+        assert "Lecture Mode Operator" in out
+        assert "Lecture Mode Operator (3 runs)" not in out
+
+        # Representative should be the highest ID among the 3 duplicates
+        highest_kg_id = max(created_ids[:3])
+        assert f"#{highest_kg_id}" in out
+        for older_id in created_ids[:2]:
+            assert f"#{older_id}" not in out
+
+        # Show dossier for representative should display cluster runs metadata
+        cmd_proposals(repl_session, f"show {highest_kg_id}")
+        show_out = _read_output(capsys)
+        assert "Cluster: 3 runs" in show_out
+        assert f"#{created_ids[0]}" in show_out
+        assert f"#{created_ids[1]}" in show_out
+        assert f"#{created_ids[2]}" in show_out
+        assert not has_emojis(out)
+        assert not has_emojis(show_out)
+    finally:
+        with get_session() as session:
+            for eid in created_ids:
+                rec = session.query(ExpressionRecord).filter_by(id=eid).first()
+                if rec:
+                    session.delete(rec)
+            session.commit()
+
+
+def test_proposals_all_escape_hatch(repl_session, capsys):
+    """Test that \\proposals all and \\proposals list all render all raw uncollapsed runs."""
+    created_ids = []
+    with get_session() as session:
+        for i in range(3):
+            rec = ExpressionRecord(
+                content=json.dumps({
+                    "schema_version": 2,
+                    "proposal_type": "knowledge_gap",
+                    "title": "Christian Existential Theology",
+                    "stranded_queries": [
+                        "divine foolishness existentialism",
+                        "paul theology of the cross absurd",
+                    ],
+                }),
+                source_type="daemon_proposal",
+                graph_role="sweep_passage",
+                inference_status="proposed",
+                privacy_tier=0,
+            )
+            session.add(rec)
+            session.flush()
+            created_ids.append(rec.id)
+
+        op_rec = ExpressionRecord(
+            content=json.dumps({
+                "proposal_type": "operator",
+                "operator_template": "LectureModeOperator",
+                "title": "Lecture Mode Operator",
+            }),
+            source_type="daemon_proposal",
+            graph_role="sweep_passage",
+            inference_status="proposed",
+            privacy_tier=0,
+        )
+        session.add(op_rec)
+        session.flush()
+        created_ids.append(op_rec.id)
+        session.commit()
+
+    try:
+        # 1. Test \proposals all
+        cmd_proposals(repl_session, "all")
+        out_all = _read_output(capsys)
+        for eid in created_ids:
+            assert f"#{eid}" in out_all
+        assert not has_emojis(out_all)
+
+        # 2. Test \proposals list all
+        cmd_proposals(repl_session, "list all")
+        out_list_all = _read_output(capsys)
+        for eid in created_ids:
+            assert f"#{eid}" in out_list_all
+        assert not has_emojis(out_list_all)
+    finally:
+        with get_session() as session:
+            for eid in created_ids:
+                rec = session.query(ExpressionRecord).filter_by(id=eid).first()
+                if rec:
+                    session.delete(rec)
+            session.commit()
+
+
+def test_proposals_cluster_key_immune_to_title_drift(repl_session, capsys):
+    """Test that proposals with drifted titles or different providers merge into one cluster by query set."""
+    created_ids = []
+    with get_session() as session:
+        p1 = ExpressionRecord(
+            content=json.dumps({
+                "schema_version": 2,
+                "proposal_type": "knowledge_gap",
+                "title": "Philosophical Integration Gap",
+                "name_source": "llm_gemini",
+                "stranded_queries": [
+                    "Loneliness In Young Men",
+                    "Stoic Resilience  ",
+                ],
+            }),
+            source_type="daemon_proposal",
+            graph_role="sweep_passage",
+            inference_status="proposed",
+            privacy_tier=0,
+        )
+        p2 = ExpressionRecord(
+            content=json.dumps({
+                "schema_version": 2,
+                "proposal_type": "knowledge_gap",
+                "title": "Masculinity, Loneliness & Philosophical Resilience",
+                "name_source": "llm_ollama",
+                "stranded_queries": [
+                    "  loneliness in young men",
+                    "stoic resilience",
+                ],
+            }),
+            source_type="daemon_proposal",
+            graph_role="sweep_passage",
+            inference_status="proposed",
+            privacy_tier=0,
+        )
+        session.add_all([p1, p2])
+        session.flush()
+        created_ids = [p1.id, p2.id]
+        session.commit()
+
+    try:
+        cmd_proposals(repl_session, "list")
+        out = _read_output(capsys)
+
+        # Both records share normalized query set -> must collapse to 1 cluster row with (2 runs)
+        assert "(2 runs)" in out
+        # Representative should be latest (p2.id)
+        assert f"#{created_ids[1]}" in out
+        assert f"#{created_ids[0]}" not in out
+        assert not has_emojis(out)
+    finally:
+        with get_session() as session:
+            for eid in created_ids:
+                rec = session.query(ExpressionRecord).filter_by(id=eid).first()
+                if rec:
+                    session.delete(rec)
+            session.commit()
+
+
+def test_proposals_cascade_mutation_authorize_defer_reject(repl_session, capsys):
+    """Test that defer, authorize, and reject actions cascade across all member proposals in the cluster."""
+    created_ids = []
+    with get_session() as session:
+        for i in range(3):
+            rec = ExpressionRecord(
+                content=json.dumps({
+                    "schema_version": 2,
+                    "proposal_type": "knowledge_gap",
+                    "title": "Christian Existential Theology",
+                    "stranded_queries": [
+                        "faith in absurdity",
+                        "existential dread prayer",
+                    ],
+                }),
+                source_type="daemon_proposal",
+                graph_role="sweep_passage",
+                inference_status="proposed",
+                privacy_tier=0,
+            )
+            session.add(rec)
+            session.flush()
+            created_ids.append(rec.id)
+        session.commit()
+
+    id_a, id_b, id_c = created_ids
+
+    try:
+        # 1. Defer via id_a
+        cmd_proposals(repl_session, f"defer {id_a}")
+        out_defer = _read_output(capsys)
+        norm_defer = " ".join(out_defer.split())
+        assert f"Deferred proposal #{id_a}" in norm_defer
+        assert "(cascaded to 3 duplicate runs in cluster 'Christian Existential Theology')" in norm_defer
+        with get_session() as session:
+            for eid in created_ids:
+                rec = session.query(ExpressionRecord).filter_by(id=eid).first()
+                assert rec.inference_status == "deferred"
+
+        # 2. Authorize via id_b
+        cmd_proposals(repl_session, f"authorize {id_b}")
+        out_auth = _read_output(capsys)
+        norm_auth = " ".join(out_auth.split())
+        assert f"Confirmed proposal #{id_b}" in norm_auth
+        assert "(cascaded to 3 duplicate runs in cluster 'Christian Existential Theology')" in norm_auth
+        with get_session() as session:
+            for eid in created_ids:
+                rec = session.query(ExpressionRecord).filter_by(id=eid).first()
+                assert rec.inference_status == "confirmed"
+
+        # 3. Reject via id_c
+        cmd_proposals(repl_session, f"reject {id_c}")
+        out_rej = _read_output(capsys)
+        norm_rej = " ".join(out_rej.split())
+        assert f"Rejected proposal #{id_c}" in norm_rej
+        assert "(cascaded to 3 duplicate runs in cluster 'Christian Existential Theology')" in norm_rej
+        with get_session() as session:
+            for eid in created_ids:
+                rec = session.query(ExpressionRecord).filter_by(id=eid).first()
+                assert rec.inference_status == "rejected"
+
+        assert not has_emojis(out_defer)
+        assert not has_emojis(out_auth)
+        assert not has_emojis(out_rej)
+    finally:
+        with get_session() as session:
+            for eid in created_ids:
+                rec = session.query(ExpressionRecord).filter_by(id=eid).first()
+                if rec:
+                    session.delete(rec)
+            session.commit()
+
+
+def test_proposals_cascade_calibration_isolation(repl_session, capsys):
+    """Test that cascading a rejection across multiple proposals never debits CalibrationTracker."""
+    created_ids = []
+    with get_session() as session:
+        for i in range(3):
+            rec = ExpressionRecord(
+                content=json.dumps({
+                    "schema_version": 2,
+                    "proposal_type": "knowledge_gap",
+                    "title": "Existential Dread Isolation",
+                    "stranded_queries": [
+                        "dread isolation prayer",
+                    ],
+                }),
+                source_type="daemon_proposal",
+                graph_role="sweep_passage",
+                inference_status="proposed",
+                privacy_tier=0,
+            )
+            session.add(rec)
+            session.flush()
+            created_ids.append(rec.id)
+        session.commit()
+
+    id_target = created_ids[0]
+
+    try:
+        mock_calib = MagicMock()
+        with patch("audiobench.daemon.intelligence.calibration.get_calibration_tracker", return_value=mock_calib):
+            cmd_proposals(repl_session, f"reject {id_target}")
+            out = _read_output(capsys)
+
+        norm_out = " ".join(out.split())
+        assert f"Rejected proposal #{id_target}" in norm_out
+        assert "(cascaded to 3 duplicate runs in cluster 'Existential Dread Isolation')" in norm_out
+        # Must strictly never call record_reject
+        mock_calib.record_reject.assert_not_called()
+
+        with get_session() as session:
+            for eid in created_ids:
+                rec = session.query(ExpressionRecord).filter_by(id=eid).first()
+                assert rec.inference_status == "rejected"
+
+        assert not has_emojis(out)
+    finally:
+        with get_session() as session:
+            for eid in created_ids:
+                rec = session.query(ExpressionRecord).filter_by(id=eid).first()
+                if rec:
+                    session.delete(rec)
+            session.commit()

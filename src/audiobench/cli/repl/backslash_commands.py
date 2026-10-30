@@ -15,12 +15,18 @@ To add a new \\command, decorate a function here:
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable
+
+logger = logging.getLogger("audiobench.cli.repl.backslash_commands")
+
 
 from audiobench.cli.display.theme import (
     ACCENT,
     BOLD,
+    BOX_STYLE,
     DIM,
+    ERROR,
     SUCCESS,
     WARNING,
     console,
@@ -128,6 +134,60 @@ def cmd_stack(session: ReplSession, args: str) -> None:
 # ── Focus ────────────────────────────────────────────────────
 
 
+def _focus_bridge(session: ReplSession, bridge: Any, idx: int) -> None:
+    """Switch focus to the work or audio file represented by a dialectic bridge."""
+    from audiobench.cli.repl.dispatch import print_context_summary
+    from audiobench.core.db_session import get_session
+    from audiobench.core.focused_entity import FocusedEntity
+    from sqlalchemy import text as _sql
+
+    with get_session() as session_db:
+        row = session_db.execute(
+            _sql("""
+                SELECT e.id, e.work_id, w.title, w.author,
+                       COALESCE(t.audio_file_id, c.audio_file_id, c2.audio_file_id) as audio_file_id,
+                       COALESCE(af_t.file_name, af_c.file_name, af_c2.file_name) as file_name
+                FROM expressions e
+                LEFT JOIN transcriptions t ON (e.source_type IN ('audio_transcript', 'transcription_chunk') AND e.source_id = t.id)
+                LEFT JOIN audio_files af_t ON t.audio_file_id = af_t.id
+                LEFT JOIN chapters c ON (e.source_type = 'chapter_summary' AND e.source_id = c.id)
+                LEFT JOIN audio_files af_c ON c.audio_file_id = af_c.id
+                LEFT JOIN chapters c2 ON (e.chapter_id IS NOT NULL AND e.chapter_id = c2.id)
+                LEFT JOIN audio_files af_c2 ON c2.audio_file_id = af_c2.id
+                LEFT JOIN works w ON e.work_id = w.id
+                WHERE e.id = :eid
+            """),
+            {"eid": bridge.target_expression_id},
+        ).fetchone()
+
+        if row and row[4]:
+            af_id, f_name = row[4], row[5] or bridge.work_title
+            session.focus = FocusedEntity(
+                type="file",
+                id=af_id,
+                label=f_name,
+            )
+        elif row and row[1]:
+            wid, wtitle = row[1], row[2] or bridge.work_title
+            session.focus = FocusedEntity(
+                type="work",
+                id=wid,
+                label=f"Work: {wtitle}",
+            )
+        else:
+            session.focus = FocusedEntity(
+                type="expression",
+                id=bridge.target_expression_id,
+                label=f"{bridge.author} — {bridge.work_title}",
+            )
+
+    console.print(
+        f"  [{SUCCESS}]Focus switched to dialectic bridge [B{idx}]:[/] [{ACCENT}]{bridge.author} — {bridge.work_title}[/] "
+        f"[{DIM}](Expression #{bridge.target_expression_id})[/]"
+    )
+    print_context_summary(session)
+
+
 @register_backslash("focus")
 def cmd_focus(session: ReplSession, args: str) -> None:
     """Focus on an audio file by ID, or show the current focus."""
@@ -153,6 +213,23 @@ def cmd_focus(session: ReplSession, args: str) -> None:
 
     init_db()
 
+    # Support \focus b1, \focus b2, \focus bridge 1 (Dialectic Bridges from Bookmark card)
+    lower_arg = arg.lower()
+    b_num: int | None = None
+    if lower_arg.startswith("b") and lower_arg[1:].isdigit():
+        b_num = int(lower_arg[1:])
+    elif lower_arg.startswith("bridge") and lower_arg[6:].strip().isdigit():
+        b_num = int(lower_arg[6:].strip())
+
+    if b_num is not None:
+        bridges = getattr(session, "last_bookmark_bridges", {})
+        if b_num not in bridges:
+            console.print(f"  [{WARNING}]Dialectic bridge [B{b_num}] not found. Run \\bookmark to view bridges.[/]")
+            return
+        bridge = bridges[b_num]
+        _focus_bridge(session, bridge, b_num)
+        return
+
     # Support \focus w12
     if arg.lower().startswith("w") and arg[1:].isdigit():
         work_id = int(arg[1:])
@@ -165,6 +242,33 @@ def cmd_focus(session: ReplSession, args: str) -> None:
                 type="work",
                 id=work.id,
                 label=f"Work: {work.title}"
+            )
+            print_context_summary(session)
+        return
+
+    # Support \focus s12 or \focus school:12
+    school_id: int | None = None
+    if lower_arg.startswith("school:") and lower_arg[7:].isdigit():
+        school_id = int(lower_arg[7:])
+    elif lower_arg.startswith("s") and lower_arg[1:].isdigit():
+        school_id = int(lower_arg[1:])
+
+    if school_id is not None:
+        from sqlalchemy import text as _sql
+        with get_session() as session_db:
+            row = session_db.execute(
+                _sql("SELECT name FROM expression_communities WHERE community_id = :cid"),
+                {"cid": school_id},
+            ).fetchone()
+            if not row:
+                console.print(f"  [{WARNING}]School #{school_id} not found.[/]")
+                return
+            school_name = row[0]
+            short_name = school_name if len(school_name) <= 35 else school_name[:32] + "..."
+            session.focus = FocusedEntity(
+                type="school",
+                id=school_id,
+                label=f"School #{school_id}: {short_name}",
             )
             print_context_summary(session)
         return
@@ -192,9 +296,9 @@ def cmd_focus(session: ReplSession, args: str) -> None:
             print_context_summary(session)
         return
 
-    if arg.isdigit() and getattr(session, "last_related", None):
+    if arg.isdigit():
         idx = int(arg)
-        if 1 <= idx <= len(session.last_related):
+        if getattr(session, "last_related", None) and 1 <= idx <= len(session.last_related):
             thought = session.last_related[idx - 1]
             if thought.audio_file_id:
                 session.focus = FocusedEntity(
@@ -213,6 +317,10 @@ def cmd_focus(session: ReplSession, args: str) -> None:
                 f"[{DIM}](Transcript #{thought.transcript_id})[/]"
             )
             print_context_summary(session)
+            return
+        elif getattr(session, "last_bookmark_bridges", None) and idx in session.last_bookmark_bridges:
+            bridge = session.last_bookmark_bridges[idx]
+            _focus_bridge(session, bridge, idx)
             return
 
     file_id = int(arg)
@@ -260,6 +368,64 @@ def cmd_unfocus(session: ReplSession, args: str) -> None:
     label = session.focus.display_label
     session.focus = None
     console.print(f"  [{DIM}]Focus cleared ({label}).[/]")
+
+
+@register_backslash("context")
+def cmd_context(session: ReplSession, args: str) -> None:
+    """Display active entity focus, navigation frame stack, and playback context."""
+    from audiobench.cli.repl.dispatch import print_context_summary
+
+    if session.focus:
+        print_context_summary(session)
+    else:
+        console.print(f"  [{DIM}]No context set. Use \\focus <id|file> or transcribe a file.[/]")
+
+
+@register_backslash("scope")
+def cmd_scope(session: ReplSession, args: str) -> None:
+    """Scope REPL search, synthesis, and playback to an intellectual school or work.
+
+    Usage:
+      \\scope school:<id>   Scope to School #<id> (e.g. \\scope school:12 or \\scope s12)
+      \\scope work:<id>     Scope to Work #<id>   (e.g. \\scope work:5 or \\scope w5)
+      \\scope clear         Clear current scope
+      \\scope               Display active scope summary
+    """
+    from audiobench.cli.repl.dispatch import print_context_summary
+
+    arg = args.strip()
+    if not arg:
+        if session.focus:
+            print_context_summary(session)
+        else:
+            console.print(
+                f"  [{DIM}]No active scope.[/]  "
+                f"Use [{ACCENT}]\\scope school:<id>[/] or [{ACCENT}]\\scope work:<id>[/] to scope context."
+            )
+        return
+
+    lower = arg.lower()
+    if lower in ("clear", "reset", "none", "off"):
+        cmd_unfocus(session, "")
+        return
+
+    if lower.startswith("school:") or lower.startswith("s"):
+        raw_id = lower.removeprefix("school:").removeprefix("s")
+        if raw_id.isdigit():
+            cmd_focus(session, f"s{raw_id}")
+            return
+
+    if lower.startswith("work:") or lower.startswith("w"):
+        raw_id = lower.removeprefix("work:").removeprefix("w")
+        if raw_id.isdigit():
+            cmd_focus(session, f"w{raw_id}")
+            return
+
+    console.print(
+        f"  [{WARNING}]Unknown scope target: '{arg}'[/]\n"
+        f"  [{DIM}]Usage: \\scope <school:<id>|s<id>|work:<id>|w<id>|clear>[/]"
+    )
+
 
 
 # ── View ─────────────────────────────────────────────────────
@@ -374,15 +540,18 @@ def cmd_search(session: ReplSession, args: str) -> None:
 
     init_db()
     repo = TranscriptionRepository()
-    results = repo.search(query, limit=limit, session=session)
+    cid = session.focus.id if (session.focus and session.focus.type == "school") else None
+    results = repo.search(query, limit=limit, session=session, community_id=cid)
 
     if not results:
-        console.print(f"  [{DIM}]No results for \"{query}\"[/]")
+        scope_note = f" in {session.focus.label}" if cid else ""
+        console.print(f"  [{DIM}]No results for \"{query}\"{scope_note}[/]")
         console.print(f"  [{DIM}]Try [{ACCENT}].search \"{query}\"[/] for semantic search.[/]")
         return
 
     # Display results
-    console.print(f"\n  [{BOLD}]Text Search — SQLite FTS5[/]  [{DIM}]\"{query}\"[/]")
+    scope_badge = f"  [{ACCENT}]‹Scoped to {session.focus.label}›[/]" if cid else ""
+    console.print(f"\n  [{BOLD}]Text Search — SQLite FTS5[/]  [{DIM}]\"{query}\"[/]{scope_badge}")
     console.print(f"  [{DIM}]{'─' * 50}[/]")
     for i, r in enumerate(results, 1):
         file_name = r.get("file_name", f"Transcript #{r.get('id', '?')}")
@@ -543,6 +712,27 @@ def cmd_chat(session: ReplSession, args: str) -> None:
         return
 
     if not target_ids and not raw:
+        if session.focus and session.focus.type == "school":
+            from audiobench.core.db_session import get_session
+            from sqlalchemy import text as _sql
+            with get_session() as sdb:
+                rows = sdb.execute(
+                    _sql("""
+                        SELECT DISTINCT e.source_id 
+                        FROM expressions e 
+                        WHERE e.community_id = :cid AND e.source_type = 'transcription_chunk' AND e.source_id IS NOT NULL
+                        LIMIT 15
+                    """),
+                    {"cid": session.focus.id},
+                ).fetchall()
+                school_tids = [r[0] for r in rows if r[0] is not None]
+            if school_tids:
+                console.print(
+                    f"  [{SUCCESS}]✦ Seeding chat session with {len(school_tids)} transcripts from {session.focus.label}...[/]"
+                )
+                dispatch_command(session, ["chat", *[str(tid) for tid in school_tids]])
+                return
+
         console.print(f"  [{DIM}]No focused transcript. Use [{ACCENT}]\\focus <id>[/][/]")
         return
 
@@ -689,44 +879,224 @@ def cmd_capture(session: ReplSession, args: str) -> None:
 # ── Help ─────────────────────────────────────────────────────
 
 
+# ── Help ─────────────────────────────────────────────────────
+
+_COMMAND_DOCS: dict[str, dict[str, Any]] = {
+    "synthesize": {
+        "title": "Synthesize (Dialectic Graph MMR)",
+        "aliases": ["synth"],
+        "syntax": "\\synthesize <thematic query or philosophical question>",
+        "summary": "Synthesize cross-library perspectives using Graph-Augmented MMR and local LLM.",
+        "description": (
+            "Executes Blended-Relevance Graph MMR (α=0.60, λ=0.55) to surface non-redundant, "
+            "author-diverse perspectives from across your library. Traverses cross-work semantic "
+            "bridges (w ≥ 0.78) and detects Triadic Cliques (+0.10 boost). Generates structured "
+            "Points of Convergence vs Divergence with inline bracketed citations [1], [2], [3]."
+        ),
+        "examples": [
+            "\\synthesize How does guilt lead to self-deception and breakdown?",
+            "\\synth What is the relationship between suffering and spiritual growth?",
+        ],
+        "flywheel": "After synthesis, run \\play cite 1 to listen, or \\bookmark cite 1 to view the smart card.",
+    },
+    "bookmark": {
+        "title": "Smart Contextual Bookmarking",
+        "aliases": ["bm"],
+        "syntax": "\\bookmark [id | cite <n> | list]",
+        "summary": "Two-tiered smart contextual bookmark cards (Narrative Arc + Dialectic Bridges).",
+        "description": (
+            "Generates rich two-tiered contextual bookmark cards:\n"
+            "  • Tier 1 (The Narrative Arc): Local premise and resolution (|t1 - t2| ≥ 90s) within the same work.\n"
+            "  • Tier 2 (Cross-Library Dialectic): High-confidence semantic bridges (w ≥ 0.78) to other thinkers.\n"
+            "  • Consensus Triangle: Automatically highlights 3-cliques connecting mutual authors."
+        ),
+        "examples": [
+            "\\bookmark cite 1          (Inspect smart card for synthesis citation [1])",
+            "\\bookmark 45955           (Generate card directly for Expression #45955)",
+            "\\bookmark list            (List all saved bookmarks)",
+        ],
+        "flywheel": "Run \\play cite 1 to listen, or \\synthesize <concept> to bridge ideas.",
+    },
+    "related": {
+        "title": "Related Fragments & Bridges",
+        "aliases": [],
+        "syntax": "\\related",
+        "summary": "Explore cross-work semantic bridges and in-core HNSW connections for the focused work.",
+        "description": (
+            "Surfaces conceptual relatives for the currently active transcript in ~28ms:\n"
+            "  • Priority 1: Bidirectional Knowledge Graph traversal with strict work isolation (e2.work_id != curr_wid).\n"
+            "  • Priority 2: In-Core HNSW island fallback for unlinked chapters.\n"
+            "Stores discovered relations in session memory for instant follow-up actions."
+        ),
+        "examples": [
+            "\\related                  (Explore relatives for current transcript)",
+            "\\play 2                  (Listen to the second surfaced relative)",
+        ],
+        "flywheel": "Type \\play <id> to listen, or \\chat to open a discussion.",
+    },
+    "suggest": {
+        "title": "Next Listen & Command Suggestions",
+        "aliases": [],
+        "syntax": "\\suggest [commands | history]",
+        "summary": "Next Listen recommendations powered by knowledge graph & triadic consensus, or command shortcuts.",
+        "description": (
+            "When a work or chapter is focused, analyzes outbound cross-work semantic edges to recommend "
+            "what to listen to next in your library. Detects Triadic Consensus (3-cliques) and displays "
+            "the ▲ Consensus badge. If no work is focused or when explicitly invoked, displays frequent "
+            "command habits from the command graph."
+        ),
+        "examples": [
+            "\\suggest                  (Next Listen recommendations for current work)",
+            "\\suggest commands         (Show frequent action shortcuts)",
+        ],
+        "flywheel": "Type \\play <id> to start listening to a recommended work.",
+    },
+    "graph": {
+        "title": "Knowledge Graph & Seeding",
+        "aliases": [],
+        "syntax": "\\graph [seed [limit] | <days>]",
+        "summary": "Seed unlinked islands in the knowledge graph or view command stats.",
+        "description": (
+            "\\graph seed [limit] scans expressions across your library and forms cross-work semantic edges "
+            "in-memory at >1,300 chunks/second. Strict work isolation prevents intra-book contamination.\n"
+            "\\graph [days] displays command usage frequency over the specified window."
+        ),
+        "examples": [
+            "\\graph seed 2500         (Seed up to 2,500 unlinked chunks into the KG)",
+            "\\graph 30                (Show command stats for last 30 days)",
+        ],
+        "flywheel": "After seeding, run \\related or \\suggest to discover newly formed connections.",
+    },
+    "play": {
+        "title": "Audio Playback & Seeking",
+        "aliases": [],
+        "syntax": "\\play [file | transcript_id | cite <n> | pause | resume | stop]",
+        "summary": "Play back audio files, transcripts, or synthesis citations.",
+        "description": (
+            "Controls local audio playback via the background daemon:\n"
+            "  • \\play cite <n>: Plays exact segment timestamp for a synthesis citation [n].\n"
+            "  • \\play <id>: Plays transcript #id from start or current position.\n"
+            "  • \\play pause / resume / stop: Playback state management."
+        ),
+        "examples": [
+            "\\play cite 1             (Play synthesis citation [1] at exact timestamp)",
+            "\\play 592                (Play transcript #592)",
+            "\\play pause              (Pause playback)",
+        ],
+        "flywheel": "While listening, type \\bookmark to save a smart card for this passage.",
+    },
+    "workflow": {
+        "title": "Command Workflows",
+        "aliases": [],
+        "syntax": "\\workflow <save|list|run|delete|show> [name]",
+        "summary": "Capture and replay sequences of REPL commands.",
+        "description": (
+            "Enables macros and automations by saving recent interactive commands as named workflows."
+        ),
+        "examples": [
+            "\\workflow save study     (Save recent commands as 'study')",
+            "\\workflow run study      (Replay the 'study' workflow)",
+            "\\workflow list           (List all saved workflows)",
+        ],
+        "flywheel": "Combine with \\suggest to see suggested workflow steps.",
+    },
+}
+
+
 @register_backslash("help")
 def cmd_help(session: ReplSession, args: str) -> None:
-    """Show available backslash commands."""
-    console.print(f"\n  [{BOLD}]AudioBench Shell[/]\n")
-    console.print(f"  [{DIM}]Three execution contexts, one prompt:[/]\n")
+    """Show available backslash commands or detailed help for a specific command."""
+    target = args.strip().lower().lstrip("\\").lstrip("/")
+    if target:
+        if target in ("synth",):
+            target = "synthesize"
+        elif target in ("bm",):
+            target = "bookmark"
 
-    console.print(f"  [{ACCENT}]\\[/][{DIM}]command[/]   — local, instant (SQLite)")
-    console.print(f"  [{DIM}]?[/] question  — AI/semantic (requires focus)")
-    console.print(f"  [yellow]![/][{DIM}]command[/]   — OS shell passthrough")
-    console.print(f"  [{DIM}]bare text  — implicit ask (requires focus)[/]\n")
+        doc = _COMMAND_DOCS.get(target)
+        if doc:
+            console.print(f"\n  [{BOLD}][{ACCENT}]\\{target}[/] — {doc['title']}[/]\n")
+            console.print(f"  [{DIM}]Syntax:[/]   [{ACCENT}]{doc['syntax']}[/]")
+            if doc.get("aliases"):
+                alias_str = ", ".join(f"[{ACCENT}]\\{a}[/]" for a in doc["aliases"])
+                console.print(f"  [{DIM}]Aliases:[/]  {alias_str}")
+            console.print(f"\n  [{BOLD}]Description:[/]\n  {doc['description']}\n")
+            if doc.get("examples"):
+                console.print(f"  [{BOLD}]Examples:[/]")
+                for ex in doc["examples"]:
+                    console.print(f"    [{ACCENT}]{ex}[/]")
+                console.print("")
+            if doc.get("flywheel"):
+                console.print(f"  [{BOLD}]Flywheel Next Steps:[/] [{DIM}]{doc['flywheel']}[/]\n")
+            return
 
-    console.print(f"  [{DIM}]{'─' * 44}[/]")
+        from audiobench.cli.repl.dispatch import _BACKSLASH_HANDLERS
+        if target in _BACKSLASH_HANDLERS:
+            fn = _BACKSLASH_HANDLERS[target]
+            fn_doc = (fn.__doc__ or "").strip()
+            console.print(f"\n  [{BOLD}][{ACCENT}]\\{target}[/][/]\n")
+            console.print(f"  {fn_doc or 'No detailed description available.'}\n")
+            return
+
+        import difflib
+        candidates = list(_COMMAND_DOCS.keys()) + list(_BACKSLASH_HANDLERS.keys())
+        matches = difflib.get_close_matches(target, candidates, n=1, cutoff=0.5)
+        console.print(f"  [{WARNING}]Unknown command: \\{target}[/]")
+        if matches:
+            console.print(f"  [{DIM}]Did you mean:[/] [{ACCENT}]\\help {matches[0]}[/] ?\n")
+        else:
+            console.print(f"  [{DIM}]Type [{ACCENT}]\\help[/] to view all available commands.[/]\n")
+        return
+
+    # Top-level categorized help menu
+    console.print(f"\n  [{BOLD}]AudioBench Shell — Command Reference[/]\n")
+    console.print(f"  [{DIM}]Three execution contexts, one prompt:[/]")
+    console.print(f"    [{ACCENT}]\\[/][{DIM}]command[/]   — local & graph commands (instant)")
+    console.print(f"    [{DIM}]?[/] question  — AI/semantic reasoning (requires focus)")
+    console.print(f"    [yellow]![/][{DIM}]command[/]   — OS shell passthrough\n")
+
+    console.print(f"  [{DIM}]{'─' * 52}[/]")
+    console.print(f"  [{BOLD}]Knowledge Graph & Dialectic[/]")
+    console.print(f"    [{ACCENT}]\\synthesize <q>[/]     Synthesize cross-library perspectives (Graph MMR)")
+    console.print(f"    [{ACCENT}]\\related[/]            Show cross-work connections & semantic bridges")
+    console.print(f"    [{ACCENT}]\\bookmark [id|cite][/] Two-tiered smart cards (Narrative Arc + Dialectic)")
+    console.print(f"    [{ACCENT}]\\suggest [commands][/]  Next Listen recommendations & triadic consensus")
+    console.print(f"    [{ACCENT}]\\graph seed [n][/]     Seed unlinked islands into the knowledge graph\n")
+
+    console.print(f"  [{BOLD}]Playback & Library[/]")
+    console.print(f"    [{ACCENT}]\\play [id|cite <n>][/] Audio playback & citation seeking")
+    console.print(f"    [{ACCENT}]\\library[/]             Launch interactive Library Command Center\n")
+
+    console.print(f"  [{BOLD}]Exploration & Focus[/]")
+    console.print(f"    [{ACCENT}]\\focus <id>[/]         Focus on audio file, transcript, or work")
+    console.print(f"    [{ACCENT}]\\unfocus[/]            Clear active focus")
+    console.print(f"    [{ACCENT}]\\show [id][/]          Print transcript with timestamps")
+    console.print(f"    [{ACCENT}]\\ls [n][/]             List recent files (default 10)")
+    console.print(f"    [{ACCENT}]\\search <q>[/]         FTS5 full-text transcript search")
+    console.print(f"    [{ACCENT}]\\info[/]               Metadata and stats for active focus\n")
+
+    console.print(f"  [{BOLD}]AI & Interaction[/]")
+    console.print(f"    [{ACCENT}]\\chat[/]               Conversational AI chat over active transcript")
+    console.print(f"    [{ACCENT}]\\ask <question>[/]     Ask AI about active transcript (? <q> shorthand)")
+    console.print(f"    [{ACCENT}]\\summarize[/]          Structured chapter summary\n")
+
+    console.print(f"  [{BOLD}]Capture & Workflows[/]")
+    console.print(f"    [{ACCENT}]\\capture <note>[/]     Quick-capture thought or note")
+    console.print(f"    [{ACCENT}]\\workflow <save|run>[/] Manage and replay command workflows")
+    console.print(f"    [{ACCENT}]\\history[/]            Past transcriptions and commands")
+    console.print(f"    [{ACCENT}]\\stats[/]              Transcript word count and duration stats\n")
+
+    console.print(f"  [{BOLD}]Security & Diarization[/]")
+    console.print(f"    [{ACCENT}]\\name <spk> <name>[/]  Rename speaker globally across transcript")
+    console.print(f"    [{ACCENT}]\\lock / \\unlock[/]     Manage privacy tiers")
+    console.print(f"    [{ACCENT}]\\enroll / \\voices[/]   Voiceprint biometric enrollment & selection\n")
+
     console.print(f"  [{BOLD}]Navigation[/]")
-    console.print(f"    [{ACCENT}]\\back[/]              Return to previous context")
-    console.print(f"    [{ACCENT}]\\home[/]              Clear stack, return to top")
-    console.print(f"    [{ACCENT}]\\stack[/]             Show navigation stack\n")
+    console.print(f"    [{ACCENT}]\\back[/] / [{ACCENT}]\\home[/]       Navigate context stack")
+    console.print(f"    [{ACCENT}]\\stack[/]              Show current navigation stack\n")
 
-    console.print(f"  [{BOLD}]Focus & View[/]")
-    console.print(f"    [{ACCENT}]\\focus <id>[/]        Focus on audio file by ID")
-    console.print(f"    [{ACCENT}]\\unfocus[/]           Clear current focus")
-    console.print(f"    [{ACCENT}]\\ls [n][/]            List recent files (default 10)")
-    console.print(f"    [{ACCENT}]\\show [id][/]         Show transcript\n")
-
-    console.print(f"  [{BOLD}]Workflows[/]")
-    console.print(f"    [{ACCENT}]\\workflow save <name>[/]   Capture last N commands")
-    console.print(f"    [{ACCENT}]\\workflow list[/]          Show all saved workflows")
-    console.print(f"    [{ACCENT}]\\workflow run <name>[/]    Replay a workflow")
-    console.print(f"    [{ACCENT}]\\workflow delete <name>[/] Delete a workflow\n")
-
-    console.print(f"  [{BOLD}]Intelligence[/]")
-    console.print(f"    [{ACCENT}]\\related[/]           Show related fragments from other files")
-    console.print(f"    [{ACCENT}]\\name[/]              Rename a speaker globally (e.g. \\name \"Speaker 1\" \"John\")")
-    console.print(f"    [{ACCENT}]\\graph[/]             Command frequency stats")
-    console.print(f"    [{ACCENT}]\\suggest[/]           What to do next (based on history)\n")
-
-    console.print(f"  [{BOLD}]Interactive Flows[/]")
-    console.print(f"    [{ACCENT}]\\library[/]  \\import[/]  \\transcribe[/]  \\chat[/]  \\ask[/]  \\summarize[/]\n")
-    console.print(f"  [{DIM}]Shell passthrough: [/]  !ls  !ffmpeg  !play  ...\n")
+    console.print(f"  [{DIM}]Tip: Type [{ACCENT}]\\help <command>[/] [{DIM}]for syntax, examples, and options.[/]")
+    console.print(f"  [{DIM}]Shell passthrough:  !ls  !ffmpeg  !play ...[/]\n")
 
 # ── Workflow ──────────────────────────────────────────────────
 
@@ -945,6 +1315,17 @@ def _resolve_thought_segment(
         .all()
     )
     if not segs:
+        try:
+            from audiobench.storage.models import ExpressionRecord, ChapterRecord
+            expr = session_db.query(ExpressionRecord).filter_by(id=expr_id).first()
+            if expr:
+                chap_id = expr.chapter_id or (expr.source_id if expr.source_type == "chapter_summary" else None)
+                if chap_id:
+                    chap = session_db.query(ChapterRecord).filter_by(id=chap_id).first()
+                    if chap and chap.start_time is not None:
+                        return float(chap.start_time), float(chap.end_time or chap.start_time), None
+        except Exception:
+            pass
         return 0.0, 0.0, None
 
     content_clean = expr_content.strip()
@@ -968,186 +1349,559 @@ def _resolve_thought_segment(
     return float(segs[0].start_time), float(segs[0].end_time), segs[0].speaker
 
 
-@register_backslash("related")
-def cmd_related(session: ReplSession, args: str) -> None:
-    """Show semantically related fragments from other transcripts."""
-    from rich.panel import Panel
+def _relevance_dots(rank: int, total_dots: int = 5) -> str:
+    """Convert a 1-based retrieval rank to a filled-dot relevance bar.
+
+    rank 1-2  → ●●●●●  (strongest)
+    rank 3-4  → ●●●●○
+    rank 5-6  → ●●●○○
+    rank 7-8  → ●●○○○
+    rank 9+   → ●○○○○  (weakest shown)
+    """
+    filled = max(1, total_dots - (rank - 1) // 2)
+    filled = min(filled, total_dots)
+    return "[cyan]●[/cyan]" * filled + "[dim]○[/dim]" * (total_dots - filled)
+
+
+def _get_db_connection():
+    """Get a raw sqlite3 connection to the primary transcriptions database."""
+    import sqlite3
+    from pathlib import Path
+    from audiobench.core.settings import get_settings
+
+    settings = get_settings()
+    db_path = Path(settings.database_url.replace("sqlite:///", "")).resolve()
+    return sqlite3.connect(str(db_path))
+
+
+def _show_school_related(session: ReplSession, cid: int, args: str) -> None:
+    """Show macro connected schools and micro bridge expressions for a focused school."""
+    import re
+    import textwrap
+    from rich.table import Table
 
     from audiobench.cli.display.theme import (
         ACCENT,
         BOLD,
-        BOX_STYLE,
         DIM,
         SUCCESS,
         WARNING,
         console,
     )
     from audiobench.cli.repl.session import RelatedThought
+    from audiobench.community.community_service import (
+        get_cross_school_bridge_pairs,
+        get_related_schools,
+    )
+    from audiobench.core.db_session import get_session
+    from audiobench.storage.models import AudioFileRecord, TranscriptionRecord
+
+    with _get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT community_id, name, node_count FROM expression_communities WHERE community_id = ? AND is_active = 1",
+            (cid,),
+        )
+        comm_row = cur.fetchone()
+        if not comm_row:
+            console.print(f"  [{WARNING}]School #{cid} not found or inactive. Run \\schools to list available schools.[/]")
+            return
+
+        school_name = comm_row[1] or f"School #{cid}"
+        related_schools = get_related_schools(conn, cid, limit=5)
+        bridge_pairs = get_cross_school_bridge_pairs(conn, cid, limit=4)
+
+    term_width = console.size.width or 80
+    border_w = min(term_width - 4, 110)
+    use_book = term_width >= 100
+
+    console.print(
+        f"\n  [{BOLD} {ACCENT}]School Dialectic Relations[/] [{DIM}](School #{cid:02d}: {school_name})[/]"
+    )
+    console.print(f"  [{DIM}]{'─' * border_w}[/]\n")
+
+    # 1. Macro Connected Schools
+    console.print(f"  [{BOLD}]Connected Schools (Macro Coupling)[/]")
+    if related_schools:
+        for rs in related_schools:
+            console.print(
+                f"    [{ACCENT}]• School #{rs['community_id']:02d}:[/] [{BOLD}]{rs['name']}[/] "
+                f"[{DIM}]({rs['edge_count']} bundle edges · coupling: {rs['coupling_weight']:.1f} · avg: {rs['avg_weight']:.2f})[/]"
+            )
+    else:
+        console.print(f"    [{DIM}](No external school connections found above threshold)[/]")
+    console.print()
+
+    # 2. Micro Dialectic Bridge Pairs (Two-Column Book Mode)
+    console.print(
+        f"  [{BOLD}]Dialectic Bridge Passages[/] "
+        f"[{DIM}]({len(bridge_pairs)} cross-school bridge pairs · {'2-column book mode' if use_book else 'single column'})[/]"
+    )
+    console.print(f"  [{DIM}]{'─' * border_w}[/]\n")
+
+    if not bridge_pairs:
+        console.print(f"    [{DIM}](No direct semantic bridge expressions found above 0.78 similarity)[/]\n")
+        console.print(
+            f"  [{DIM}]Quick actions:[/]  "
+            f"[{ACCENT}]\\focus school <id>[/] [{DIM}]switch school focus[/]  •  "
+            f"[{ACCENT}]\\play school <id>[/] [{DIM}]listen to school[/]  •  "
+            f"[{ACCENT}]\\school {cid}[/] [{DIM}]school details[/]\n"
+        )
+        return
+
+    session.last_related = []
+    wrap_w = max(42, (term_width - 6) // 2) if use_book else min(term_width - 6, 95)
+
+    with get_session() as sdb:
+        pair_blocks = []
+        for i, bp in enumerate(bridge_pairs, 1):
+            inside = bp["inside"]
+            outside = bp["outside"]
+
+            # Inside formatting
+            in_attr = f"{inside['author']} — {inside['title']}" if inside["author"] and inside["author"] != "Unknown Author" else inside["title"]
+            in_suffix = f"(Expr #{inside['id']})"
+            in_max_attr = max(15, wrap_w - len(in_suffix) - 2)
+            if len(in_attr) > in_max_attr:
+                in_attr = in_attr[:in_max_attr - 1] + "…"
+            in_spaces = " " * max(1, wrap_w - len(in_attr) - len(in_suffix))
+            in_hdr = f"[{BOLD}]{in_attr}[/] {in_spaces}[{DIM}]{in_suffix}[/]"
+            in_wrapped = textwrap.fill(f'"{inside["formatted_content"]}"', width=wrap_w - 4)
+            in_lines = [in_hdr] + [f"  {w}" for w in in_wrapped.split("\n")]
+
+            # Outside formatting & RelatedThought registration
+            ext_txid = outside.get("source_id")
+            af_row = None
+            if ext_txid:
+                tx_rec = sdb.query(TranscriptionRecord).filter_by(id=ext_txid).first()
+                if tx_rec and tx_rec.audio_file_id:
+                    af_row = sdb.query(AudioFileRecord).filter_by(id=tx_rec.audio_file_id).first()
+
+            file_name = af_row.file_name if af_row else (f"Transcript #{ext_txid}" if ext_txid else "Unknown")
+            file_path = af_row.file_path if af_row else None
+
+            start_time, end_time, seg_speaker = _resolve_thought_segment(
+                sdb, outside["id"], ext_txid or 0, outside["content"]
+            )
+            pct = min(99, max(40, int(bp["weight"] * 100)))
+
+            thought = RelatedThought(
+                index=i,
+                transcript_id=ext_txid or 0,
+                audio_file_id=af_row.id if af_row else None,
+                file_name=file_name,
+                file_path=file_path,
+                start_time=start_time,
+                end_time=end_time,
+                speaker=seg_speaker,
+                content=outside["content"],
+                score=bp["weight"],
+                match_percent=pct,
+                work_title=outside["title"],
+                work_author=outside["author"],
+            )
+            session.last_related.append(thought)
+
+            ext_attr = f"{outside['author']} — {outside['title']}" if outside["author"] and outside["author"] != "Unknown Author" else outside["title"]
+            ext_suffix = f"\\[{i}\\] (sim: {bp['weight']:.2f})"
+            ext_suffix_vis = f"[{i}] (sim: {bp['weight']:.2f})"
+            ext_max_attr = max(15, wrap_w - len(ext_suffix_vis) - 2)
+            if len(ext_attr) > ext_max_attr:
+                ext_attr = ext_attr[:ext_max_attr - 1] + "…"
+            ext_spaces = " " * max(1, wrap_w - len(ext_attr) - len(ext_suffix_vis))
+            ext_hdr = f"[{BOLD}]{ext_attr}[/] {ext_spaces}[{DIM}]{ext_suffix}[/]"
+            ext_comm_label = f"[{ACCENT}]• {outside['community_name']}[/]"
+            ext_wrapped = textwrap.fill(f'"{outside["formatted_content"]}"', width=wrap_w - 4)
+            ext_lines = [ext_hdr, f"  {ext_comm_label}"] + [f"  {w}" for w in ext_wrapped.split("\n")]
+
+            pair_blocks.append((in_lines, ext_lines))
+
+    if use_book:
+        tbl = Table.grid(padding=(0, 1))
+        tbl.add_column(width=wrap_w, no_wrap=False)
+        tbl.add_column(width=1, style=DIM)
+        tbl.add_column(width=wrap_w, no_wrap=False)
+
+        col_hdr_left = f"[{BOLD} {ACCENT}]School #{cid:02d} (Inside Core)[/]"
+        col_hdr_right = f"[{BOLD} {ACCENT}]Connected Thoughts (Bridge Out)[/]"
+        tbl.add_row(col_hdr_left, "│", col_hdr_right)
+        tbl.add_row(f"[dim]{'─' * wrap_w}[/dim]", "│", f"[dim]{'─' * wrap_w}[/dim]")
+
+        for in_lines, ext_lines in pair_blocks:
+            max_h = max(len(in_lines), len(ext_lines))
+            for r_i in range(max_h):
+                l = in_lines[r_i] if r_i < len(in_lines) else ""
+                r = ext_lines[r_i] if r_i < len(ext_lines) else ""
+                tbl.add_row(l, "│", r)
+            tbl.add_row("", "│", "")
+        console.print(tbl)
+    else:
+        for i, (in_lines, ext_lines) in enumerate(pair_blocks, 1):
+            console.print(f"  [{BOLD} {ACCENT}]Bridge Pair #{i}[/]")
+            for line in in_lines:
+                console.print(f"  {line}")
+            console.print(f"  [{DIM}]── bridge to ──────────────────────────────────────[/dim]")
+            for line in ext_lines:
+                console.print(f"  {line}")
+            console.print()
+
+    console.print(
+        f"\n  [{DIM}]Quick actions:[/]  "
+        f"[{ACCENT}]\\focus school <id>[/] [{DIM}]switch school focus[/]  •  "
+        f"[{ACCENT}]\\play school <id>[/] [{DIM}]listen to school[/]  •  "
+        f"[{ACCENT}]\\play <1-{len(session.last_related)}>[/] [{DIM}]listen to bridge passage[/]  •  "
+        f"[{ACCENT}]\\focus <1-{len(session.last_related)}>[/] [{DIM}]focus bridge file[/]\n"
+    )
+
+
+@register_backslash("related")
+def cmd_related(session: ReplSession, args: str) -> None:
+    """Show semantically related fragments from other transcripts or schools in Book Mode."""
+    import re
+    import textwrap
+    from rich.table import Table
+
+    from audiobench.cli.display.theme import (
+        ACCENT,
+        BOLD,
+        DIM,
+        SUCCESS,
+        WARNING,
+        console,
+    )
+    from audiobench.cli.repl.session import RelatedThought
+    from audiobench.core.db_session import get_session
+    from audiobench.memory.boilerplate import clean_audio_disclaimers
+    from audiobench.memory.graph_linker import is_linkable_chunk
     from audiobench.playback.controls import fmt_timestamp
+    from audiobench.storage.models import AudioFileRecord
+    from sqlalchemy import text as _sql
+
+    clean_arg = args.strip().lower()
+
+    # School relatedness handling
+    if clean_arg.startswith("school"):
+        parts = clean_arg.split()
+        target_cid = None
+        if len(parts) > 1:
+            raw_cid = parts[1].lstrip("#")
+            if raw_cid.isdigit():
+                target_cid = int(raw_cid)
+        if target_cid is None and session.focus and session.focus.type == "school":
+            target_cid = session.focus.id
+        if target_cid is not None:
+            _show_school_related(session, target_cid, args)
+            return
+        else:
+            console.print("  [dim]Usage: \\related school <id> (or focus on a school first)[/]")
+            return
+
+    if session.focus and session.focus.type == "school":
+        if clean_arg in ("work", "works", "transcript", "transcripts"):
+            pass
+        else:
+            _show_school_related(session, session.focus.id, args)
+            return
 
     if not session.last_id:
         console.print(f"  [{DIM}]No focused transcript. Use [{ACCENT}]\\focus <id>[/][/]")
         return
 
-    repo = session._get_repo()
-    rec = repo.get_by_id(session.last_id, session=session)
-    if not rec:
-        return
+    console.print(f"  [{DIM}]Traversing knowledge graph & in-core semantic index...[/]")
 
-    # Get text to search. Summary if available, otherwise first 500 chars.
-    text_to_search = rec.get("summary", "")
-    if not text_to_search:
-        text_to_search = rec.get("full_text", "")[:500]
+    with get_session() as sdb:
+        tx_info = sdb.execute(
+            _sql("""
+                SELECT t.id, t.audio_file_id, af.work_id, w.title, w.author, af.file_name
+                FROM transcriptions t
+                LEFT JOIN audio_files af ON t.audio_file_id = af.id
+                LEFT JOIN works w ON af.work_id = w.id
+                WHERE t.id = :txid
+            """),
+            {"txid": session.last_id},
+        ).fetchone()
 
-    if not text_to_search.strip():
-        console.print(f"  [{DIM}]Transcript is empty, cannot find related content.[/]")
-        return
+        if not tx_info:
+            console.print(f"  [{DIM}]Transcript #{session.last_id} not found in database.[/]")
+            return
 
-    console.print(f"  [{DIM}]Searching for related fragments across the library...[/]")
+        curr_wid = tx_info[2]
+        if curr_wid is None:
+            ew_row = sdb.execute(
+                _sql("SELECT work_id FROM expressions WHERE source_type = 'transcription_chunk' AND source_id = :txid AND work_id IS NOT NULL LIMIT 1"),
+                {"txid": session.last_id},
+            ).fetchone()
+            if ew_row:
+                curr_wid = ew_row[0]
 
-    from audiobench.daemon.factory import get_daemon_client
+        # Find sweep_chunks belonging to this transcript
+        chunk_rows = sdb.execute(
+            _sql("""
+                SELECT id FROM expressions
+                WHERE source_type = 'transcription_chunk'
+                  AND source_id = :txid
+                  AND graph_role = 'sweep_chunk'
+            """),
+            {"txid": session.last_id},
+        ).fetchall()
+        chunk_ids = [r[0] for r in chunk_rows]
+        if not chunk_ids:
+            chunk_rows = sdb.execute(
+                _sql("SELECT id FROM expressions WHERE source_type = 'transcription_chunk' AND source_id = :txid"),
+                {"txid": session.last_id},
+            ).fetchall()
+            chunk_ids = [r[0] for r in chunk_rows]
 
-    daemon = get_daemon_client()
+        # Priority 1: Bidirectional Knowledge Graph Lookup
+        # (cross-work semantic edges with strict work isolation)
+        kg_related: list[tuple[int, int | None, int | None, str | None, str | None, float, str, str]] = []
+        seen_works: set[Any] = set()
 
-    try:
-        results = daemon.search(
-            query=text_to_search,
-            top_k=20,
-            use_bm25=False,  # pure semantic relation
-            use_dense=True,
-            use_colbert=True,
+        if chunk_ids:
+            placeholders = ",".join(f":c{i}" for i in range(len(chunk_ids)))
+            params = {f"c{i}": cid for i, cid in enumerate(chunk_ids)}
+            params["curr_wid"] = curr_wid
+            params["txid"] = session.last_id
+
+            sem_edges = sdb.execute(
+                _sql(f"""
+                    SELECT 
+                        e2.id as target_eid,
+                        e2.source_id as target_txid,
+                        e2.work_id as target_wid,
+                        w2.title as target_title,
+                        w2.author as target_author,
+                        r.weight as weight,
+                        e2.content as content
+                    FROM expression_relations r
+                    JOIN expressions e2 ON e2.id = (
+                        CASE WHEN r.from_expression_id IN ({placeholders}) THEN r.to_expression_id
+                             ELSE r.from_expression_id END
+                    )
+                    LEFT JOIN works w2 ON e2.work_id = w2.id
+                    WHERE (r.from_expression_id IN ({placeholders}) OR r.to_expression_id IN ({placeholders}))
+                      AND r.relation_type = 'semantic'
+                      AND (
+                          CASE 
+                              WHEN :curr_wid IS NOT NULL THEN (e2.work_id IS NOT NULL AND e2.work_id != :curr_wid)
+                              ELSE (e2.work_id IS NOT NULL OR NOT (e2.source_type = 'transcription_chunk' AND e2.source_id = :txid))
+                          END
+                      )
+                    ORDER BY r.weight DESC
+                    LIMIT 50
+                """),
+                params,
+            ).fetchall()
+
+            for r in sem_edges:
+                if is_linkable_chunk(r[6]):
+                    wid_key = r[2] if r[2] is not None else f"tx_{r[1]}"
+                    if wid_key not in seen_works:
+                        seen_works.add(wid_key)
+                        kg_related.append((r[0], r[1], r[2], r[3], r[4], float(r[5]), r[6], "KG"))
+                        if len(kg_related) >= 30:
+                            break
+
+        # Priority 2: In-Core HNSW Island Fallback
+        # If fewer than 9 connections found in the KG, query HNSW directly with work exclusion
+        if len(kg_related) < 9 and chunk_ids:
+            try:
+                from audiobench.memory.graph_linker import ensure_hnsw_ready
+
+                hnsw = ensure_hnsw_ready()
+                step = max(1, len(chunk_ids) // 6)
+                sampled_cids = chunk_ids[::step][:8]
+                cand_hits: dict[int, float] = {}
+
+                for scid in sampled_cids:
+                    if hnsw.has_item(scid):
+                        vec = hnsw.get_items([scid])[0]
+                        hits = hnsw.query(vec, k=30)
+                        for hid, dist in hits:
+                            if hid not in chunk_ids:
+                                sim = 1.0 - float(dist)
+                                if sim >= 0.70:
+                                    if hid not in cand_hits or sim > cand_hits[hid]:
+                                        cand_hits[hid] = sim
+
+                if cand_hits:
+                    c_ids = list(cand_hits.keys())
+                    c_placeholders = ",".join(f":hc{i}" for i in range(len(c_ids)))
+                    c_params = {f"hc{i}": hid for i, hid in enumerate(c_ids)}
+                    c_params["curr_wid"] = curr_wid
+                    c_params["txid"] = session.last_id
+                    h_rows = sdb.execute(
+                        _sql(f"""
+                            SELECT e.id, e.source_id, e.work_id, w.title, w.author, e.content
+                            FROM expressions e
+                            LEFT JOIN works w ON e.work_id = w.id
+                            WHERE e.id IN ({c_placeholders})
+                              AND (
+                                  CASE 
+                                      WHEN :curr_wid IS NOT NULL THEN (e.work_id IS NOT NULL AND e.work_id != :curr_wid)
+                                      ELSE (e.work_id IS NOT NULL OR NOT (e.source_type = 'transcription_chunk' AND e.source_id = :txid))
+                                  END
+                              )
+                        """),
+                        c_params,
+                    ).fetchall()
+
+                    sorted_h = sorted(h_rows, key=lambda row: cand_hits.get(row[0], 0.0), reverse=True)
+                    for r in sorted_h:
+                        if is_linkable_chunk(r[5]):
+                            wid_key = r[2] if r[2] is not None else f"tx_{r[1]}"
+                            if wid_key not in seen_works:
+                                seen_works.add(wid_key)
+                                kg_related.append((r[0], r[1], r[2], r[3], r[4], cand_hits[r[0]], r[5], "ANN"))
+                                if len(kg_related) >= 30:
+                                    break
+            except Exception as e:
+                logger.debug("cmd_related: HNSW fallback failed: %s", e)
+
+    if not kg_related:
+        console.print(
+            f"  [{DIM}]No cross-work dialectic connections found yet. Run [{ACCENT}]\\graph seed[/] to link this work.[/]"
         )
-    except Exception as e:
-        console.print(f"  [{WARNING}]Daemon search failed: {e}[/]")
         return
 
-    if not results:
-        console.print(f"  [{DIM}]No related fragments found.[/]")
+    # Benchmark-proven hybrid score threshold: max(score_max * 0.85, 0.72)
+    max_score = kg_related[0][5]
+    cutoff = max(max_score * 0.85, 0.72)
+    filtered_related = [r for r in kg_related if r[5] >= cutoff][:9]
+
+    if not filtered_related:
+        console.print(
+            f"  [{DIM}]No cross-work dialectic connections found yet. Run [{ACCENT}]\\graph seed[/] to link this work.[/]"
+        )
         return
 
-    from audiobench.core.db_session import get_session
-    from audiobench.storage.expression_repository import ExpressionRepository
-    from audiobench.storage.models import AudioFileRecord, WorkRecord
-
-    expr_repo = ExpressionRepository()
-
-    # Filter out current source_id (one fragment per related transcript)
-    related_exprs = []
-    seen_ids = set()
-    for r in results:
-        expr_id = r.get("expression_id")
-        if expr_id:
-            expr = expr_repo.get_by_id(expr_id, session=session)
-            if expr and expr.source_id != session.last_id and expr.source_id not in seen_ids:
-                seen_ids.add(expr.source_id)
-                related_exprs.append((expr, float(r.get("score", 0.0))))
-                if len(related_exprs) >= 5:
-                    break
-
-    if not related_exprs:
-        console.print(f"  [{DIM}]No related fragments found outside of this transcript.[/]")
-        return
-
-    console.print(
-        f"\n  [{BOLD} {ACCENT}]Related Thoughts[/] [{DIM}]({len(related_exprs)} connections found across library)[/]"
-    )
-    console.print(f"  [{DIM}]{'─' * 55}[/]\n")
+    term_width = console.size.width or 80
+    use_book = term_width >= 100 and len(filtered_related) >= 2
+    wrap_w = max(42, (term_width - 6) // 2) if use_book else min(term_width - 6, 95)
 
     session.last_related = []
+    thought_blocks: list[list[str]] = []
 
-    with get_session() as session_db:
-        for i, (expr, raw_score) in enumerate(related_exprs, 1):
-            transcript_record = repo.get_by_id(expr.source_id, session=session)
-            audio_file_id = transcript_record.get("audio_file_id") if transcript_record else None
-            file_name = (
-                transcript_record.get("file_name")
-                if transcript_record
-                else f"Transcript #{expr.source_id}"
-            )
-            file_path = transcript_record.get("file_path") if transcript_record else None
+    with get_session() as sdb:
+        for i, (expr_id, tx_id, wid, w_title, w_author, sim, content, source_tag) in enumerate(filtered_related, 1):
+            af_row = None
+            if tx_id:
+                from audiobench.storage.models import TranscriptionRecord as _TX
 
-            # Resolve work info if available
-            work_title = None
-            work_author = None
-            if expr.work_id:
-                w = session_db.query(WorkRecord).filter_by(id=expr.work_id).first()
-                if w:
-                    work_title = w.title
-                    work_author = w.author
-            elif audio_file_id:
-                af = session_db.query(AudioFileRecord).filter_by(id=audio_file_id).first()
-                if af and af.file_path and not file_path:
-                    file_path = af.file_path
-                if af and af.work:
-                    work_title = af.work.title
-                    work_author = af.work.author
+                tx_record = sdb.query(_TX).filter_by(id=tx_id).first()
+                if tx_record and tx_record.audio_file_id:
+                    af_row = sdb.query(AudioFileRecord).filter_by(id=tx_record.audio_file_id).first()
+            file_name = af_row.file_name if af_row else (f"Transcript #{tx_id}" if tx_id else "Unknown")
+            file_path = af_row.file_path if af_row else None
+            work_title = w_title or (af_row.work.title if af_row and af_row.work else None)
+            work_author = w_author or (af_row.work.author if af_row and af_row.work else None)
 
-            # Resolve exact segment timestamp & speaker
             start_time, end_time, seg_speaker = _resolve_thought_segment(
-                session_db, expr.id, expr.source_id, expr.content
+                sdb, expr_id, tx_id or 0, content
             )
-            speaker = seg_speaker or expr.speaker
-
-            # Score normalization: ColBERT raw scores are typically ~1.0 to 2.5
-            pct = (
-                min(99, max(45, int((raw_score / 2.2) * 90)))
-                if raw_score > 0.5
-                else int(raw_score * 100)
-            )
+            pct = min(99, max(40, int(sim * 100)))
 
             thought = RelatedThought(
                 index=i,
-                transcript_id=expr.source_id,
-                audio_file_id=audio_file_id,
+                transcript_id=tx_id,
+                audio_file_id=af_row.id if af_row else None,
                 file_name=file_name,
                 file_path=file_path,
                 start_time=start_time,
                 end_time=end_time,
-                speaker=speaker,
-                content=expr.content,
-                score=raw_score,
+                speaker=seg_speaker,
+                content=content,
+                score=sim,
                 match_percent=pct,
                 work_title=work_title,
                 work_author=work_author,
             )
             session.last_related.append(thought)
 
-            # Build rich visual card
-            card_title = (
-                f"[{BOLD} {ACCENT}]\\[{i}] {file_name}[/]  [{DIM}]—[/]  "
-                f"[{SUCCESS if pct >= 80 else ACCENT}]{pct}% Match[/]"
-            )
+            # Build visual card block for Book Mode
+            if work_author and work_title:
+                source_label = f"{work_author} — {work_title}"
+            elif work_title:
+                source_label = f"{work_title}"
+            else:
+                source_label = file_name
 
-            meta_parts = [f"[{DIM}]⏱ {fmt_timestamp(start_time)}[/]"]
-            if speaker:
-                meta_parts.append(f"[{ACCENT}]Speaker:[/] {speaker}")
-            if work_title:
-                meta_parts.append(f"[{DIM}]Work:[/] {work_title}")
-            meta_line = f"  [{DIM}]•[/]  ".join(meta_parts)
+            if len(source_label) > wrap_w - 8:
+                source_label = source_label[:wrap_w - 11] + "..."
+            rule_len = max(2, wrap_w - len(source_label) - 4)
+            hdr = f"[dim]──[/dim] [bold]{source_label}[/bold] [dim]{'─' * rule_len}[/dim]"
 
-            clean_content = expr.content.strip().replace("\r", "").replace("\n", " ")
-            if len(clean_content) > 320:
-                clean_content = clean_content[:317] + "..."
+            dots = _relevance_dots(i)
+            tag_chip = f"[{BOLD} {SUCCESS}][{source_tag}][/]" if source_tag == "KG" else f"[{BOLD} {ACCENT}][{source_tag}][/]"
+            meta_parts = [f"[{BOLD} {ACCENT}]\\[{i}][/]", dots, tag_chip]
+            if start_time:
+                meta_parts.append(f"[{DIM}]@{fmt_timestamp(start_time)}[/]")
+            if seg_speaker:
+                meta_parts.append(f"[{DIM}]• {seg_speaker}[/]")
+            meta_line = "  ".join(meta_parts)
 
-            # Use Rich.Text for the body so content is always treated as a
-            # literal — never parsed as Rich markup (square brackets in text).
-            from rich.text import Text
+            clean_text = clean_audio_disclaimers(content).strip().replace("\r", "").replace("\n", " ")
+            clean_text = re.sub(r"\s+", " ", clean_text)
+            if len(clean_text) > 280:
+                clean_text = clean_text[:277] + "..."
+            wrapped = textwrap.fill(f'"{clean_text}"', width=wrap_w - 4)
 
-            body_text = Text.from_markup(meta_line)
-            body_text.append(f'\n\n"{clean_content}"')
+            block = [hdr, meta_line]
+            for w in wrapped.split("\n"):
+                block.append(f"  {w}")
+            thought_blocks.append(block)
 
-            panel = Panel(
-                body_text,
-                title=card_title,
-                title_align="left",
-                box=BOX_STYLE,
-                border_style="cyan" if i == 1 else "dim cyan",
-                padding=(0, 1),
-            )
-            console.print(panel)
+    border_w = min(term_width - 4, 110)
+    mode_label = "2-column book mode" if use_book else "single column"
 
     console.print(
-        f"  [{DIM}]Quick actions:[/]  "
+        f"\n  [{BOLD} {ACCENT}]Related Dialectics[/] [{DIM}]({len(session.last_related)} cross-library connections · {mode_label})[/]"
+    )
+    console.print(f"  [{DIM}]{'─' * border_w}[/]\n")
+
+    if use_book:
+        left_blocks: list[list[str]] = []
+        right_blocks: list[list[str]] = []
+        left_h = 0
+        right_h = 0
+        for b in thought_blocks:
+            h = len(b) + 1
+            if left_h <= right_h:
+                left_blocks.append(b)
+                left_h += h
+            else:
+                right_blocks.append(b)
+                right_h += h
+
+        left_lines: list[str] = []
+        for b in left_blocks:
+            left_lines.extend(b)
+            left_lines.append("")
+
+        right_lines: list[str] = []
+        for b in right_blocks:
+            right_lines.extend(b)
+            right_lines.append("")
+
+        tbl = Table.grid(padding=(0, 1))
+        tbl.add_column(width=wrap_w, no_wrap=False)
+        tbl.add_column(width=1, style=DIM)
+        tbl.add_column(width=wrap_w, no_wrap=False)
+
+        max_lines = max(len(left_lines), len(right_lines))
+        for r_i in range(max_lines):
+            l = left_lines[r_i] if r_i < len(left_lines) else ""
+            r = right_lines[r_i] if r_i < len(right_lines) else ""
+            tbl.add_row(l, "│", r)
+        console.print(tbl)
+    else:
+        for b in thought_blocks:
+            for line in b:
+                console.print(f"  {line}")
+            console.print()
+
+    console.print(
+        f"\n  [{DIM}]Quick actions:[/]  "
         f"[{ACCENT}]\\play <1-{len(session.last_related)}>[/] [{DIM}]listen at timestamp[/]  •  "
         f"[{ACCENT}]\\chat related[/] [{DIM}]AI discussion[/]  •  "
         f"[{ACCENT}]\\focus <1-{len(session.last_related)}>[/] [{DIM}]switch file[/]\n"
@@ -1236,7 +1990,27 @@ def cmd_name(session: ReplSession, args: str) -> None:
 
 @register_backslash("graph")
 def cmd_graph(session: ReplSession, args: str) -> None:
-    """Show command frequency stats from the command graph."""
+    """Show command frequency stats or seed unlinked islands in knowledge graph."""
+    parts = args.strip().split()
+    if parts and parts[0].lower() == "seed":
+        limit = 2500
+        if len(parts) > 1 and parts[1].isdigit():
+            limit = int(parts[1])
+        console.print(f"  [{BOLD}]Seeding unlinked islands into knowledge graph (limit={limit})...[/]")
+        try:
+            from audiobench.memory.graph_linker import seed_unlinked_islands
+            result = seed_unlinked_islands(limit=limit)
+            console.print(
+                f"  [{SUCCESS}]✓ Seeding complete:[/] "
+                f"Processed [{BOLD}]{result.chunks_processed}[/] chunks, "
+                f"created [{BOLD}]{result.edges_created}[/] cross-work semantic edges "
+                f"across [{BOLD}]{len(result.linked_work_ids)}[/] works "
+                f"in [{DIM}]{result.elapsed_ms:.1f}ms[/]."
+            )
+        except Exception as e:
+            console.print(f"  [{WARNING}]Seeding failed: {e}[/]")
+        return
+
     try:
         from audiobench.storage.command_graph_repository import get_command_graph_repo
         repo = get_command_graph_repo()
@@ -1260,15 +2034,504 @@ def cmd_graph(session: ReplSession, args: str) -> None:
             ("Avg ms", {"width": 10, "justify": "right"}),
         ],
     )
-    for row in stats:
-        avg = f"{row['avg_ms']:.0f}" if row["avg_ms"] else "—"
-        table.add_row(row["command"], str(row["count"]), avg)
-    console.print(table)
+def _render_smart_bookmark_card(
+    session: ReplSession,
+    card: Any,
+    cite_num: int | None = None,
+) -> None:
+    """Render the Hermeneutic Codex Two-Tiered Smart Bookmark Card in monastic aesthetic."""
+    import textwrap
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.rule import Rule
+    from rich.table import Table
+    from audiobench.cli.display.theme import ACCENT, BOLD, BOX_STYLE, DIM, SUCCESS
+
+    # Register bridges for immediate interactive playback and focus navigation
+    bridges = getattr(card, "dialectic_bridges", []) or []
+    session.last_bookmark_bridges = {
+        i: b for i, b in enumerate(bridges[:3], 1)
+    }
+
+    term_width = (console.size.width if hasattr(console, "size") and console.size else None) or console.width or 80
+    avail_w = max(40, term_width - 4)
+
+    lines: list[str] = []
+    # Title & Metadata
+    title_text = f"Smart Bookmark: {card.work_title}"
+    lines.append(f"[{BOLD} {ACCENT}]{title_text}[/]")
+
+    school_str = ""
+    if getattr(card, "community_id", None):
+        c_name = getattr(card, "community_name", "") or ""
+        short_cname = f" {c_name}" if c_name else ""
+        school_str = f"  ·  School: #{card.community_id}{short_cname}"
+    lines.append(
+        f"[{DIM}]Author: {card.author}  ·  Timestamp: {card.timestamp_display}  ·  Expr #{card.expression_id}{school_str}[/]"
+    )
+    lines.append("")
+
+    # Focused Excerpt
+    lines.append(f"[{BOLD}]Focused Excerpt[/]")
+    group_items = ["\n".join(lines)]
+
+    quote_clean = card.quote.strip() if getattr(card, "quote", None) else ""
+    if quote_clean:
+        from rich.markdown import Markdown as RichMarkdown
+        from rich.padding import Padding
+        group_items.append(Padding(RichMarkdown(quote_clean), (0, 2)))
+    else:
+        group_items.append(f"  [{DIM}](No excerpt content available)[/]")
+
+    if getattr(card, "consensus_triangle", None):
+        tri = card.consensus_triangle
+        group_items.append(
+            f"\n  [{ACCENT}]Triadic Consensus:[/] [{BOLD}]{tri[0]}[/], [{BOLD}]{tri[1]}[/], [{BOLD}]{tri[2]}[/] "
+            f"[{DIM}](Closed cross-author dialectic)[/]"
+        )
+
+    group_items.append(Rule(style=DIM))
+
+    use_two_col = term_width >= 100
+    if use_two_col:
+        col_w = max(38, (avail_w - 5) // 2)
+        tbl = Table.grid(padding=(0, 1))
+        tbl.add_column(width=col_w, no_wrap=False)
+        tbl.add_column(width=1, style=DIM)
+        tbl.add_column(width=col_w, no_wrap=False)
+
+        left_lines: list[str] = []
+        left_lines.append(f"[{BOLD} {ACCENT}]Tier 1: Local Narrative Arc[/]")
+        left_lines.append(f"[{DIM}]Same-work thematic context and callbacks[/]")
+        left_lines.append("")
+        left_lines.append(f"[{BOLD}]◄ Context (Ignition)[/]")
+        if getattr(card, "preceding_context", None):
+            ctx = card.preceding_context[:220] + ("..." if len(card.preceding_context) > 220 else "")
+            w_ctx = textwrap.fill(f'"{ctx}"', width=col_w - 2)
+            for w in w_ctx.split("\n"):
+                left_lines.append(f"  [{DIM}]{w}[/]")
+        else:
+            left_lines.append(f"  [{DIM}](Opening or standalone passage)[/]")
+        left_lines.append("")
+        left_lines.append(f"[{BOLD}]► Resolution (Follow-up)[/]")
+        if getattr(card, "following_resolution", None):
+            res = card.following_resolution[:220] + ("..." if len(card.following_resolution) > 220 else "")
+            w_res = textwrap.fill(f'"{res}"', width=col_w - 2)
+            for w in w_res.split("\n"):
+                left_lines.append(f"  [{DIM}]{w}[/]")
+        else:
+            left_lines.append(f"  [{DIM}](Concluding or open-ended chapter segment)[/]")
+
+        right_lines: list[str] = []
+        right_lines.append(f"[{BOLD} {ACCENT}]Tier 2: Dialectic Bridges[/]")
+        right_lines.append(f"[{DIM}]Cross-library conceptual connections[/]")
+        right_lines.append("")
+        if bridges:
+            for idx, b in enumerate(bridges[:3], 1):
+                clique_flag = f" [{ACCENT}][Consensus Partner][/]" if b.is_clique_partner else ""
+                b_attr = f"{b.author} — {b.work_title}"
+                b_meta = f"Cosine: {b.cosine_similarity:.3f}"
+                max_attr = max(15, col_w - len(b_meta) - 10)
+                if len(b_attr) > max_attr:
+                    b_attr = b_attr[:max_attr - 1] + "…"
+                spaces = " " * max(1, col_w - len(b_attr) - len(b_meta) - 8)
+                b_hdr = f"[{ACCENT}][B{idx}][/] [{BOLD}]{b_attr}[/]{spaces}[{DIM}]{b_meta}[/]{clique_flag}"
+                right_lines.append(b_hdr)
+                snip = b.snippet[:200] + ("..." if len(b.snippet) > 200 else "")
+                w_snip = textwrap.fill(f'"{snip}"', width=col_w - 2)
+                for w in w_snip.split("\n"):
+                    right_lines.append(f"  [{DIM}]{w}[/]")
+                right_lines.append("")
+        else:
+            right_lines.append(f"  [{DIM}](No cross-library dialectic bridges detected)[/]")
+
+        max_rows = max(len(left_lines), len(right_lines))
+        for r_i in range(max_rows):
+            l = left_lines[r_i] if r_i < len(left_lines) else ""
+            r = right_lines[r_i] if r_i < len(right_lines) else ""
+            tbl.add_row(l, "│", r)
+        group_items.append(tbl)
+    else:
+        tbl = Table.grid(padding=(0, 0))
+        tbl.add_column(width=avail_w - 2, no_wrap=False)
+        tbl.add_row(f"[{BOLD} {ACCENT}]Tier 1: Local Narrative Arc[/] [{DIM}](Same-work context)[/]")
+        tbl.add_row(f"[{BOLD}]◄ Context (Ignition)[/]")
+        if getattr(card, "preceding_context", None):
+            ctx = card.preceding_context[:220] + ("..." if len(card.preceding_context) > 220 else "")
+            w_ctx = textwrap.fill(f'"{ctx}"', width=avail_w - 4)
+            for w in w_ctx.split("\n"):
+                tbl.add_row(f"  [{DIM}]{w}[/]")
+        else:
+            tbl.add_row(f"  [{DIM}](Opening or standalone passage)[/]")
+        tbl.add_row("")
+        tbl.add_row(f"[{BOLD}]► Resolution (Follow-up)[/]")
+        if getattr(card, "following_resolution", None):
+            res = card.following_resolution[:220] + ("..." if len(card.following_resolution) > 220 else "")
+            w_res = textwrap.fill(f'"{res}"', width=avail_w - 4)
+            for w in w_res.split("\n"):
+                tbl.add_row(f"  [{DIM}]{w}[/]")
+        else:
+            tbl.add_row(f"  [{DIM}](Concluding or open-ended chapter segment)[/]")
+        tbl.add_row("")
+        tbl.add_row(Rule(style=DIM))
+        tbl.add_row(f"[{BOLD} {ACCENT}]Tier 2: Dialectic Bridges[/] [{DIM}](Cross-library conceptual connections)[/]")
+        if bridges:
+            for idx, b in enumerate(bridges[:3], 1):
+                clique_flag = f" [{ACCENT}][Consensus Partner][/]" if b.is_clique_partner else ""
+                b_attr = f"{b.author} — {b.work_title}"
+                b_hdr = f"[{ACCENT}][B{idx}][/] [{BOLD}]{b_attr}[/] [{DIM}](Cosine: {b.cosine_similarity:.3f})[/]{clique_flag}"
+                tbl.add_row(b_hdr)
+                snip = b.snippet[:200] + ("..." if len(b.snippet) > 200 else "")
+                w_snip = textwrap.fill(f'"{snip}"', width=avail_w - 4)
+                for w in w_snip.split("\n"):
+                    tbl.add_row(f"  [{DIM}]{w}[/]")
+                tbl.add_row("")
+        else:
+            tbl.add_row(f"  [{DIM}](No cross-library dialectic bridges detected)[/]")
+        group_items.append(tbl)
+
+    # Docked Quick Actions Toolbar
+    actions: list[str] = []
+    if cite_num is not None:
+        actions.append(f"[{ACCENT}]\\play cite {cite_num}[/] [{DIM}]listen to citation[/]")
+    else:
+        actions.append(f"[{ACCENT}]\\play e{card.expression_id}[/] [{DIM}]listen to quote[/]")
+
+    if bridges:
+        b1 = bridges[0]
+        actions.append(f"[{ACCENT}]\\play b1[/] [{DIM}]jump to {b1.author}[/]")
+        actions.append(f"[{ACCENT}]\\focus b1[/] [{DIM}]focus {b1.author}[/]")
+
+    actions.append(f"[{ACCENT}]\\synthesize \"{card.work_title}\"[/] [{DIM}]synthesize perspectives[/]")
+
+    quick_toolbar = f"[{DIM}]Quick actions:[/]  " + "  •  ".join(actions)
+    group_items.append(Rule(style=DIM))
+    group_items.append(quick_toolbar)
+
+    panel = Panel(Group(*group_items), border_style=DIM, box=BOX_STYLE, expand=False)
+    console.print("")
+    console.print(panel)
+    console.print("")
+
+
+@register_backslash("bookmark")
+@register_backslash("bm")
+def cmd_bookmark(session: ReplSession, args: str) -> None:
+    """Inspect or create two-tiered smart contextual bookmark cards.
+
+    Usage:
+      \\bookmark <expression_id>    Show full Two-Tiered Smart Bookmark Card.
+      \\bookmark cite <number>      Open card directly from a synthesis citation [1], [2]...
+      \\bookmark list               List recent bookmarks.
+    """
+    parts = args.strip().split()
+    if not parts:
+        console.print("  [{DIM}]Usage: \\bookmark <expression_id> | \\bookmark cite <n> | \\bookmark list[/]")
+        return
+
+    sub = parts[0].lower()
+    from audiobench.memory.bookmark_service import generate_smart_bookmark_card
+
+    cite_num: int | None = None
+    if sub == "cite":
+        if len(parts) < 2 or not parts[1].isdigit():
+            console.print("  [{WARNING}]Please specify citation number: \\bookmark cite <1|2|3...>[/]")
+            return
+        cite_num = int(parts[1])
+        citations = getattr(session, "last_synthesis_citations", {})
+        if cite_num not in citations:
+            console.print(f"  [{WARNING}]Citation [{cite_num}] not found in last synthesis session.[/]")
+            return
+        expr_id = citations[cite_num]
+    elif sub == "list":
+        from audiobench.storage.bookmark_repository import BookmarkRepository
+        repo = BookmarkRepository()
+        bms = repo.list(limit=10)
+        if not bms:
+            console.print("  [{DIM}]No bookmarks saved yet.[/]")
+            return
+        table = make_table(
+            "Recent Bookmarks",
+            [
+                ("ID", {"width": 6, "justify": "right"}),
+                ("Track / File", {"style": ACCENT}),
+                ("Time", {"width": 10}),
+                ("Type", {"width": 10}),
+                ("Notes", {}),
+            ],
+        )
+        for b in bms:
+            table.add_row(
+                str(b["id"]),
+                b.get("audio_file_name", "—"),
+                b.get("timestamp_display", "—"),
+                b.get("bookmark_type", "bookmark"),
+                (b.get("notes") or "")[:40],
+            )
+        console.print(table)
+        return
+    elif sub.isdigit():
+        expr_id = int(sub)
+    else:
+        console.print(f"  [{WARNING}]Unknown argument: '{args}'. Run \\bookmark <id> or \\bookmark cite <n>[/]")
+        return
+
+    try:
+        card = generate_smart_bookmark_card(expr_id)
+        _render_smart_bookmark_card(session, card, cite_num=cite_num)
+    except Exception as e:
+        console.print(f"  [{WARNING}]Could not generate bookmark card for #{expr_id}: {e}[/]")
+
+
+@register_backslash("synthesize")
+@register_backslash("synth")
+def cmd_synthesize(session: ReplSession, args: str) -> None:
+    """Synthesize perspectives across the library using Graph-Augmented MMR and LLM.
+
+    Usage:
+      \\synthesize <theme or query>
+    """
+    query = args.strip().strip('"').strip("'")
+    if not query:
+        console.print("  [{DIM}]Usage: \\synthesize <thematic question or query>[/]")
+        return
+
+    scoped_cid: int | None = None
+    scoped_badge: str = ""
+    if session.focus and session.focus.type == "school":
+        scoped_cid = session.focus.id
+        scoped_badge = f"  [{ACCENT}]‹Scoped to {session.focus.label}›[/]"
+
+    console.print(f"  [{BOLD}]Synthesizing perspectives for:[/] \"{query}\"{scoped_badge}...")
+    try:
+        from audiobench.chat.synthesis_engine import generate_synthesis
+        from rich.markdown import Markdown
+
+        resp = generate_synthesis(query, community_id=scoped_cid)
+        # Populate interactive flywheel citation map
+        session.last_synthesis_citations = resp.citations
+
+        console.print("")
+        console.print(Markdown(resp.synthesis_text))
+        console.print("")
+
+        if resp.fragments:
+            console.print(f"  [{DIM}]Sources ({resp.elapsed_seconds:.2f}s | {resp.model_used}):[/]")
+            playable_indices = [idx for idx, f in enumerate(resp.fragments, 1) if getattr(f, "is_playable", True)]
+            text_indices = [idx for idx, f in enumerate(resp.fragments, 1) if not getattr(f, "is_playable", True)]
+
+            for idx, f in enumerate(resp.fragments, 1):
+                clique_flag = " [Consensus Partner]" if f.is_clique_partner else ""
+                is_playable = getattr(f, "is_playable", True)
+                author_style = BOLD if is_playable else ACCENT
+                console.print(
+                    f"    [{ACCENT}][{idx}][/] [{author_style}]{f.author}[/] — [{DIM}]{f.work_title}[/] "
+                    f"(EffRel: {f.effective_rel:.3f}){clique_flag}"
+                )
+
+            # Build clean, differentiated Flywheel prompt
+            if playable_indices and text_indices:
+                p_cites = " or ".join(str(i) for i in playable_indices[:2])
+                t_cite = text_indices[0]
+                t_author = resp.fragments[t_cite - 1].author
+                flywheel_msg = (
+                    f"Type [{ACCENT}]\\bookmark cite {t_cite}[/] for {t_author} to inspect the synthesis card, "
+                    f"or [{ACCENT}]\\play cite {p_cites}[/] to listen."
+                )
+            elif playable_indices:
+                p_first = playable_indices[0]
+                p_author = resp.fragments[p_first - 1].author
+                flywheel_msg = (
+                    f"Type [{ACCENT}]\\bookmark cite {p_first}[/] for {p_author} to inspect the full passage card, "
+                    f"or [{ACCENT}]\\play cite {p_first}[/] to listen."
+                )
+            elif text_indices:
+                t_first = text_indices[0]
+                t_author = resp.fragments[t_first - 1].author
+                flywheel_msg = (
+                    f"Type [{ACCENT}]\\bookmark cite {t_first}[/] for {t_author} to inspect the synthesis card."
+                )
+            else:
+                flywheel_msg = ""
+
+            if flywheel_msg:
+                console.print(f"\n  [{BOLD}]Flywheel:[/] {flywheel_msg}")
+    except Exception as e:
+        console.print(f"  [{WARNING}]Synthesis failed: {e}[/]")
 
 
 @register_backslash("suggest")
 def cmd_suggest(session: ReplSession, args: str) -> None:
-    """Suggest next actions based on your command history."""
+    """Suggest next listens based on knowledge graph connections, or next commands."""
+    mode_cmds = args.strip().lower() in ("cmd", "cmds", "command", "commands", "history")
+
+    # If the user specifically asks for command history or if no work is focused,
+    # show command history. Otherwise, generate Next Listen recommendations.
+    if not mode_cmds:
+        try:
+            from sqlalchemy import text as _sql
+            from audiobench.core.db_session import get_session
+            from audiobench.storage.models import WorkRecord
+
+            curr_wid: int | None = None
+            with get_session() as sdb:
+                if session.focus and session.focus.type == "work":
+                    curr_wid = session.focus.id
+                elif session.focus and session.focus.type == "file":
+                    row = sdb.execute(
+                        _sql("SELECT work_id FROM audio_files WHERE id = :afid"),
+                        {"afid": session.focus.id},
+                    ).fetchone()
+                    if row:
+                        curr_wid = row[0]
+                elif session.last_id is not None:
+                    row = sdb.execute(
+                        _sql("""
+                            SELECT COALESCE(
+                                (SELECT af.work_id FROM transcriptions t JOIN audio_files af ON t.audio_file_id = af.id WHERE t.id = :txid),
+                                (SELECT work_id FROM expressions WHERE source_type = 'transcription_chunk' AND source_id = :txid AND work_id IS NOT NULL LIMIT 1)
+                            )
+                        """),
+                        {"txid": session.last_id},
+                    ).fetchone()
+                    if row:
+                        curr_wid = row[0]
+
+                if curr_wid is not None:
+                    curr_work = sdb.query(WorkRecord).filter_by(id=curr_wid).first()
+                    work_title = curr_work.title if curr_work else f"Work #{curr_wid}"
+                    work_author = curr_work.author if curr_work and curr_work.author else ""
+
+                    # Find candidate target works connected via semantic edges with strict work isolation
+                    cand_works = sdb.execute(
+                        _sql("""
+                            SELECT 
+                                w2.id as work_id,
+                                w2.title as title,
+                                w2.author as author,
+                                COUNT(DISTINCT CASE 
+                                    WHEN r.from_expression_id < r.to_expression_id 
+                                    THEN r.from_expression_id || '_' || r.to_expression_id 
+                                    ELSE r.to_expression_id || '_' || r.from_expression_id 
+                                END) as edge_count,
+                                MAX(r.weight) as max_weight,
+                                AVG(r.weight) as avg_weight
+                            FROM expression_relations r
+                            JOIN expressions e1 ON (r.from_expression_id = e1.id OR r.to_expression_id = e1.id)
+                            JOIN expressions e2 ON (e2.id = CASE WHEN r.from_expression_id = e1.id THEN r.to_expression_id ELSE r.from_expression_id END)
+                            JOIN works w2 ON e2.work_id = w2.id
+                            WHERE e1.work_id = :curr_wid
+                              AND e2.work_id IS NOT NULL
+                              AND e2.work_id != :curr_wid
+                              AND r.relation_type = 'semantic'
+                            GROUP BY w2.id
+                            ORDER BY max_weight DESC, edge_count DESC
+                            LIMIT 4
+                        """),
+                        {"curr_wid": curr_wid},
+                    ).fetchall()
+
+                    if cand_works:
+                        # 3-Clique (Triadic Consensus) Detection
+                        # Find all works connected to curr_wid
+                        conn_to_curr_rows = sdb.execute(
+                            _sql("""
+                                SELECT DISTINCT e2.work_id
+                                FROM expression_relations r
+                                JOIN expressions e1 ON (r.from_expression_id = e1.id OR r.to_expression_id = e1.id)
+                                JOIN expressions e2 ON (e2.id = CASE WHEN r.from_expression_id = e1.id THEN r.to_expression_id ELSE r.from_expression_id END)
+                                WHERE e1.work_id = :curr_wid
+                                  AND e2.work_id IS NOT NULL
+                                  AND e2.work_id != :curr_wid
+                                  AND r.relation_type = 'semantic'
+                            """),
+                            {"curr_wid": curr_wid},
+                        ).fetchall()
+                        curr_neighbors = {r[0] for r in conn_to_curr_rows}
+
+                        author_str = f" by {work_author}" if work_author else ""
+                        console.print(f"\n  [{BOLD}]Next Listen Recommendations[/] [{DIM}](based on '{work_title}'{author_str})[/]:\n")
+
+                        for idx, cw in enumerate(cand_works, start=1):
+                            target_wid = cw[0]
+                            target_title = cw[1] or f"Work #{target_wid}"
+                            target_author = cw[2] or "Unknown Author"
+                            edge_cnt = cw[3]
+                            max_w = float(cw[4])
+
+                            # Check for 3-clique
+                            conn_to_target_rows = sdb.execute(
+                                _sql("""
+                                    SELECT DISTINCT e2.work_id, w2.author, w2.title
+                                    FROM expression_relations r
+                                    JOIN expressions e1 ON (r.from_expression_id = e1.id OR r.to_expression_id = e1.id)
+                                    JOIN expressions e2 ON (e2.id = CASE WHEN r.from_expression_id = e1.id THEN r.to_expression_id ELSE r.from_expression_id END)
+                                    JOIN works w2 ON e2.work_id = w2.id
+                                    WHERE e1.work_id = :target_wid
+                                      AND e2.work_id IS NOT NULL
+                                      AND e2.work_id != :target_wid
+                                      AND r.relation_type = 'semantic'
+                                """),
+                                {"target_wid": target_wid},
+                            ).fetchall()
+                            target_neighbors = {r[0]: (r[1] or r[2]) for r in conn_to_target_rows}
+                            mutual_wids = (curr_neighbors & set(target_neighbors.keys())) - {curr_wid, target_wid}
+
+                            clique_badge = ""
+                            if mutual_wids:
+                                mutual_partner_wid = next(iter(mutual_wids))
+                                partner_name = target_neighbors.get(mutual_partner_wid, f"Work #{mutual_partner_wid}")
+                                clique_badge = f" [{ACCENT}]▲ Consensus with {partner_name}[/]"
+
+                            # Best bridging excerpt
+                            bridge_row = sdb.execute(
+                                _sql("""
+                                    SELECT e2.content, e2.source_id
+                                    FROM expression_relations r
+                                    JOIN expressions e1 ON (r.from_expression_id = e1.id OR r.to_expression_id = e1.id)
+                                    JOIN expressions e2 ON (e2.id = CASE WHEN r.from_expression_id = e1.id THEN r.to_expression_id ELSE r.from_expression_id END)
+                                    WHERE e1.work_id = :curr_wid
+                                      AND e2.work_id = :target_wid
+                                      AND r.relation_type = 'semantic'
+                                    ORDER BY r.weight DESC
+                                    LIMIT 1
+                                """),
+                                {"curr_wid": curr_wid, "target_wid": target_wid},
+                            ).fetchone()
+
+                            # Resolving a playable transcript ID for the target work
+                            tx_row = sdb.execute(
+                                _sql("""
+                                    SELECT t.id 
+                                    FROM transcriptions t
+                                    JOIN audio_files af ON t.audio_file_id = af.id
+                                    WHERE af.work_id = :twid
+                                    ORDER BY t.id ASC LIMIT 1
+                                """),
+                                {"twid": target_wid},
+                            ).fetchone()
+                            play_id = tx_row[0] if tx_row else (bridge_row[1] if bridge_row and bridge_row[1] else None)
+
+                            match_pct = int(max_w * 100)
+                            console.print(f"  [{BOLD}]{idx}. {target_author} — {target_title}[/]{clique_badge}")
+                            console.print(f"     [{DIM}]Strength:[/] [{ACCENT}]{match_pct}% match[/] [{DIM}]({edge_cnt} cross-work bridges)[/]")
+                            if bridge_row and bridge_row[0]:
+                                bridge_excerpt = bridge_row[0].strip().replace("\n", " ")
+                                if len(bridge_excerpt) > 130:
+                                    bridge_excerpt = bridge_excerpt[:127] + "..."
+                                console.print(f"     [{DIM}]Bridge:[/] \"{bridge_excerpt}\"")
+                            if play_id:
+                                console.print(f"     [{DIM}]Listen:[/] [{ACCENT}]\\play {play_id}[/]  [{DIM}]or[/]  [{ACCENT}]\\related[/] [{DIM}]to explore[/]")
+                            else:
+                                console.print(f"     [{DIM}]Explore:[/] [{ACCENT}]\\related[/]")
+                            console.print()
+
+                        console.print(f"  [{DIM}]Tip: Type [italic]\\suggest commands[/italic] to view frequent action shortcuts.[/]\n")
+                        return
+        except Exception as e:
+            logger.warning("Next Listen suggestion failed: %s", e)
+
+    # ── Command History & Workflow Fallback ───────────────────────────
     try:
         from audiobench.storage.command_graph_repository import get_command_graph_repo
         repo = get_command_graph_repo()
@@ -1638,7 +2901,7 @@ def cmd_security(session: ReplSession, args: str) -> None:
         (3, "Override",   "manually flagged (--sensitive)",          tier >= 3),
     ]
     for n, name, desc, unlocked in tiers_info:
-        lock_icon = "✓" if unlocked else "🔒"
+        lock_icon = "✓" if unlocked else "x"
         color = SUCCESS if unlocked else "red"
         # Mark which tier is the active session unlock
         star = f" [{ACCENT}]★[/]" if n == session.session_unlock_tier and n > 0 else ""
@@ -1688,7 +2951,7 @@ def cmd_enroll(session: ReplSession, args: str) -> None:
             Panel(
                 f"  [{DIM}]↑↓/k j: Move  →/Enter: Enter dir  ←/h: Go up[/]\n"
                 f"  [{DIM}]s: Confirm highlighted file  q: Cancel[/]",
-                title=f"[bold][{ACCENT}]🎙 Voice Enrollment — Select Audio File[/][/]",
+                title=f"[bold][{ACCENT}]Voice Enrollment — Select Audio File[/][/]",
                 title_align="left",
                 border_style=ACCENT,
                 expand=False,
@@ -1728,7 +2991,7 @@ def cmd_enroll(session: ReplSession, args: str) -> None:
                     while True:
                         stdscr.clear()
                         height, width = stdscr.getmaxyx()
-                        header = " 🎙 Voice Enrollment — Pick a sample "
+                        header = " Voice Enrollment — Pick a sample "
                         path_str = f" {self.navigator.current_path}"
                         if len(path_str) > width - len(header) - 3:
                             path_str = "..." + path_str[-(width - len(header) - 6):]
@@ -1751,7 +3014,7 @@ def cmd_enroll(session: ReplSession, args: str) -> None:
                             idx = self.ui_offset + off
                             y = off + 3
                             item_path = self.navigator.current_path / item
-                            icon = "📁" if item_path.is_dir() else "🎵"
+                            icon = "[DIR]" if item_path.is_dir() else "[AUD]"
                             marker = "►" if idx == self.navigator.selected else " "
                             attr = curses.color_pair(3) | curses.A_BOLD if idx == self.navigator.selected else curses.color_pair(2)
                             max_len = width - 10
@@ -1861,7 +3124,7 @@ def cmd_enroll(session: ReplSession, args: str) -> None:
             f"  [bold]Name:[/]       {name}\n"
             f"  [bold]Model:[/]      ECAPA-TDNN  [{DIM}](speechbrain/spkrec-ecapa-voxceleb)[/]\n"
             f"  [bold]Threshold:[/]  {threshold}  [{DIM}](cosine similarity)[/]",
-            title=f"[bold][{ACCENT}]🎙 Voice Enrollment — Confirm[/][/]",
+            title=f"[bold][{ACCENT}]Voice Enrollment — Confirm[/][/]",
             title_align="left",
             border_style=ACCENT,
             expand=False,
@@ -2018,6 +3281,230 @@ def _playback_backslash(slash_command: str):
     return decorator
 
 
+def _play_school(session: ReplSession, cid: int, client: Any) -> None:
+    """Queue and sequentially play representative works of a school of thought."""
+    from audiobench.community.compute_medoids import select_representative_samples
+    from audiobench.playback.controls import fmt_timestamp
+    from audiobench.core.db_session import get_session
+    from sqlalchemy import text as _sql
+
+    # 1. Fetch community details
+    with _get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT community_id, name, medoid_expr_id, node_count FROM expression_communities WHERE community_id = ? AND is_active = 1",
+            (cid,),
+        )
+        row = cur.fetchone()
+        if not row:
+            console.print(f"  [{WARNING}]School #{cid} not found or inactive. Run \\schools to list available schools.[/]")
+            return
+        comm_id, name, medoid_id, node_count = row
+
+        # Fetch representative sample expressions across distinct works
+        samples = select_representative_samples(conn, cid, medoid_id=medoid_id, max_samples=4)
+
+    # 2. Build candidate list: medoid first, followed by samples from other works
+    candidate_eids: list[int] = []
+    if medoid_id:
+        candidate_eids.append(medoid_id)
+    for s in samples:
+        eid = s.get("id") or s.get("expression_id")
+        if eid and eid not in candidate_eids:
+            candidate_eids.append(eid)
+
+    if not candidate_eids:
+        console.print(f"  [{WARNING}]No representative passages available for School #{cid}.[/]")
+        return
+
+    # 3. Resolve audio files and segment timestamps
+    playable_items: list[dict[str, Any]] = []
+    with get_session() as sdb:
+        for eid in candidate_eids:
+            res = _resolve_expression_playback_info(sdb, eid)
+            e_id, tx_id, w_id, content, af_id, file_name, file_path, work_title, work_author, chap_start_time = res
+            if not file_path:
+                continue
+            start_time, end_time, speaker = _resolve_thought_segment(sdb, e_id, tx_id or 0, content)
+            if start_time == 0.0 and chap_start_time > 0.0:
+                start_time = float(chap_start_time)
+            playable_items.append({
+                "expression_id": e_id,
+                "transcription_id": tx_id,
+                "audio_file_id": af_id,
+                "file_name": file_name,
+                "file_path": file_path,
+                "work_title": work_title or file_name or f"Work #{w_id}",
+                "work_author": work_author or "Unknown Author",
+                "start_time": start_time,
+                "end_time": end_time,
+                "content": content,
+            })
+
+    if not playable_items:
+        console.print(f"  [{WARNING}]No playable audio tracks found for School #{cid}.[/]")
+        return
+
+    # 4. Save to session playlist
+    session.school_playlist = {
+        "community_id": cid,
+        "title": name,
+        "items": playable_items,
+        "index": 0,
+    }
+
+    # 5. Play first track
+    track0 = playable_items[0]
+    client.playback_play(
+        track0["file_path"],
+        start_pos=track0["start_time"],
+        audio_file_id=track0["audio_file_id"],
+        transcription_id=track0["transcription_id"],
+    )
+
+    # 6. Render queue summary (zero emojis)
+    console.print(f"\n  [{SUCCESS}]> Playing School #{cid:02d}:[/] [{BOLD}]{name}[/]")
+    console.print(f"  [{DIM}]{'─' * 60}[/]")
+    console.print(
+        f"  [{ACCENT}]Track [1/{len(playable_items)}]:[/] [{BOLD}]{track0['work_author']} — {track0['work_title']}[/] "
+        f"at [{ACCENT}]{fmt_timestamp(track0['start_time'])}[/]"
+    )
+    if len(playable_items) > 1:
+        console.print(f"\n  [{DIM}]Upcoming in queue:[/]")
+        for i, trk in enumerate(playable_items[1:], 2):
+            console.print(
+                f"    [{DIM}][{i}][/] {trk['work_author']} — {trk['work_title']} "
+                f"[{DIM}]({fmt_timestamp(trk['start_time'])})[/]"
+            )
+    console.print(f"  [{DIM}]{'─' * 60}[/]")
+    console.print(f"  [{DIM}]Use [{ACCENT}]\\next[/] to advance or [{ACCENT}]\\prev[/] to go back.[/]\n")
+
+
+def _resolve_expression_playback_info(
+    session_db: Any, expr_id: int
+) -> tuple[int, int, int | None, str, int | None, str | None, str | None, str | None, str | None, float]:
+    """Retrieve playback metadata for any expression, coalescing transcriptions and chapters.
+
+    Returns:
+        (eid, tx_id, wid, content, af_id, file_name, file_path, work_title, work_author, chap_start_time)
+    """
+    from sqlalchemy import text as _sql
+
+    row = session_db.execute(
+        _sql("""
+            SELECT e.id,
+                   COALESCE(t.id, 0) as transcription_id,
+                   e.work_id,
+                   e.content,
+                   COALESCE(t.audio_file_id, c.audio_file_id, c2.audio_file_id) as audio_file_id,
+                   COALESCE(af_t.file_name, af_c.file_name, af_c2.file_name) as file_name,
+                   COALESCE(af_t.file_path, af_c.file_path, af_c2.file_path) as file_path,
+                   w.title as work_title,
+                   w.author as work_author,
+                   COALESCE(c.start_time, c2.start_time, 0.0) as chapter_start_time
+            FROM expressions e
+            LEFT JOIN transcriptions t ON (e.source_type IN ('audio_transcript', 'transcription_chunk') AND e.source_id = t.id)
+            LEFT JOIN audio_files af_t ON t.audio_file_id = af_t.id
+            LEFT JOIN chapters c ON (e.source_type = 'chapter_summary' AND e.source_id = c.id)
+            LEFT JOIN audio_files af_c ON c.audio_file_id = af_c.id
+            LEFT JOIN chapters c2 ON (e.chapter_id IS NOT NULL AND e.chapter_id = c2.id)
+            LEFT JOIN audio_files af_c2 ON c2.audio_file_id = af_c2.id
+            LEFT JOIN works w ON e.work_id = w.id
+            WHERE e.id = :eid
+        """),
+        {"eid": expr_id},
+    ).fetchone()
+    if not row:
+        return (expr_id, 0, None, "", None, None, None, None, None, 0.0)
+    eid = row[0]
+    tx_id = row[1]
+    wid = row[2]
+    content = row[3]
+    af_id = row[4]
+    file_name = row[5]
+    file_path = row[6]
+    work_title = row[7]
+    work_author = row[8]
+    chap_start_time = float(row[9]) if len(row) > 9 and row[9] is not None else 0.0
+    return (eid, tx_id, wid, content, af_id, file_name, file_path, work_title, work_author, chap_start_time)
+
+
+def _play_expression(
+    session: ReplSession,
+    client: Any,
+    expr_id: int,
+    label: str = "",
+) -> bool:
+    """Resolve and initiate playback for any semantic expression (transcript or chapter)."""
+    from audiobench.core.db_session import get_session
+    from audiobench.playback.controls import fmt_timestamp
+    from sqlalchemy import text as _sql
+
+    with get_session() as sdb:
+        st_row = sdb.execute(
+            _sql("SELECT source_type FROM expressions WHERE id = :eid"),
+            {"eid": expr_id},
+        ).fetchone()
+        source_type = st_row[0] if st_row else ""
+        if source_type in ("search_synthesis", "search_session_summary", "chat_message", "journal_entry"):
+            target_desc = label.capitalize() if label else f"Expression #{expr_id}"
+            type_label = (
+                "prior research synthesis" if source_type == "search_synthesis"
+                else "past research session summary" if source_type == "search_session_summary"
+                else "chat reflection" if source_type == "chat_message"
+                else "cognitive journal entry"
+            )
+            console.print(
+                f"  [{DIM}]{target_desc} (Expression #{expr_id}) is a text-based {type_label}, "
+                f"not an audio recording.[/]"
+            )
+            if label:
+                if "citation [" in label.lower():
+                    c_num = label.lower().split("[")[-1].rstrip("]")
+                    bm_cmd = f"\\bookmark cite {c_num}"
+                elif "bridge [" in label.lower():
+                    b_num = label.lower().split("[")[-1].rstrip("]").lstrip("b")
+                    bm_cmd = f"\\bookmark b{b_num}"
+                else:
+                    bm_cmd = f"\\bookmark {expr_id}"
+                console.print(
+                    f"  [{DIM}]Use [{ACCENT}]{bm_cmd}[/] to inspect the full text card and dialectic connections.[/]"
+                )
+            return False
+
+        res = _resolve_expression_playback_info(sdb, expr_id)
+        eid, tx_id, wid, content, af_id, file_name, file_path, work_title, work_author, chap_start_time = res
+
+        if not file_path:
+            tag = f" for {label}" if label else ""
+            console.print(f"  [{WARNING}]Could not locate audio file{tag} (Expression #{expr_id}).[/]")
+            return False
+
+        start_time, end_time, speaker = _resolve_thought_segment(sdb, eid, tx_id or 0, content)
+        if start_time == 0.0 and chap_start_time > 0.0:
+            start_time = float(chap_start_time)
+
+        st = client.playback_status()
+        if st.get("playing") and st.get("transcription_id") == tx_id and tx_id:
+            client.playback_seek(start_time)
+        else:
+            client.playback_play(
+                file_path,
+                start_pos=start_time,
+                audio_file_id=af_id,
+                transcription_id=tx_id,
+            )
+
+        author_str = f"{work_author} — " if work_author else ""
+        title_str = f"{work_title}" if work_title else file_name
+        tag = f" {label}:" if label else ":"
+        console.print(
+            f"  [{SUCCESS}]> Playing{tag}[/] [{BOLD}]{author_str}{title_str}[/] "
+            f"at [{ACCENT}]{fmt_timestamp(start_time)}[/]"
+        )
+        return True
+
+
 @register_backslash("play")
 def cmd_play(session: ReplSession, args: str) -> None:
     """Play audio for current or specified transcript, or seek to timestamp."""
@@ -2027,9 +3514,73 @@ def cmd_play(session: ReplSession, args: str) -> None:
     client = get_daemon_client()
 
     arg_clean = args.strip()
-    if arg_clean.isdigit() and getattr(session, "last_related", None):
+
+    if arg_clean.lower() in ("next", "n"):
+        cmd_next(session, "")
+        return
+
+    if arg_clean.lower() in ("prev", "p", "back", "b"):
+        cmd_prev(session, "")
+        return
+
+    # School playback: \play school <id>, \play school:<id>, \play s<id>, or bare \play school
+    school_play_id: int | None = None
+    lower_play = arg_clean.lower()
+    if lower_play.startswith("school ") and lower_play[7:].strip().lstrip("#").isdigit():
+        school_play_id = int(lower_play[7:].strip().lstrip("#"))
+    elif lower_play.startswith("school:") and lower_play[7:].strip().lstrip("#").isdigit():
+        school_play_id = int(lower_play[7:].strip().lstrip("#"))
+    elif lower_play.startswith("s") and lower_play[1:].isdigit():
+        school_play_id = int(lower_play[1:])
+    elif lower_play == "school" and session.focus and session.focus.type == "school":
+        school_play_id = session.focus.id
+
+    if school_play_id is not None:
+        _play_school(session, school_play_id, client)
+        return
+
+    # Citation playback from synthesis: \play cite <n>
+    if arg_clean.startswith("cite"):
+        parts = arg_clean.split()
+        if len(parts) < 2 or not parts[1].isdigit():
+            console.print("  [{WARNING}]Please specify citation number: \\play cite <1|2|3...>[/]")
+            return
+        cite_num = int(parts[1])
+        citations = getattr(session, "last_synthesis_citations", {})
+        if cite_num not in citations:
+            console.print(f"  [{WARNING}]Citation [{cite_num}] not found. Run \\synthesize <query> first.[/]")
+            return
+        expr_id = citations[cite_num]
+        _play_expression(session, client, expr_id, label=f"citation [{cite_num}]")
+        return
+
+    # Dialectic bridge playback from bookmark: \play b1, \play b2, \play b3 (or \play bridge 1)
+    b_idx: int | None = None
+    if lower_play.startswith("b") and lower_play[1:].isdigit():
+        b_idx = int(lower_play[1:])
+    elif lower_play.startswith("bridge") and lower_play[6:].strip().isdigit():
+        b_idx = int(lower_play[6:].strip())
+
+    if b_idx is not None:
+        bridges = getattr(session, "last_bookmark_bridges", {})
+        if b_idx not in bridges:
+            console.print(f"  [{WARNING}]Dialectic bridge [B{b_idx}] not found. Run \\bookmark to view bridges.[/]")
+            return
+        bridge = bridges[b_idx]
+        _play_expression(session, client, bridge.target_expression_id, label=f"bridge [B{b_idx}]")
+        return
+
+    # Explicit expression playback: \play expr <id> or \play e<id>
+    if lower_play.startswith("expr ") or (lower_play.startswith("e") and lower_play[1:].isdigit()):
+        e_str = lower_play[1:] if lower_play.startswith("e") and not lower_play.startswith("expr") else lower_play[5:].strip()
+        if e_str.isdigit():
+            eid = int(e_str)
+            if _play_expression(session, client, eid, label=f"Expression #{eid}"):
+                return
+
+    if arg_clean.isdigit():
         idx = int(arg_clean)
-        if 1 <= idx <= len(session.last_related):
+        if getattr(session, "last_related", None) and 1 <= idx <= len(session.last_related):
             thought = session.last_related[idx - 1]
             if thought.file_path:
                 from audiobench.playback.controls import fmt_timestamp
@@ -2045,10 +3596,14 @@ def cmd_play(session: ReplSession, args: str) -> None:
                         transcription_id=thought.transcript_id,
                     )
                 console.print(
-                    f"  [{SUCCESS}]▶ Playing thought #{idx}[/] from [{ACCENT}]{thought.file_name}[/] "
+                    f"  [{SUCCESS}]> Playing thought #{idx}[/] from [{ACCENT}]{thought.file_name}[/] "
                     f"at [{BOLD}]{fmt_timestamp(thought.start_time)}[/]"
                 )
                 return
+        elif getattr(session, "last_bookmark_bridges", None) and idx in session.last_bookmark_bridges:
+            bridge = session.last_bookmark_bridges[idx]
+            _play_expression(session, client, bridge.target_expression_id, label=f"bridge [B{idx}]")
+            return
 
     repo = session._get_repo() if hasattr(session, "_get_repo") else None
     if repo is None:
@@ -2067,6 +3622,79 @@ def cmd_play(session: ReplSession, args: str) -> None:
         transcript_resolver=(lambda tid: repo.get_by_id(tid, session=session)) if repo else None,
         loaded_transcript_ids=loaded_ids,
     )
+
+
+@register_backslash("next")
+@register_backslash("n")
+def cmd_next(session: ReplSession, args: str) -> None:
+    """Advance to the next track in the school queue or citation."""
+    playlist = getattr(session, "school_playlist", None)
+    if playlist and playlist.get("items"):
+        idx = playlist.get("index", 0) + 1
+        items = playlist["items"]
+        if idx >= len(items):
+            console.print(f"  [{DIM}]Reached end of playlist for School #{playlist['community_id']}.[/]")
+            return
+        playlist["index"] = idx
+        track = items[idx]
+        from audiobench.daemon.factory import get_daemon_client
+        from audiobench.playback.controls import fmt_timestamp
+
+        client = get_daemon_client()
+        client.playback_play(
+            track["file_path"],
+            start_pos=track["start_time"],
+            audio_file_id=track["audio_file_id"],
+            transcription_id=track["transcription_id"],
+        )
+        console.print(
+            f"  [{SUCCESS}]> Playing track [{idx + 1}/{len(items)}]:[/] "
+            f"[{BOLD}]{track['work_author']} — {track['work_title']}[/] "
+            f"at [{ACCENT}]{fmt_timestamp(track['start_time'])}[/]"
+        )
+        return
+
+    from audiobench.daemon.factory import get_daemon_client
+    from audiobench.playback.controls import handle_playback_command
+
+    handle_playback_command("/next", args, get_daemon_client(), console)
+
+
+@register_backslash("prev")
+@register_backslash("p")
+def cmd_prev(session: ReplSession, args: str) -> None:
+    """Return to previous track in the school queue or citation."""
+    playlist = getattr(session, "school_playlist", None)
+    if playlist and playlist.get("items"):
+        idx = playlist.get("index", 0) - 1
+        items = playlist["items"]
+        if idx < 0:
+            console.print(f"  [{DIM}]Already at first track of School #{playlist['community_id']}.[/]")
+            return
+        playlist["index"] = idx
+        track = items[idx]
+        from audiobench.daemon.factory import get_daemon_client
+        from audiobench.playback.controls import fmt_timestamp
+
+        client = get_daemon_client()
+        client.playback_play(
+            track["file_path"],
+            start_pos=track["start_time"],
+            audio_file_id=track["audio_file_id"],
+            transcription_id=track["transcription_id"],
+        )
+        console.print(
+            f"  [{SUCCESS}]> Playing track [{idx + 1}/{len(items)}]:[/] "
+            f"[{BOLD}]{track['work_author']} — {track['work_title']}[/] "
+            f"at [{ACCENT}]{fmt_timestamp(track['start_time'])}[/]"
+        )
+        return
+
+    from audiobench.daemon.factory import get_daemon_client
+    from audiobench.playback.controls import handle_playback_command
+
+    handle_playback_command("/prev", args, get_daemon_client(), console)
+
 
 
 @_playback_backslash("/seek")
@@ -2109,6 +3737,21 @@ def cmd_clip(session: ReplSession, args: str) -> None:
     """Clip audio between two timestamps (e.g. \\clip 6:30 7:00)."""
 
 
+@_playback_backslash("/lyrics")
+def cmd_lyrics(session: ReplSession, args: str) -> None:
+    """Launch interactive live lyrics / karaoke follow HUD for daemon playback."""
+
+
+@_playback_backslash("/karaoke")
+def cmd_karaoke(session: ReplSession, args: str) -> None:
+    """Launch interactive live lyrics / karaoke follow HUD (alias for \\lyrics)."""
+
+
+@_playback_backslash("/follow")
+def cmd_follow(session: ReplSession, args: str) -> None:
+    """Launch interactive live lyrics / karaoke follow HUD (alias for \\lyrics)."""
+
+
 @register_backslash("info")
 def cmd_info(session: ReplSession, args: str) -> None:
     """Display 360-degree dossier for an audio file or transcript."""
@@ -2119,4 +3762,653 @@ def cmd_info(session: ReplSession, args: str) -> None:
         console.print("  [dim]Usage: \\info <target> (audio file ID, transcript ID, or filename)[/]")
         return
     render_file_dossier(target, console)
+
+
+@register_backslash("schools")
+def cmd_schools(session: ReplSession, args: str) -> None:
+    """List all emergent intellectual schools of thought."""
+    from audiobench.community.community_service import list_active_schools
+
+    try:
+        with _get_db_connection() as conn:
+            schools = list_active_schools(conn)
+    except Exception as e:
+        console.print(f"  [{WARNING}]Could not load schools of thought: {e}[/]")
+        return
+
+    if not schools:
+        console.print(
+            f"  [{DIM}]No active schools of thought found. "
+            f"Run canonical community clustering to generate them.[/]"
+        )
+        return
+
+    table = make_table(
+        f"Schools of Thought ({len(schools)} Active Communities)",
+        [
+            ("ID", {"style": ACCENT, "no_wrap": True, "width": 5}),
+            ("School of Thought", {"style": BOLD}),
+            ("Chunks", {"justify": "right", "width": 8}),
+            ("Core Literature / Authors", {"style": DIM}),
+        ],
+    )
+    for s in schools:
+        table.add_row(
+            f"#{s['community_id']:02d}",
+            s["name"],
+            str(s["node_count"]),
+            s["core_sources"],
+        )
+
+    console.print(table)
+
+
+@register_backslash("school")
+def cmd_school(session: ReplSession, args: str) -> None:
+    """Inspect a specific School of Thought dossier card."""
+    import textwrap
+    from rich.panel import Panel
+    from rich.table import Table
+    from audiobench.cli.display.theme import BOX_STYLE
+    from audiobench.community.community_service import get_school_details
+    from audiobench.community.compute_medoids import format_sample_passage
+
+    clean_arg = args.strip().lstrip("#")
+    if not clean_arg:
+        console.print(f"  [{DIM}]Usage: \\school <id> (e.g. \\school 12)[/]")
+        return
+
+    if not clean_arg.isdigit():
+        console.print(f"  [{WARNING}]Invalid school ID: '{args.strip()}'. Run \\schools to see available IDs.[/]")
+        return
+
+    cid = int(clean_arg)
+    try:
+        with _get_db_connection() as conn:
+            details = get_school_details(conn, cid)
+    except Exception as e:
+        console.print(f"  [{WARNING}]Error loading school #{cid}: {e}[/]")
+        return
+
+    if not details:
+        console.print(f"  [{WARNING}]School #{cid} not found or inactive. Run \\schools to see available schools.[/]")
+        return
+
+    from rich.console import Group
+    from rich.rule import Rule
+
+    term_width = (console.size.width if hasattr(console, "size") and console.size else None) or console.width or 80
+    avail_w = max(40, term_width - 4)
+
+    lines = []
+    lines.append(f"[{BOLD} {ACCENT}]School #{details['community_id']:02d}: {details['name']}[/]")
+    lines.append(
+        f"[{DIM}]Size: {details['node_count']} chunks  ·  "
+        f"Resolution: {details['resolution']:.2f}  ·  "
+        f"Seed: {details['seed']}  ·  "
+        f"Medoid: Expr #{details['medoid']['id']}[/]"
+    )
+    lines.append("")
+
+    # Medoid
+    lines.append(f"[{BOLD}]Medoid Passage (Core Center)[/]")
+    m = details["medoid"]
+    m_author = m["work_author"]
+    m_title = m["work_title"]
+    m_attr = f"— {m_author}, {m_title}" if m_author else f"— {m_title}"
+    if m["content"]:
+        m_txt = m.get("formatted_content") or m["content"]
+        lines.append(f"  [{DIM}]\"{m_txt}\"[/]")
+        lines.append(f"  [{ACCENT}]{m_attr}[/]")
+    else:
+        lines.append(f"  [{DIM}](No medoid expression assigned)[/]")
+    lines.append("")
+
+    # Top works
+    lines.append(f"[{BOLD}]Top Works Breakdown[/]")
+    for tw in details["top_works"]:
+        w_attr = f"{tw['author']} — {tw['title']}" if tw["author"] and tw["author"] != "Unknown Author" else tw["title"]
+        lines.append(f"  [{ACCENT}]•[/] {w_attr}: [{BOLD}]{tw['count']}[/] chunks [{DIM}]({tw['pct']:.1f}%)[/]")
+
+    # Key Sample Expressions (Two-Column Book Mode inside continuous window)
+    samples = details.get("sample_expressions") or []
+    use_book = term_width >= 100 and len(samples) >= 2
+    mode_label = "2-column book mode" if use_book else "single column"
+
+    lines.append("")
+    lines.append(f"[{BOLD} {ACCENT}]Key Sample Expressions[/] [{DIM}]({len(samples)} core expressions · {mode_label})[/]")
+
+    group_items = ["\n".join(lines), Rule(style=DIM)]
+
+    if not samples:
+        group_items.append(f"  [{DIM}](No additional sample expressions found)[/]")
+    else:
+        if use_book:
+            col_w = max(38, (avail_w - 5) // 2)
+            tbl = Table.grid(padding=(0, 1))
+            tbl.add_column(width=col_w, no_wrap=False)
+            tbl.add_column(width=1, style=DIM)
+            tbl.add_column(width=col_w, no_wrap=False)
+
+            sample_blocks = []
+            for s in samples:
+                s_author = s["author"]
+                s_title = s["title"]
+                s_attr = f"{s_author} — {s_title}" if s_author and s_author != "Unknown Author" else s_title
+                s_suffix = f"Expr #{s['id']} · Str: {s['strength']:.1f}"
+                max_attr = max(15, col_w - len(s_suffix) - 2)
+                if len(s_attr) > max_attr:
+                    s_attr = s_attr[:max_attr - 1] + "…"
+                spaces = " " * max(1, col_w - len(s_attr) - len(s_suffix))
+                s_hdr = f"[{BOLD}]{s_attr}[/] {spaces}[{DIM}]{s_suffix}[/]"
+
+                formatted_txt = s.get("formatted_content") or format_sample_passage(s["content"], max_chars=280)
+                wrapped = textwrap.fill(f'"{formatted_txt}"', width=col_w - 2)
+                block = [s_hdr] + [f"  [{DIM}]{w}[/]" for w in wrapped.split("\n")]
+                sample_blocks.append(block)
+
+            left_lines: list[str] = []
+            right_lines: list[str] = []
+            for idx, b in enumerate(sample_blocks):
+                target = left_lines if idx % 2 == 0 else right_lines
+                target.extend(b)
+                target.append("")
+
+            max_lines = max(len(left_lines), len(right_lines))
+            for r_i in range(max_lines):
+                l = left_lines[r_i] if r_i < len(left_lines) else ""
+                r = right_lines[r_i] if r_i < len(right_lines) else ""
+                tbl.add_row(l, "│", r)
+            group_items.append(tbl)
+        else:
+            tbl = Table.grid(padding=(0, 0))
+            tbl.add_column(width=avail_w - 2, no_wrap=False)
+            for s in samples:
+                s_author = s["author"]
+                s_title = s["title"]
+                s_attr = f"{s_author} — {s_title}" if s_author and s_author != "Unknown Author" else s_title
+                s_suffix = f"Expr #{s['id']} · Str: {s['strength']:.1f}"
+                s_hdr = f"[{BOLD}]{s_attr}[/]  [{DIM}]{s_suffix}[/]"
+                tbl.add_row(s_hdr)
+                formatted_txt = s.get("formatted_content") or format_sample_passage(s["content"], max_chars=280)
+                wrapped = textwrap.fill(f'"{formatted_txt}"', width=avail_w - 4)
+                for w in wrapped.split("\n"):
+                    tbl.add_row(f"  [{DIM}]{w}[/]")
+                tbl.add_row("")
+            group_items.append(tbl)
+
+    quick_actions = (
+        f"[{DIM}]Quick actions:[/]  "
+        f"[{ACCENT}]\\play school {cid}[/] [{DIM}]listen to school[/]  •  "
+        f"[{ACCENT}]\\related school {cid}[/] [{DIM}]school relations & bridges[/]  •  "
+        f"[{ACCENT}]\\schools[/] [{DIM}]list all schools[/]"
+    )
+    group_items.append(Rule(style=DIM))
+    group_items.append(quick_actions)
+
+    panel = Panel(Group(*group_items), border_style=DIM, box=BOX_STYLE, expand=False)
+    console.print(panel)
+
+
+# ── Proposals Inspection & Governance (\proposals, \prop) ───────────────────
+
+
+def _is_daemon_alive() -> bool:
+    """Check if the background daemon is reachable via socket without autostarting."""
+    try:
+        from audiobench.daemon.client import DaemonClient
+
+        return DaemonClient()._raw_ping()
+    except Exception:
+        return False
+
+
+def _fetch_daemon_proposals(
+    expression_id: int | None = None,
+    include_all: bool = False,
+    status: str | None = None,
+) -> list[dict]:
+    """Fetch proposals from daemon socket or fallback to audited in-process server handler."""
+    if _is_daemon_alive():
+        try:
+            from audiobench.daemon.client import DaemonClient
+
+            return DaemonClient().get_proposals(
+                expression_id=expression_id,
+                include_all=include_all,
+                status=status,
+            )
+        except Exception:
+            pass
+
+    from audiobench.daemon.server import _handle_get_proposals
+
+    args: dict[str, Any] = {}
+    if expression_id is not None:
+        args["expression_id"] = expression_id
+    if include_all:
+        args["include_all"] = True
+    if status is not None:
+        args["status"] = status
+    res = _handle_get_proposals(args)
+    return res.get("proposals", [])
+
+
+def _authorize_daemon_proposal(expression_id: int) -> dict:
+    """Authorize proposal via daemon socket or fallback to audited in-process server handler."""
+    if _is_daemon_alive():
+        try:
+            from audiobench.daemon.client import DaemonClient
+
+            return DaemonClient().authorize_proposal(expression_id)
+        except Exception:
+            pass
+
+    from audiobench.daemon.server import _handle_authorize_proposal
+
+    return _handle_authorize_proposal({"expression_id": expression_id})
+
+
+def _defer_daemon_proposal(expression_id: int) -> dict:
+    """Defer proposal via daemon socket or fallback to audited in-process server handler."""
+    if _is_daemon_alive():
+        try:
+            from audiobench.daemon.client import DaemonClient
+
+            return DaemonClient().defer_proposal(expression_id)
+        except Exception:
+            pass
+
+    from audiobench.daemon.server import _handle_defer_proposal
+
+    return _handle_defer_proposal({"expression_id": expression_id})
+
+
+def _reject_daemon_proposal(expression_id: int) -> dict:
+    """Reject proposal via daemon socket or fallback to audited in-process server handler."""
+    if _is_daemon_alive():
+        try:
+            from audiobench.daemon.client import DaemonClient
+
+            return DaemonClient().reject_proposal(expression_id)
+        except Exception:
+            pass
+
+    from audiobench.daemon.server import _handle_reject_proposal
+
+    return _handle_reject_proposal({"expression_id": expression_id})
+
+
+def _parse_proposal_payload(content: str) -> tuple[str, str, dict]:
+    """Extract proposal_type, display_title, and parsed data dictionary."""
+    content_str = (content or "").strip()
+    if not content_str.startswith("{"):
+        preview = content_str[:70].replace("\n", " ")
+        return "legacy", preview, {}
+
+    try:
+        import json
+
+        data = json.loads(content_str)
+        if not isinstance(data, dict):
+            return "legacy", content_str[:70], {}
+
+        prop_type = data.get(
+            "proposal_type",
+            "operator" if "operator_template" in data else "proposal",
+        )
+        title = data.get("title") or data.get("summary") or content_str[:70]
+        return prop_type, title, data
+    except Exception:
+        return "legacy", content_str[:70], {}
+
+
+@register_backslash("proposals")
+@register_backslash("prop")
+def cmd_proposals(session: ReplSession, args: str) -> None:
+    """Inspect and manage daemon proposals (knowledge gaps, operators).
+
+    Usage:
+        \\proposals                      List pending proposals (proposed/deferred)
+        \\proposals list [all|status]    List proposals with optional status filter
+        \\proposals show <id>            Show detailed dossier for a proposal
+        \\proposals <id>                 Shorthand for \\proposals show <id>
+        \\proposals authorize <id>       Authorize/confirm an operator or knowledge gap
+        \\proposals defer <id>           Defer proposal from active alerts
+        \\proposals reject <id>          Reject and dismiss proposal
+    """
+    tokens = args.strip().split()
+    subcmd = tokens[0].lower() if tokens else "list"
+
+    clean_subcmd = subcmd.lstrip("#")
+    if clean_subcmd.isdigit():
+        _show_proposal(int(clean_subcmd))
+        return
+
+    if subcmd in ("all", "*"):
+        _list_proposals(include_all=True)
+        return
+
+    if subcmd in ("list", "ls"):
+        status_filter = tokens[1].lower() if len(tokens) > 1 else None
+        include_all = status_filter in ("all", "*")
+        eff_status = (
+            None
+            if include_all
+            else (
+                status_filter
+                if status_filter in ("proposed", "deferred", "confirmed", "rejected")
+                else None
+            )
+        )
+        _list_proposals(include_all=include_all, status=eff_status)
+    elif subcmd in ("show", "info", "view", "dossier"):
+        raw_id = tokens[1].lstrip("#") if len(tokens) > 1 else ""
+        if not raw_id.isdigit():
+            console.print(f"[{ERROR}]Usage: \\proposals show <id>[/]")
+            return
+        _show_proposal(int(raw_id))
+    elif subcmd in ("authorize", "auth", "confirm", "accept"):
+        raw_id = tokens[1].lstrip("#") if len(tokens) > 1 else ""
+        if not raw_id.isdigit():
+            console.print(f"[{ERROR}]Usage: \\proposals authorize <id>[/]")
+            return
+        _authorize_proposal(int(raw_id))
+    elif subcmd in ("defer", "pause"):
+        raw_id = tokens[1].lstrip("#") if len(tokens) > 1 else ""
+        if not raw_id.isdigit():
+            console.print(f"[{ERROR}]Usage: \\proposals defer <id>[/]")
+            return
+        _defer_proposal(int(raw_id))
+    elif subcmd in ("reject", "dismiss", "del", "rm"):
+        raw_id = tokens[1].lstrip("#") if len(tokens) > 1 else ""
+        if not raw_id.isdigit():
+            console.print(f"[{ERROR}]Usage: \\proposals reject <id>[/]")
+            return
+        _reject_proposal(int(raw_id))
+    else:
+        console.print(
+            f"[{ERROR}]Unknown subcommand: {subcmd}.[/] Type [{ACCENT}]\\help proposals[/] for usage."
+        )
+
+
+def _list_proposals(include_all: bool = False, status: str | None = None) -> None:
+    """Render table of proposals."""
+    from rich.markup import escape
+    from rich.table import Table
+
+    from audiobench.daemon.intelligence.proposal_cluster import canonical_cluster_key
+
+    proposals = _fetch_daemon_proposals(include_all=include_all, status=status)
+    if not proposals:
+        target = f"'{status}'" if status else ("all" if include_all else "pending")
+        console.print(f"[{DIM}]No {target} proposals found.[/]")
+        return
+
+    if not include_all:
+        clusters: dict[tuple, list[dict]] = {}
+        for p in proposals:
+            k = canonical_cluster_key(p.get("content", ""))
+            clusters.setdefault(k, []).append(p)
+
+        display_proposals = []
+        cluster_run_counts: dict[int, int] = {}
+        for group in clusters.values():
+            # Select representative: prefer confirmed first, then highest ID
+            rep = sorted(
+                group,
+                key=lambda x: (x.get("inference_status") == "confirmed", x.get("id", 0)),
+                reverse=True,
+            )[0]
+            display_proposals.append(rep)
+            cluster_run_counts[rep["id"]] = len(group)
+
+        display_proposals.sort(key=lambda x: x.get("id", 0), reverse=True)
+    else:
+        display_proposals = proposals
+        cluster_run_counts = {}
+
+    table = Table(
+        box=BOX_STYLE,
+        title=f"[{BOLD}][{ACCENT}]Daemon Proposals ({len(display_proposals)})[/][/]",
+        title_justify="left",
+    )
+    table.add_column("ID", style=ACCENT, no_wrap=True)
+    table.add_column("Type", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Title / Summary")
+    table.add_column("Created", style=DIM, no_wrap=True)
+
+    for p in display_proposals:
+        pid = str(p["id"])
+        prop_type, title, _ = _parse_proposal_payload(p.get("content", ""))
+        p_status = p.get("inference_status", "proposed")
+
+        if p_status == "proposed":
+            status_str = f"[{BOLD}][{ACCENT}]proposed[/][/]"
+        elif p_status == "deferred":
+            status_str = f"[{DIM}]deferred[/]"
+        elif p_status == "confirmed":
+            status_str = f"[{SUCCESS}]confirmed[/]"
+        elif p_status == "rejected":
+            status_str = f"[{ERROR}]rejected[/]"
+        else:
+            status_str = f"[{DIM}]{p_status}[/]"
+
+        type_color = (
+            "cyan"
+            if prop_type == "knowledge_gap"
+            else ("magenta" if prop_type == "operator" else "white")
+        )
+        type_str = f"[{type_color}]{prop_type}[/]"
+
+        escaped_title = escape(title)
+        runs = cluster_run_counts.get(p["id"], 1)
+        if runs > 1:
+            title_display = f"{escaped_title} [{DIM}]({runs} runs)[/]"
+        else:
+            title_display = escaped_title
+
+        created = str(p.get("created_at", ""))[:19]
+        table.add_row(f"#{pid}", type_str, status_str, title_display, created)
+
+    console.print(table)
+    console.print(
+        f"[{DIM}]Actions:[/] [{ACCENT}]\\proposals show <id>[/] [{DIM}]dossier[/] • "
+        f"[{ACCENT}]\\proposals authorize <id>[/] [{DIM}]confirm[/] • "
+        f"[{ACCENT}]\\proposals defer <id>[/] [{DIM}]defer[/] • "
+        f"[{ACCENT}]\\proposals reject <id>[/] [{DIM}]dismiss[/]"
+    )
+
+
+def _normalize_recommended_ingestion(raw: Any) -> list[str]:
+    """Normalize recommended_ingestion into a canonical list of strings."""
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    if isinstance(raw, str):
+        import re
+
+        return [
+            item.strip()
+            for item in re.split(r',\s*(?=")|,\s*(?=[A-Za-z0-9])', raw)
+            if item.strip()
+        ]
+    return []
+
+
+def _show_proposal(proposal_id: int) -> None:
+    """Render full dossier panel for a single proposal."""
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.rule import Rule
+
+    from audiobench.daemon.intelligence.proposal_cluster import canonical_cluster_key
+
+    proposals = _fetch_daemon_proposals(expression_id=proposal_id)
+    if not proposals:
+        console.print(f"[{ERROR}]Proposal #{proposal_id} not found.[/]")
+        return
+
+    p = proposals[0]
+    content = p.get("content", "")
+    prop_type, title, data = _parse_proposal_payload(content)
+    status = p.get("inference_status", "proposed")
+    created_at = str(p.get("created_at", ""))[:19]
+
+    items = []
+    items.append(
+        f"[{BOLD}][{ACCENT}]Proposal #{proposal_id}[/][/]  [{DIM}]•[/]  [{BOLD}]{title}[/]"
+    )
+    items.append(
+        f"[{DIM}]Type:[/] [{BOLD}]{prop_type}[/]  [{DIM}]•  Status:[/] [{BOLD}]{status}[/]  [{DIM}]•  Created:[/] {created_at}"
+    )
+
+    cluster_key = canonical_cluster_key(content)
+    all_proposals = _fetch_daemon_proposals(include_all=True)
+    cluster_members = [
+        m for m in all_proposals
+        if canonical_cluster_key(m.get("content", "")) == cluster_key
+    ]
+    if len(cluster_members) > 1:
+        member_ids_str = ", ".join(f"#{m['id']}" for m in sorted(cluster_members, key=lambda x: x.get("id", 0)))
+        items.append(
+            f"[{DIM}]Cluster:[/] [{BOLD}]{len(cluster_members)} runs[/] [{DIM}]({member_ids_str})[/]"
+        )
+    items.append(Rule(style=DIM))
+
+    payload = data.get("payload", data) if isinstance(data, dict) else {}
+    if not isinstance(payload, dict):
+        payload = data
+
+    if prop_type == "knowledge_gap":
+        diagnostic = payload.get("diagnostic") or data.get("diagnostic", "")
+        if diagnostic:
+            items.append(f"[{BOLD}]Missing Topic Diagnostic:[/]")
+            items.append(f"  {diagnostic}")
+            items.append("")
+
+        raw_rec = payload.get("recommended_ingestion") or data.get("recommended_ingestion")
+        recommended = _normalize_recommended_ingestion(raw_rec)
+        if recommended:
+            items.append(f"[{BOLD}]Recommended Acquisitions / Reading List:[/]")
+            for item in recommended:
+                items.append(f"  [{ACCENT}]•[/] {item}")
+            items.append("")
+
+        stranded = payload.get("stranded_queries") or data.get("stranded_queries", [])
+        if stranded:
+            items.append(f"[{BOLD}]Correlated Search Queries ({len(stranded)}):[/]")
+            preview_queries = stranded[:10]
+            for q in preview_queries:
+                items.append(f"  [{DIM}]-[/] \"{q}\"")
+            if len(stranded) > 10:
+                items.append(
+                    f"  [{DIM}]... and {len(stranded) - 10} more correlated queries[/]"
+                )
+            items.append("")
+
+        medoid = payload.get("medoid_query") or data.get("medoid_query")
+        dist = payload.get("drift_distance") if payload.get("drift_distance") is not None else payload.get("distance")
+        if dist is None:
+            dist = data.get("drift_distance") if data.get("drift_distance") is not None else data.get("distance")
+        source = payload.get("name_source") or data.get("name_source", "unknown")
+        meta_lines = []
+        if medoid:
+            medoid_display = medoid.strip()
+            if len(medoid_display) > 160:
+                medoid_display = medoid_display[:157] + "..."
+            meta_lines.append(f"[{DIM}]Medoid Anchor:[/] \"{medoid_display}\"")
+        if dist is not None:
+            meta_lines.append(f"[{DIM}]Semantic Drift Distance:[/] {dist:.4f} (threshold: 0.20)")
+        if source:
+            meta_lines.append(f"[{DIM}]Naming Provider:[/] {source}")
+        if meta_lines:
+            items.append(Rule(title="Telemetry", style=DIM))
+            for ml in meta_lines:
+                items.append(f"  {ml}")
+
+    elif prop_type == "operator":
+        template = data.get("operator_template", "Unknown")
+        summary = data.get("summary", "")
+        rationale = data.get("rationale", "")
+        items.append(f"[{BOLD}]Operator Template:[/] [{ACCENT}]{template}[/]")
+        if summary:
+            items.append(f"[{BOLD}]Summary:[/] {summary}")
+        if rationale:
+            items.append(f"[{BOLD}]Rationale:[/] {rationale}")
+    else:
+        items.append(f"[{DIM}]Raw Content:[/]\n{content}")
+
+    items.append(Rule(style=DIM))
+    items.append(
+        f"[{DIM}]Actions:[/] [{ACCENT}]\\proposals authorize {proposal_id}[/] [{DIM}]confirm[/]  •  "
+        f"[{ACCENT}]\\proposals defer {proposal_id}[/] [{DIM}]defer[/]  •  "
+        f"[{ACCENT}]\\proposals reject {proposal_id}[/] [{DIM}]dismiss[/]"
+    )
+
+    console.print(
+        Panel(Group(*items), border_style=ACCENT, box=BOX_STYLE, expand=False)
+    )
+
+
+def _authorize_proposal(proposal_id: int) -> None:
+    """Execute authorize action for a proposal."""
+    res = _authorize_daemon_proposal(proposal_id)
+    if res.get("status") == "error":
+        console.print(
+            f"[{ERROR}]Failed to authorize proposal #{proposal_id}: {res.get('message', 'Unknown error')}[/]"
+        )
+        return
+    action = res.get("action", "authorized")
+    cascade_note = ""
+    cascaded_count = res.get("cascaded_count", 1)
+    if cascaded_count > 1:
+        cluster_title = res.get("cluster_title") or f"#{proposal_id}"
+        cascade_note = f" (cascaded to {cascaded_count} duplicate runs in cluster '{cluster_title}')"
+    if action == "authorized":
+        console.print(
+            f"[{SUCCESS}]Authorized proposal #{proposal_id}{cascade_note} — operator dynamic hot-registration active.[/]"
+        )
+    else:
+        console.print(
+            f"[{SUCCESS}]Confirmed proposal #{proposal_id}{cascade_note} — knowledge gap acknowledged.[/]"
+        )
+
+
+def _defer_proposal(proposal_id: int) -> None:
+    """Execute defer action for a proposal."""
+    res = _defer_daemon_proposal(proposal_id)
+    if res.get("status") == "error":
+        console.print(
+            f"[{ERROR}]Failed to defer proposal #{proposal_id}: {res.get('message', 'Unknown error')}[/]"
+        )
+        return
+    cascade_note = ""
+    cascaded_count = res.get("cascaded_count", 1)
+    if cascaded_count > 1:
+        cluster_title = res.get("cluster_title") or f"#{proposal_id}"
+        cascade_note = f" (cascaded to {cascaded_count} duplicate runs in cluster '{cluster_title}')"
+    console.print(
+        f"[{WARNING}]Deferred proposal #{proposal_id}{cascade_note} — alerts suppressed.[/]"
+    )
+
+
+def _reject_proposal(proposal_id: int) -> None:
+    """Execute reject action for a proposal."""
+    res = _reject_daemon_proposal(proposal_id)
+    if res.get("status") == "error":
+        console.print(
+            f"[{ERROR}]Failed to reject proposal #{proposal_id}: {res.get('message', 'Unknown error')}[/]"
+        )
+        return
+    cascade_note = ""
+    cascaded_count = res.get("cascaded_count", 1)
+    if cascaded_count > 1:
+        cluster_title = res.get("cluster_title") or f"#{proposal_id}"
+        cascade_note = f" (cascaded to {cascaded_count} duplicate runs in cluster '{cluster_title}')"
+    console.print(
+        f"[{ERROR}]Rejected proposal #{proposal_id}{cascade_note} — proposal dismissed.[/]"
+    )
+
+
 
