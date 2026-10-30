@@ -39,6 +39,9 @@ _M: int = 32               # Bidirectional links per element (higher = better re
 _EF_CONSTRUCTION: int = 200  # Build quality
 _EF_SEARCH: int = 100      # Query recall
 _CHUNK_SIZE: int = 25      # Vectors per lock acquisition in query_batch (~15ms per chunk)
+_MAX_FAST_FORWARD_DELTA_PCT: float = 0.25  # Conservative performance threshold: 25%
+_MAX_FAST_FORWARD_DELTA_ABS: int = 10_000   # Conservative absolute threshold: 10k items
+_MIN_FAST_FORWARD_DELTA_FLOOR: int = 50     # Floor for small test suites/indexes
 
 
 class InCoreHNSWIndex:
@@ -52,6 +55,9 @@ class InCoreHNSWIndex:
         m: int = _M,
         ef_construction: int = _EF_CONSTRUCTION,
         ef_search: int = _EF_SEARCH,
+        max_fast_forward_delta_pct: float = _MAX_FAST_FORWARD_DELTA_PCT,
+        max_fast_forward_delta_abs: int = _MAX_FAST_FORWARD_DELTA_ABS,
+        min_fast_forward_delta_floor: int = _MIN_FAST_FORWARD_DELTA_FLOOR,
     ) -> None:
         if data_dir is None:
             from audiobench.core.settings import get_settings
@@ -62,6 +68,9 @@ class InCoreHNSWIndex:
         self._m = m
         self._ef_construction = ef_construction
         self._ef_search = ef_search
+        self._max_fast_forward_delta_pct = max_fast_forward_delta_pct
+        self._max_fast_forward_delta_abs = max_fast_forward_delta_abs
+        self._min_fast_forward_delta_floor = min_fast_forward_delta_floor
 
         self._lock = threading.Lock()
         self._ready: bool = False
@@ -114,9 +123,12 @@ class InCoreHNSWIndex:
                 return np.empty((0, self._dim), dtype=np.float32)
             return np.array(self._index.get_items(valid_ids), dtype=np.float32)
 
-    def load_snapshot(self) -> bool:
-        """Attempt to directly load the persisted snapshot from disk without reading LanceDB.
+    def load_snapshot(self, validate_against_lancedb: bool = True) -> bool:
+        """Attempt to directly load the persisted snapshot from disk.
 
+        If validate_against_lancedb=True, verifies that the snapshot metadata has not
+        drifted beyond the conservative fast-forward threshold against live LanceDB
+        embeddable expression count before marking ready.
         Returns True if successfully loaded, False otherwise.
         """
         with self._lock:
@@ -126,8 +138,31 @@ class InCoreHNSWIndex:
                 return False
             try:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
+
+                if validate_against_lancedb:
+                    try:
+                        from audiobench.memory.memory_store import MemoryStore, EMBEDDABLE_SOURCE_TYPES
+                        store = MemoryStore()
+                        filter_clause = " OR ".join(f"source_type = '{st}'" for st in EMBEDDABLE_SOURCE_TYPES)
+                        live_count = store.table.count_rows(filter=filter_clause)
+                        drift_abs = abs(live_count - meta.get("row_count", 0))
+                        max_allowed = max(
+                            min(int(meta.get("row_count", 0) * self._max_fast_forward_delta_pct), self._max_fast_forward_delta_abs),
+                            self._min_fast_forward_delta_floor,
+                        )
+                        if drift_abs > max_allowed:
+                            logger.info(
+                                "InCoreHNSWIndex fast-path snapshot drift (%d) exceeds threshold (%d). Falling back to build.",
+                                drift_abs,
+                                max_allowed,
+                            )
+                            return False
+                    except Exception as val_err:
+                        logger.debug("Fast-path snapshot validation skipped: %s", val_err)
+
                 idx = hnswlib.Index(space=self._space, dim=self._dim)
-                idx.load_index(str(bin_path), max_elements=meta["max_elements"])
+                idx.load_index(str(bin_path), max_elements=meta["max_elements"], allow_replace_deleted=True)
+                idx.set_ef(self._ef_search)
                 self._index = idx
                 self._count = meta["row_count"]
                 self._max_elements = meta["max_elements"]
@@ -145,7 +180,7 @@ class InCoreHNSWIndex:
                 return False
 
     def load_or_build(self, embeddable_rows: list[tuple[int, np.ndarray]]) -> None:
-        """Load the snapshot from disk if valid, otherwise build from scratch.
+        """Load the snapshot from disk if valid, otherwise fast-forward or build from scratch.
 
         embeddable_rows: list of (expression_id, 768-dim float vector)
         Guaranteed to drain any early-boot buffered items before marking ready.
@@ -170,7 +205,10 @@ class InCoreHNSWIndex:
                     self._count, self._last_max_id, self._id_checksum,
                 )
             else:
-                self._build_from_scratch_locked(clean_rows)
+                fast_forwarded = self._fast_forward_snapshot_locked(clean_rows, dedup_dict)
+                if not fast_forwarded:
+                    self._build_from_scratch_locked(clean_rows)
+                    self._save_locked()
 
             # Drain any early boot writes buffered while loading/building
             drained = 0
@@ -185,6 +223,100 @@ class InCoreHNSWIndex:
 
             self._ready = True
             logger.info("InCoreHNSWIndex is READY (%d items indexed).", self._count)
+
+    def _fast_forward_snapshot_locked(
+        self,
+        clean_rows: list[tuple[int, np.ndarray]],
+        dedup_dict: dict[int, np.ndarray],
+    ) -> bool:
+        """Attempt to fast-forward an existing snapshot by incrementally adding delta items.
+
+        Returns True if successfully fast-forwarded and saved, False if snapshot cannot
+        be fast-forwarded (missing, corrupted, or drift exceeds conservative threshold).
+        """
+        bin_path = self._data_dir / "expression_index.bin"
+        meta_path = self._data_dir / "expression_index.meta.json"
+
+        if not (bin_path.exists() and meta_path.exists()):
+            return False
+
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if meta.get("dim") != self._dim or meta.get("space") != self._space:
+                logger.info("InCoreHNSWIndex snapshot config mismatch (dim/space). Rebuilding.")
+                return False
+
+            max_elements = int(meta.get("max_elements", max(len(clean_rows) * 2, 50_000)))
+            idx = hnswlib.Index(space=self._space, dim=self._dim)
+            idx.load_index(str(bin_path), max_elements=max_elements, allow_replace_deleted=True)
+            idx.set_ef(self._ef_search)
+
+            snapshot_ids = set(idx.get_ids_list())
+            live_ids = set(dedup_dict.keys())
+
+            # Verify that metadata and binary are mutually consistent
+            if meta.get("row_count") != len(snapshot_ids):
+                logger.warning(
+                    "InCoreHNSWIndex snapshot meta vs binary row_count mismatch (meta=%d, binary=%d). Rebuilding.",
+                    meta.get("row_count"), len(snapshot_ids),
+                )
+                return False
+
+            if meta.get("id_checksum") != (sum(snapshot_ids) % (2**64)):
+                logger.warning("InCoreHNSWIndex snapshot checksum mismatch against binary. Rebuilding.")
+                return False
+
+            if meta.get("max_expression_id") != max(snapshot_ids, default=0):
+                logger.warning("InCoreHNSWIndex snapshot max_id mismatch against binary. Rebuilding.")
+                return False
+
+            delta_ids = live_ids - snapshot_ids
+            deleted_ids = snapshot_ids - live_ids
+
+            max_delta = max(
+                min(int(len(snapshot_ids) * self._max_fast_forward_delta_pct), self._max_fast_forward_delta_abs),
+                self._min_fast_forward_delta_floor,
+            )
+
+            if len(delta_ids) > max_delta or len(deleted_ids) > max_delta:
+                logger.info(
+                    "InCoreHNSWIndex drift (%d new, %d deleted) exceeds fast-forward threshold (%d). Rebuilding.",
+                    len(delta_ids), len(deleted_ids), max_delta,
+                )
+                return False
+
+            logger.info(
+                "InCoreHNSWIndex fast-forwarding: %d new, %d deleted (snapshot=%d, live=%d)...",
+                len(delta_ids), len(deleted_ids), len(snapshot_ids), len(live_ids),
+            )
+
+            for did in deleted_ids:
+                try:
+                    idx.mark_deleted(did)
+                except Exception as del_err:
+                    logger.debug("Fast-forward mark_deleted failed for #%d: %s", did, del_err)
+
+            self._index = idx
+            self._max_elements = idx.get_max_elements()
+            self._indexed_ids = snapshot_ids - deleted_ids
+            self._count = len(self._indexed_ids)
+            self._last_max_id = max(self._indexed_ids, default=0)
+            self._id_checksum = sum(self._indexed_ids) % (2**64)
+
+            if delta_ids:
+                delta_rows = [(eid, dedup_dict[eid]) for eid in delta_ids]
+                self._add_batch_locked(delta_rows)
+
+            self._save_locked()
+            logger.info(
+                "InCoreHNSWIndex fast-forward complete: %d items indexed (max_id=%d, checksum=%d).",
+                self._count, self._last_max_id, self._id_checksum,
+            )
+            return True
+
+        except Exception as exc:
+            logger.warning("InCoreHNSWIndex fast-forward failed (%s). Rebuilding from scratch.", exc)
+            return False
 
     def _load_snapshot_if_valid(
         self, embeddable_rows: list[tuple[int, np.ndarray]]
@@ -274,42 +406,48 @@ class InCoreHNSWIndex:
         with self._lock:
             if not self._ready or self._index is None:
                 return False
+            return self._save_locked()
 
-            try:
-                self._data_dir.mkdir(parents=True, exist_ok=True)
-                bin_tmp = self._data_dir / "expression_index.bin.tmp"
-                bin_path = self._data_dir / "expression_index.bin"
-                meta_tmp = self._data_dir / "expression_index.meta.json.tmp"
-                meta_path = self._data_dir / "expression_index.meta.json"
+    def _save_locked(self) -> bool:
+        """Persist snapshot to disk under self._lock."""
+        if self._index is None:
+            return False
 
-                # 1. Save binary index to tmp and atomic replace
-                self._index.save_index(str(bin_tmp))
-                os.replace(bin_tmp, bin_path)
+        try:
+            self._data_dir.mkdir(parents=True, exist_ok=True)
+            bin_tmp = self._data_dir / "expression_index.bin.tmp"
+            bin_path = self._data_dir / "expression_index.bin"
+            meta_tmp = self._data_dir / "expression_index.meta.json.tmp"
+            meta_path = self._data_dir / "expression_index.meta.json"
 
-                # 2. Write metadata to tmp and atomic replace
-                meta = {
-                    "row_count": self._count,
-                    "max_expression_id": self._last_max_id,
-                    "id_checksum": self._id_checksum,
-                    "max_elements": self._max_elements,
-                    "dim": self._dim,
-                    "space": self._space,
-                    "m": self._m,
-                    "ef_construction": self._ef_construction,
-                    "ef_search": self._ef_search,
-                    "saved_at": time.time(),
-                }
-                meta_tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-                os.replace(meta_tmp, meta_path)
+            # 1. Save binary index to tmp and atomic replace
+            self._index.save_index(str(bin_tmp))
+            os.replace(bin_tmp, bin_path)
 
-                logger.info(
-                    "InCoreHNSWIndex: snapshot saved (%d items, max_id=%d, checksum=%d)",
-                    self._count, self._last_max_id, self._id_checksum,
-                )
-                return True
-            except Exception as exc:
-                logger.error("InCoreHNSWIndex: failed to save snapshot: %s", exc)
-                return False
+            # 2. Write metadata to tmp and atomic replace
+            meta = {
+                "row_count": self._count,
+                "max_expression_id": self._last_max_id,
+                "id_checksum": self._id_checksum,
+                "max_elements": self._max_elements,
+                "dim": self._dim,
+                "space": self._space,
+                "m": self._m,
+                "ef_construction": self._ef_construction,
+                "ef_search": self._ef_search,
+                "saved_at": time.time(),
+            }
+            meta_tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            os.replace(meta_tmp, meta_path)
+
+            logger.info(
+                "InCoreHNSWIndex: snapshot saved (%d items, max_id=%d, checksum=%d)",
+                self._count, self._last_max_id, self._id_checksum,
+            )
+            return True
+        except Exception as exc:
+            logger.error("InCoreHNSWIndex: failed to save snapshot: %s", exc)
+            return False
 
     # ------------------------------------------------------------------
     # Writes: Add, Batch Add, Remove

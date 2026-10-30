@@ -345,3 +345,168 @@ def test_hnsw_early_boot_concurrent_race(tmp_path: Path) -> None:
         f"Item count mismatch: expected {expected_count}, got {index.item_count()}"
     )
 
+
+def test_hnsw_fast_forward_incremental_sync(tmp_path: Path, sample_vectors: list[tuple[int, np.ndarray]]) -> None:
+    """Test that incremental delta rows are fast-forwarded without full rebuild."""
+    # 1. Build initial base snapshot of 40 items
+    base_rows = sample_vectors[:40]
+    index_base = InCoreHNSWIndex(data_dir=tmp_path, dim=64, m=16, ef_construction=100, ef_search=50)
+    index_base.load_or_build(base_rows)
+    assert index_base.item_count() == 40
+    assert index_base.save() is True
+
+    meta_file = tmp_path / "expression_index.meta.json"
+    meta_initial = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert meta_initial["row_count"] == 40
+
+    # 2. Cold instance loads all 50 items (40 base + 10 delta)
+    index_ff = InCoreHNSWIndex(data_dir=tmp_path, dim=64, m=16, ef_construction=100, ef_search=50)
+    index_ff.load_or_build(sample_vectors)
+
+    # 3. Assert fast-forwarded successfully to 50 items
+    assert index_ff.is_ready()
+    assert index_ff.item_count() == 50
+    assert index_ff.has_item(50)
+
+    # Newly added delta item (eid=45) must be searchable and match itself
+    top_hit = index_ff.query(sample_vectors[44][1], k=1)
+    assert top_hit[0][0] == sample_vectors[44][0]
+
+    # 4. Verify snapshot on disk was updated atomically
+    meta_updated = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert meta_updated["row_count"] == 50
+    assert meta_updated["max_expression_id"] == 50
+
+    # 5. Cold load_snapshot loads the updated snapshot directly
+    index_cold = InCoreHNSWIndex(data_dir=tmp_path, dim=64, m=16, ef_construction=100, ef_search=50)
+    assert index_cold.load_snapshot(validate_against_lancedb=False) is True
+    assert index_cold.item_count() == 50
+
+
+def test_hnsw_fast_forward_recall_parity(tmp_path: Path) -> None:
+    """Verify search recall parity between full rebuild and incremental fast-forward."""
+    np.random.seed(123)
+    n_total = 100
+    rows = []
+    for eid in range(1, n_total + 1):
+        v = np.random.randn(64).astype(np.float32)
+        v /= np.linalg.norm(v)
+        rows.append((eid, v))
+
+    dir_full = tmp_path / "full"
+    dir_ff = tmp_path / "fast_forward"
+    dir_full.mkdir()
+    dir_ff.mkdir()
+
+    # Index A: Full rebuild
+    idx_full = InCoreHNSWIndex(data_dir=dir_full, dim=64, m=16, ef_construction=100, ef_search=50)
+    idx_full.load_or_build(rows)
+
+    # Index B: 75 base items -> save -> fast forward 25 delta items
+    idx_ff = InCoreHNSWIndex(data_dir=dir_ff, dim=64, m=16, ef_construction=100, ef_search=50)
+    idx_ff.load_or_build(rows[:75])
+    assert idx_ff.save() is True
+
+    idx_ff_reloaded = InCoreHNSWIndex(data_dir=dir_ff, dim=64, m=16, ef_construction=100, ef_search=50)
+    idx_ff_reloaded.load_or_build(rows)
+
+    # Query 20 test vectors for top-5 neighbors
+    test_queries = [r[1] for r in rows[:20]]
+    overlaps = []
+    for q in test_queries:
+        res_full = [eid for eid, _ in idx_full.query(q, k=5)]
+        res_ff = [eid for eid, _ in idx_ff_reloaded.query(q, k=5)]
+        overlap = len(set(res_full) & set(res_ff)) / 5.0
+        overlaps.append(overlap)
+
+    avg_parity = float(np.mean(overlaps))
+    assert avg_parity >= 0.95, f"Recall parity {avg_parity} fell below 0.95"
+
+
+def test_hnsw_fast_forward_exceeds_threshold_falls_back_to_rebuild(tmp_path: Path, sample_vectors: list[tuple[int, np.ndarray]]) -> None:
+    """Verify that drift exceeding the conservative threshold falls back to a full rebuild."""
+    # Base snapshot with 20 items
+    index_base = InCoreHNSWIndex(
+        data_dir=tmp_path,
+        dim=64,
+        m=16,
+        ef_construction=100,
+        ef_search=50,
+        max_fast_forward_delta_pct=0.10,  # 10% max delta
+        min_fast_forward_delta_floor=2,    # Floor of 2 items
+    )
+    index_base.load_or_build(sample_vectors[:20])
+    assert index_base.save() is True
+
+    # Attempt load_or_build with 30 items (10 new items > threshold 2)
+    index_drifted = InCoreHNSWIndex(
+        data_dir=tmp_path,
+        dim=64,
+        m=16,
+        ef_construction=100,
+        ef_search=50,
+        max_fast_forward_delta_pct=0.10,
+        min_fast_forward_delta_floor=2,
+    )
+    index_drifted.load_or_build(sample_vectors[:30])
+
+    # Rebuild succeeded, full 30 items indexed
+    assert index_drifted.is_ready()
+    assert index_drifted.item_count() == 30
+    assert index_drifted.has_item(30)
+
+
+def test_hnsw_fast_forward_handles_deletions(tmp_path: Path, sample_vectors: list[tuple[int, np.ndarray]]) -> None:
+    """Verify that fast-forward handles deleted expressions and maintains accurate count."""
+    index_base = InCoreHNSWIndex(data_dir=tmp_path, dim=64, m=16, ef_construction=100, ef_search=50)
+    index_base.load_or_build(sample_vectors[:30])
+    assert index_base.save() is True
+
+    # Drop items 5 and 10, add items 31 and 32
+    modified_rows = [r for r in sample_vectors[:30] if r[0] not in (5, 10)]
+    modified_rows.extend(sample_vectors[30:32])
+    assert len(modified_rows) == 30
+
+    index_ff = InCoreHNSWIndex(data_dir=tmp_path, dim=64, m=16, ef_construction=100, ef_search=50)
+    index_ff.load_or_build(modified_rows)
+
+    assert index_ff.item_count() == 30
+    assert not index_ff.has_item(5)
+    assert not index_ff.has_item(10)
+    assert index_ff.has_item(31)
+    assert index_ff.has_item(32)
+
+
+def test_hnsw_save_locked_avoids_deadlock(tmp_path: Path, sample_vectors: list[tuple[int, np.ndarray]]) -> None:
+    """Verify that _save_locked executes safely when caller already holds self._lock."""
+    index = InCoreHNSWIndex(data_dir=tmp_path, dim=64, m=16, ef_construction=100, ef_search=50)
+    index.load_or_build(sample_vectors[:20])
+
+    # 1. Direct invocation under acquired self._lock
+    with index._lock:
+        # Non-reentrant lock: calling index.save() here would deadlock; _save_locked must succeed
+        success = index._save_locked()
+        assert success is True
+
+    # 2. Public save() outside lock succeeds
+    assert index.save() is True
+
+    # 3. Concurrent thread safety: multiple threads triggering save and query
+    import concurrent.futures
+
+    def worker_save():
+        return index.save()
+
+    def worker_query():
+        return index.query(sample_vectors[0][1], k=3)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        f_saves = [executor.submit(worker_save) for _ in range(5)]
+        f_queries = [executor.submit(worker_query) for _ in range(10)]
+        for f in f_saves:
+            assert f.result(timeout=5.0) is True
+        for f in f_queries:
+            assert len(f.result(timeout=5.0)) == 3
+
+
+
