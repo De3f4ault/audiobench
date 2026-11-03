@@ -119,6 +119,7 @@ class ChatSession:
         show_thinking: bool = True,
         session_type: str = "chat",
         title: str = "New Chat",
+        custom_title: bool = False,
     ) -> None:
         if client is None:
             client = create_chat_client(model)
@@ -160,7 +161,7 @@ class ChatSession:
         # Message history (in-memory, synced to DB)
         self._messages: list[dict] = []
         self._system_prompt: str = CHAT_SYSTEM_NO_CONTEXT
-        self._title_generated = False
+        self._title_generated = bool(custom_title)
         self._injected_fragments: list[dict] = []
 
     # ── Properties ──────────────────────────────────────────
@@ -286,15 +287,30 @@ class ChatSession:
             return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
         for f in fragments:
-            ts = f"{_ts(f.start_time)} → {_ts(f.end_time)}"
+            if isinstance(f, dict):
+                start = f.get("start_time", 0.0) or 0.0
+                end = f.get("end_time", 0.0) or 0.0
+                tx_id = f.get("transcription_id")
+                src = f.get("source_file") or (f"Transcript #{tx_id}" if tx_id else "Unknown")
+                score = f.get("score") if f.get("score") is not None else f.get("rrf_score", 0.0)
+                text = (f.get("text") or "").strip()
+            else:
+                start = getattr(f, "start_time", 0.0) or 0.0
+                end = getattr(f, "end_time", 0.0) or 0.0
+                tx_id = getattr(f, "transcription_id", None)
+                src = getattr(f, "source_file", None) or (f"Transcript #{tx_id}" if tx_id else "Unknown")
+                score = getattr(f, "rrf_score", 0.0)
+                text = (getattr(f, "text", "") or "").strip()
+
+            ts = f"{_ts(start)} → {_ts(end)}"
             self._injected_fragments.append({
-                "source_file": f.source_file or f"Transcript #{f.transcription_id}",
-                "transcription_id": f.transcription_id,
+                "source_file": src,
+                "transcription_id": tx_id,
                 "timestamp": ts,
-                "start_time": f.start_time,
-                "end_time": f.end_time,
-                "score": getattr(f, "rrf_score", 0.0),
-                "text": f.text.strip(),
+                "start_time": start,
+                "end_time": end,
+                "score": score,
+                "text": text,
                 "query": query,
             })
 
@@ -502,18 +518,58 @@ class ChatSession:
 
             # Rebuild system prompt with restored transcript text
             self._rebuild_system_prompt()
-            logger.info(
-                "Restored conversation #%d: %d messages, %d transcripts re-hydrated",
-                self._conversation_id,
-                len(self._messages),
-                len(loaded),
-            )
-        else:
-            logger.info(
-                "Restored conversation #%d (%d messages)",
-                self._conversation_id,
-                len(self._messages),
-            )
+
+        # Re-hydrate search fragments if linked to a search query or search session
+        search_query_id = conv.get("search_query_id")
+        search_session_id = conv.get("search_session_id")
+
+        if not search_query_id and search_session_id:
+            title = conv.get("title") or ""
+            seq = None
+            if title.startswith("[S"):
+                end_idx = title.find("]")
+                if end_idx != -1 and title[2:end_idx].isdigit():
+                    seq = int(title[2:end_idx])
+            try:
+                from audiobench.memory.session_store import resolve_query_id_for_session
+                found_qid = resolve_query_id_for_session(search_session_id, sequence_num=seq, title=title)
+                if found_qid:
+                    search_query_id = found_qid
+                    if self._chat_repo and self._conversation_id:
+                        self._chat_repo.update_search_session_id(
+                            self._conversation_id,
+                            search_session_id,
+                            search_query_id,
+                        )
+            except Exception as e:
+                logger.warning("Could not resolve query ID for search session %s: %s", search_session_id, e)
+
+        if search_query_id:
+            try:
+                from audiobench.memory.session_store import get_query_fragments, get_query_text
+                frags = get_query_fragments(search_query_id)
+                q_text = get_query_text(search_query_id) or conv.get("title") or ""
+                if frags:
+                    self._injected_fragments = []
+                    self.inject_search_fragments(frags, query=q_text)
+                    logger.info(
+                        "Restored %d search fragments for conversation #%d (query #%d)",
+                        len(frags),
+                        self._conversation_id,
+                        search_query_id,
+                    )
+            except Exception as e:
+                logger.warning("Failed to restore search fragments for conversation #%d: %s", self._conversation_id, e)
+
+        tx_count = len(self._transcripts) if hasattr(self, "_transcripts") else 0
+        frag_count = len(self._injected_fragments) if hasattr(self, "_injected_fragments") else 0
+        logger.info(
+            "Restored conversation #%d: %d messages, %d transcripts, %d search fragments",
+            self._conversation_id,
+            len(self._messages),
+            tx_count,
+            frag_count,
+        )
         return True
 
     def send(
@@ -669,8 +725,22 @@ class ChatSession:
                 )
                 title = result.get("content", "").strip()
             if title and len(title) < 100:
-                self._chat_repo.update_title(self._conversation_id, title)
-                logger.info("Generated title: %s", title)
+                # Check if current conversation title has an [S#] prefix to preserve
+                prefix = ""
+                try:
+                    current_conv = self._chat_repo.get_conversation(self._conversation_id)
+                    if current_conv:
+                        curr_title = current_conv.get("title", "")
+                        if curr_title.startswith("[S"):
+                            end_idx = curr_title.find("]")
+                            if end_idx != -1 and curr_title[2:end_idx].isdigit():
+                                prefix = curr_title[: end_idx + 1] + " "
+                except Exception as ex:
+                    logger.debug("Could not inspect existing title prefix: %s", ex)
+
+                final_title = f"{prefix}{title}" if prefix else title
+                self._chat_repo.update_title(self._conversation_id, final_title)
+                logger.info("Generated title: %s", final_title)
         except Exception as e:
             logger.warning("Failed to generate title: %s", e)
 

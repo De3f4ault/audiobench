@@ -13,9 +13,15 @@ Usage:
 
 from __future__ import annotations
 
+import queue
+import re
+import sys
+import threading
+import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from audiobench.core.error_types import AudioBenchError
 from audiobench.core.logger_factory import get_logger
@@ -24,6 +30,9 @@ logger = get_logger("tts.engine")
 
 # Default voice model download URL base
 PIPER_VOICES_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
+
+# Module-level cache for loaded ONNX models (bounded to prevent excessive RAM usage)
+_LOADED_VOICES: dict[str, Any] = {}
 
 
 class TTSError(AudioBenchError):
@@ -39,6 +48,19 @@ class VoiceInfo:
     quality: str  # e.g., "medium", "high", "low"
     model_path: Path  # path to .onnx file
     config_path: Path  # path to .onnx.json file
+
+
+def split_speech_sentences(text: str) -> list[str]:
+    """Split text into sentence units preserving punctuation for TTS alignment."""
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    sentences: list[str] = []
+    for line in lines:
+        parts = re.split(r"(?<=[.!?])\s+", line)
+        for p in parts:
+            p_clean = p.strip()
+            if p_clean:
+                sentences.append(p_clean)
+    return sentences or ([text.strip()] if text.strip() else [])
 
 
 class PiperTTSEngine:
@@ -79,6 +101,11 @@ class PiperTTSEngine:
                 "Install with: pip install piper-tts\nOr: pip install -e '.[tts]'",
             ) from None
 
+        if voice_name in _LOADED_VOICES:
+            self._voice = _LOADED_VOICES[voice_name]
+            self._voice_name = voice_name
+            return
+
         model_path = self._voices_dir / f"{voice_name}.onnx"
         config_path = self._voices_dir / f"{voice_name}.onnx.json"
 
@@ -92,6 +119,10 @@ class PiperTTSEngine:
         try:
             self._voice = PiperVoice.load(str(model_path), str(config_path))
             self._voice_name = voice_name
+            if len(_LOADED_VOICES) >= 2:
+                oldest = next(iter(_LOADED_VOICES))
+                del _LOADED_VOICES[oldest]
+            _LOADED_VOICES[voice_name] = self._voice
             logger.info("Voice loaded: %s", voice_name)
         except Exception as e:
             raise TTSError(
@@ -138,12 +169,110 @@ class PiperTTSEngine:
         except Exception as e:
             raise TTSError("Synthesis failed", str(e)) from e
 
-    def play(self, text: str, voice: str = "en_US-amy-medium") -> None:
-        """Synthesize and play text through speakers.
+    def synthesize_with_timestamps(
+        self,
+        text: str,
+        voice: str = "en_US-amy-medium",
+        output_path: str | Path | None = None,
+    ) -> tuple[Path, list[dict]]:
+        """Synthesize text to a WAV file with exact sentence-level timestamps.
 
         Args:
             text: Text to speak.
             voice: Piper voice name.
+            output_path: Where to save the WAV. If None, auto-generates a path.
+
+        Returns:
+            Tuple of (output_wav_path, segments) where each segment has:
+            {"start": float, "end": float, "text": str, "speaker": "assistant"}.
+
+        Raises:
+            TTSError: If synthesis fails.
+        """
+        self._load_voice(voice)
+
+        if output_path is None:
+            output_path = Path.cwd() / "speech_output.wav"
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        sentences = split_speech_sentences(text)
+        segments: list[dict] = []
+        sample_rate = 22050
+        current_time = 0.0
+
+        logger.info(
+            "Synthesizing %d sentences (%d chars) with timestamps to %s",
+            len(sentences),
+            len(text),
+            output_path,
+        )
+
+        try:
+            with wave.open(str(output_path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(sample_rate)
+
+                for sentence in sentences:
+                    sentence_chunks = list(self._voice.synthesize(sentence))
+                    if not sentence_chunks:
+                        continue
+
+                    chunk_sr = sentence_chunks[0].sample_rate
+                    if chunk_sr != sample_rate:
+                        sample_rate = chunk_sr
+                        wav_file.setframerate(sample_rate)
+
+                    total_samples = 0
+                    for chunk in sentence_chunks:
+                        wav_file.writeframes(chunk.audio_int16_bytes)
+                        total_samples += len(chunk.audio_int16_array)
+
+                    duration = total_samples / float(sample_rate)
+                    end_time = current_time + duration
+                    segments.append({
+                        "start": round(current_time, 2),
+                        "end": round(end_time, 2),
+                        "text": sentence,
+                        "speaker": "assistant",
+                    })
+                    current_time = end_time
+
+            logger.info(
+                "Synthesized %d segments: %s (%d bytes)",
+                len(segments),
+                output_path.name,
+                output_path.stat().st_size,
+            )
+            return output_path, segments
+
+        except Exception as e:
+            raise TTSError("Synthesis with timestamps failed", str(e)) from e
+
+    _active_stop_event: threading.Event | None = None
+
+    @classmethod
+    def stop(cls) -> None:
+        """Stop any active audio playback immediately."""
+        if cls._active_stop_event is not None:
+            cls._active_stop_event.set()
+        try:
+            import sounddevice as sd
+            sd.stop()
+        except Exception:
+            pass
+
+    def play(self, text: str, voice: str = "en_US-amy-medium") -> None:
+        """Synthesize and play text through speakers with pause/stop support.
+
+        Args:
+            text: Text to speak.
+            voice: Piper voice name.
+
+        Interactive Controls:
+            - Space / P: Pause or resume playback
+            - Q / Enter / Ctrl+C: Stop playback immediately
 
         Raises:
             TTSError: If playback fails.
@@ -152,40 +281,143 @@ class PiperTTSEngine:
 
         try:
             import sounddevice as sd
-        except ImportError:
+            import numpy as np
+        except ImportError as exc:
             raise TTSError(
-                "sounddevice not installed",
-                "Install with: pip install sounddevice",
-            ) from None
+                "Audio playback dependencies missing",
+                "Install with: pip install sounddevice numpy",
+            ) from exc
 
         logger.info("Playing TTS: %d chars with voice %s", len(text), voice)
 
-        try:
-            # Collect raw audio chunks from synthesize() generator
-            audio_bytes: list[bytes] = []
-            sample_rate = 22050  # Piper default, updated from first chunk
+        audio_queue: queue.Queue[np.ndarray | None] = queue.Queue()
+        synthesis_done = threading.Event()
+        stop_requested = threading.Event()
+        PiperTTSEngine._active_stop_event = stop_requested
 
-            for chunk in self._voice.synthesize(text):
-                audio_bytes.append(chunk.audio_int16_bytes)
-                sample_rate = chunk.sample_rate
+        is_paused = False
+        current_buf = np.array([], dtype=np.float32)
+        buf_pos = 0
+        sample_rate = 22050
 
-            if not audio_bytes:
-                logger.warning("TTS produced no audio")
+        def audio_callback(outdata, frames, time_info, status):
+            nonlocal current_buf, buf_pos
+            if stop_requested.is_set():
+                raise sd.CallbackStop
+            if is_paused:
+                outdata.fill(0)
                 return
 
-            # Convert to numpy and play
-            import numpy as np
+            filled = 0
+            while filled < frames:
+                if buf_pos < len(current_buf):
+                    avail = len(current_buf) - buf_pos
+                    needed = frames - filled
+                    to_copy = min(avail, needed)
+                    outdata[filled : filled + to_copy, 0] = current_buf[buf_pos : buf_pos + to_copy]
+                    buf_pos += to_copy
+                    filled += to_copy
+                else:
+                    try:
+                        chunk = audio_queue.get_nowait()
+                        if chunk is None:
+                            # Sentinel for end of audio stream
+                            outdata[filled:, 0] = 0
+                            raise sd.CallbackStop
+                        current_buf = chunk
+                        buf_pos = 0
+                    except queue.Empty:
+                        if synthesis_done.is_set():
+                            outdata[filled:, 0] = 0
+                            raise sd.CallbackStop
+                        else:
+                            # Underflow while waiting for synthesizer chunk
+                            outdata[filled:, 0] = 0
+                            break
 
-            raw_audio = b"".join(audio_bytes)
-            samples = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32) / 32768.0
+        def synthesize_worker():
+            nonlocal sample_rate
+            try:
+                for chunk in self._voice.synthesize(text):
+                    if stop_requested.is_set():
+                        break
+                    sample_rate = chunk.sample_rate
+                    raw = np.frombuffer(chunk.audio_int16_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                    audio_queue.put(raw)
+            except Exception as e:
+                logger.error("TTS synthesis error in worker: %s", e)
+            finally:
+                synthesis_done.set()
+                audio_queue.put(None)
 
-            sd.play(samples, samplerate=sample_rate)
-            sd.wait()  # Block until playback finishes
+        synth_thread = threading.Thread(target=synthesize_worker, daemon=True)
+        synth_thread.start()
 
+        # Wait briefly for first audio chunk or synthesis completion
+        while audio_queue.empty() and not synthesis_done.is_set() and not stop_requested.is_set():
+            time.sleep(0.01)
+
+        if stop_requested.is_set() or (audio_queue.empty() and synthesis_done.is_set()):
+            return
+
+        is_tty = hasattr(sys.stdin, "isatty") and sys.stdin.isatty()
+        try:
+            with sd.OutputStream(
+                samplerate=sample_rate,
+                channels=1,
+                dtype="float32",
+                callback=audio_callback,
+            ) as stream:
+                if is_tty:
+                    import select
+                    import termios
+
+                    fd = sys.stdin.fileno()
+                    old_attr = termios.tcgetattr(fd)
+                    try:
+                        new_attr = termios.tcgetattr(fd)
+                        new_attr[3] = new_attr[3] & ~termios.ICANON & ~termios.ECHO
+                        new_attr[6][termios.VMIN] = 1
+                        new_attr[6][termios.VTIME] = 0
+                        termios.tcsetattr(fd, termios.TCSANOW, new_attr)
+
+                        while stream.active and not stop_requested.is_set():
+                            r, _, _ = select.select([sys.stdin], [], [], 0.05)
+                            if r:
+                                ch = sys.stdin.read(1)
+                                if ch in (" ", "p", "P"):
+                                    is_paused = not is_paused
+                                    if is_paused:
+                                        print("\r  \033[36m[Voice]\033[0m \033[33m[Paused]\033[0m (Space: resume · q: stop)   ", end="", flush=True)
+                                    else:
+                                        print("\r  \033[36m[Voice]\033[0m \033[2mResumed.\033[0m                                ", end="", flush=True)
+                                elif ch in ("q", "Q", "\r", "\n", "\x03"):
+                                    stop_requested.set()
+                                    print("\r  \033[36m[Voice]\033[0m \033[2mPlayback stopped.\033[0m                         ", end="", flush=True)
+                                    break
+                    finally:
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
+                        print()
+                else:
+                    while stream.active and not stop_requested.is_set():
+                        time.sleep(0.05)
+
+        except KeyboardInterrupt:
+            stop_requested.set()
+            try:
+                sd.stop()
+            except Exception:
+                pass
+            raise
         except TTSError:
             raise
         except Exception as e:
-            raise TTSError("Playback failed", str(e)) from e
+            if not stop_requested.is_set():
+                raise TTSError("Playback failed", str(e)) from e
+        finally:
+            stop_requested.set()
+            PiperTTSEngine._active_stop_event = None
+            synth_thread.join(timeout=0.2)
 
     def list_voices(self) -> list[VoiceInfo]:
         """List locally available voice models.

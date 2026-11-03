@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
-from datetime import datetime, UTC
 
 
 def _make_memoir_data(
@@ -149,7 +149,7 @@ def test_build_study_context_includes_prior_session_title(monkeypatch):
 
 def _real_build_study_context_for_test(repl_self, sessions, summaries):
     """Helper that runs _build_study_context with injected sessions/summaries."""
-    from audiobench.memory.memoir_writer import Memoir, CompressionLevel, compress_memoir
+    from audiobench.memory.memoir_writer import CompressionLevel, Memoir, compress_memoir
 
     current_n = repl_self.current_session_number or 1
     session_memoirs: list[tuple[int, Memoir]] = []

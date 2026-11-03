@@ -7,15 +7,11 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
-from audiobench.core.error_types import AudioBenchError
+from audiobench.core.error_types import AIError, AudioBenchError
 from audiobench.core.logger_factory import get_logger
 from audiobench.core.settings import get_settings
 
 logger = get_logger("ai.gemini")
-
-
-class AIError(AudioBenchError):
-    """AI/LLM operation failure."""
 
 
 class GeminiClient:
@@ -23,10 +19,16 @@ class GeminiClient:
 
     def __init__(
         self,
-        model: str = "gemini-2.5-pro",
+        model: str | None = None,
     ) -> None:
         self.settings = get_settings()
-        self._model = model
+        
+        # Resolve convenience keyword to configured model
+        if model and model.lower() != "gemini":
+            self._model = model
+        else:
+            self._model = self.settings.gemini_model or "gemini-2.5-flash"
+
         self._client = None
         self._is_available = False
 
@@ -71,6 +73,8 @@ class GeminiClient:
             )
 
         model_name = model or self._model
+        if not model_name or model_name.lower() in ("gemini", "default"):
+            model_name = self.settings.gemini_model or "gemini-2.5-flash"
 
         from google.genai import types
 
@@ -106,6 +110,8 @@ class GeminiClient:
             )
 
         model_name = model or self._model
+        if not model_name or model_name.lower() in ("gemini", "default"):
+            model_name = self.settings.gemini_model or "gemini-2.5-flash"
 
         from google.genai import types
 
@@ -144,6 +150,8 @@ class GeminiClient:
             )
 
         model_name = model or self._model
+        if not model_name or model_name.lower() in ("gemini", "default"):
+            model_name = self.settings.gemini_model or "gemini-2.5-flash"
 
         system_instruction = None
         user_content = ""
@@ -175,3 +183,53 @@ class GeminiClient:
             yield {"content": "", "done": True}
         except Exception as e:
             raise AIError("Gemini API stream failed", str(e)) from e
+
+    def chat(
+        self,
+        messages: list[dict],
+        model: str | None = None,
+        temperature: float = 0.3,
+        num_ctx: int | None = None,
+        think: bool = True,
+    ) -> dict:
+        """Non-streaming chat generation matching the OllamaClient interface."""
+        if not self._is_available:
+            raise AIError(
+                "Gemini not available", "google-genai SDK not installed or missing API key."
+            )
+
+        model_name = model or self._model
+        if not model_name or model_name.lower() in ("gemini", "default"):
+            model_name = self.settings.gemini_model or "gemini-2.5-flash"
+
+        system_instruction = None
+        user_content = ""
+        for m in messages:
+            if m.get("role") == "system":
+                system_instruction = m.get("content")
+            else:
+                user_content += m.get("content", "") + "\n"
+
+        from google.genai import types
+
+        config = types.GenerateContentConfig(
+            temperature=temperature,
+        )
+        if system_instruction:
+            config.system_instruction = system_instruction
+
+        logger.info("Chat generating with %s (%.2f°C)", model_name, temperature)
+
+        try:
+            response = self._client.models.generate_content(
+                model=model_name,
+                contents=user_content.strip(),
+                config=config,
+            )
+            return {
+                "content": response.text or "",
+                "thinking": None,
+            }
+        except Exception as e:
+            raise AIError("Gemini API call failed", str(e)) from e
+

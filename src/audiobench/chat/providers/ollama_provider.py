@@ -19,14 +19,10 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator
 
-from audiobench.core.error_types import AudioBenchError
+from audiobench.core.error_types import AIError, AudioBenchError
 from audiobench.core.logger_factory import get_logger
 
 logger = get_logger("ai.ollama")
-
-
-class AIError(AudioBenchError):
-    """AI/LLM operation failure."""
 
 
 # Regex to extract <think>...</think> blocks from content (fallback for non-native thinking)
@@ -43,7 +39,7 @@ class OllamaClient:
     def __init__(
         self,
         base_url: str = "http://localhost:11434",
-        model: str = "deepseek-v3.2:cloud",
+        model: str = "gpt-oss:120b-cloud",
         timeout: tuple[int, int] = (10, 600),
     ) -> None:
         self._base_url = base_url.rstrip("/")
@@ -52,6 +48,26 @@ class OllamaClient:
         # Streaming reads may take minutes for large-context prompts
         # (connect_timeout, read_timeout)
         self._stream_timeout = (10, 600)
+
+    @staticmethod
+    def _handle_http_error(e: Any, model_name: str) -> AIError:
+        """Format helpful error message from requests.HTTPError."""
+        err_msg = str(e)
+        status_code = getattr(e.response, "status_code", None)
+        try:
+            err_data = e.response.json()
+            if isinstance(err_data, dict) and "error" in err_data:
+                err_msg = err_data["error"]
+        except Exception:
+            pass
+
+        if status_code == 404:
+            return AIError(
+                f"Model '{model_name}' not available on Ollama server",
+                f"{err_msg}\n"
+                f"Run /model to switch to an available model, or run 'ollama pull {model_name}'.",
+            )
+        return AIError(f"Ollama API error ({status_code or 'unknown'})", err_msg)
 
     def _ensure_requests(self):
         """Lazy import of requests."""
@@ -143,6 +159,9 @@ class OllamaClient:
             resp.raise_for_status()
             data = resp.json()
 
+            if "error" in data:
+                raise AIError(f"Model error from {model_name}", data["error"])
+
             response_text = data.get("response", "")
             logger.info(
                 "Generated %d chars in %.1fs",
@@ -157,7 +176,7 @@ class OllamaClient:
                 f"Start Ollama with: ollama serve\nThen pull the model: ollama pull {model_name}",
             ) from None
         except requests.HTTPError as e:
-            raise AIError(f"Ollama API error ({e.response.status_code})", str(e)) from e
+            raise self._handle_http_error(e, model_name) from e
         except Exception as e:
             raise AIError("Generation failed", str(e)) from e
 
@@ -210,6 +229,9 @@ class OllamaClient:
             for line in resp.iter_lines():
                 if line:
                     data = json.loads(line)
+                    # Ollama returns errors as {"error": "..."} with HTTP 200 during streaming.
+                    if "error" in data:
+                        raise AIError(f"Model error from {model_name}", data["error"])
                     token = data.get("response", "")
                     if token:
                         yield token
@@ -218,6 +240,10 @@ class OllamaClient:
 
         except requests.ConnectionError:
             raise AIError("Ollama server not running", "Start with: ollama serve") from None
+        except requests.HTTPError as e:
+            raise self._handle_http_error(e, model_name) from e
+        except AIError:
+            raise
         except Exception as e:
             raise AIError("Streaming failed", str(e)) from e
 
@@ -281,6 +307,9 @@ class OllamaClient:
             resp.raise_for_status()
             data = resp.json()
 
+            if "error" in data:
+                raise AIError(f"Model error from {model_name}", data["error"])
+
             message = data.get("message", {})
             content = message.get("content", "")
             thinking = message.get("thinking")
@@ -300,7 +329,7 @@ class OllamaClient:
                 f"Start with: ollama serve\nPull model: ollama pull {model_name}",
             ) from None
         except requests.HTTPError as e:
-            raise AIError(f"Ollama API error ({e.response.status_code})", str(e)) from e
+            raise self._handle_http_error(e, model_name) from e
         except Exception as e:
             raise AIError("Chat failed", str(e)) from e
 
@@ -360,6 +389,13 @@ class OllamaClient:
             for line in resp.iter_lines():
                 if line:
                     data = json.loads(line)
+                    # Ollama returns errors as {"error": "..."} with HTTP 200
+                    # during streaming — raise_for_status() does not catch these.
+                    if "error" in data:
+                        raise AIError(
+                            f"Model error from {model_name}",
+                            data["error"],
+                        )
                     message = data.get("message", {})
                     chunk = {
                         "content": message.get("content", ""),
@@ -372,5 +408,9 @@ class OllamaClient:
 
         except requests.ConnectionError:
             raise AIError("Ollama server not running", "Start with: ollama serve") from None
+        except requests.HTTPError as e:
+            raise self._handle_http_error(e, model_name) from e
+        except AIError:
+            raise
         except Exception as e:
             raise AIError("Chat streaming failed", str(e)) from e

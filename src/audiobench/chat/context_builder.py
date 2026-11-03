@@ -107,39 +107,36 @@ def qa(transcript: str, question: str) -> str:
 # ── Chat Mode Prompts ──────────────────────────────────────
 
 CHAT_SYSTEM = (
-    "You are a knowledgeable AI analyst for AudioBench, helping users "
-    "deeply understand their audio transcripts and engage in broader "
-    "intellectual discussion. You have access to the user's transcribed "
-    "content shown below.\n\n"
-    "Your approach:\n"
-    "- Provide thorough, insightful responses that give genuine value.\n"
-    "- Reference specific parts of the transcript — use direct quotes when relevant.\n"
-    "- Use clear structure (headers, bullet points, numbered lists) for complex answers.\n"
-    "- Match response depth to the question: simple questions get focused answers, "
-    "complex questions get detailed exploration with evidence.\n"
-    "- Identify patterns, themes, and connections the user might not have noticed.\n"
-    "- When analyzing, go beyond surface-level — explore implications, context, and significance.\n"
-    "- Be direct and substantive — skip pleasantries, deliver quality analysis.\n"
-    "- When a question relates to the loaded transcripts, ground your answer in "
-    "the transcript content with specific references and quotes.\n"
-    "- When a question is about a topic outside the transcripts, use your general "
-    "knowledge freely. Be helpful and thorough, but note that you're drawing from "
-    "general knowledge rather than the loaded transcripts.\n"
-    "- You can also make connections between the transcripts and outside knowledge "
-    "when it enriches the discussion.\n\n"
+    "You are AudioBench's research companion — an AI analyst grounded in the user's own audio transcripts\n"
+    "(audiobooks, podcasts, lectures, interviews, and personal recordings).\n\n"
+    "CORE PRINCIPLES:\n"
+    "- Lead with insight, not summary. Go beyond restating what was said — identify patterns,\n"
+    "  tensions, and implications the user may not have noticed.\n"
+    "- Be direct. No preamble, no hedging phrases like 'it seems that', no pleasantries.\n"
+    "- Match structure to complexity: use **bold headers** and bullet points for multi-part analysis;\n"
+    "  plain prose for simple, direct questions.\n"
+    "- Quote the transcript directly when it adds force to a point. Don't paraphrase what you can quote.\n\n"
+    "WHEN DRAWING ON TRANSCRIPTS:\n"
+    "- Reference specific moments — speaker, timestamp, or context — to ground your claims.\n"
+    "- Cite timestamps in [MM:SS] or [HH:MM:SS] format (e.g. [03:15]) whenever quoting or referencing\n"
+    "  parts of the audio, allowing instant audio playback navigation.\n"
+    "- If fragments conflict with each other, name the tension explicitly rather than smoothing it over.\n\n"
+    "WHEN GOING BEYOND THE TRANSCRIPTS:\n"
+    "- Use your general knowledge freely, but clearly signal it: 'Drawing from general knowledge...'\n"
+    "- Make connections between the transcripts and outside knowledge when it genuinely enriches the answer.\n\n"
+    "IF THE QUERY IS AMBIGUOUS:\n"
+    "- Ask exactly one focused clarifying question before answering. Do not ask multiple questions.\n\n"
     "{transcript_context}"
 )
 
 CHAT_SYSTEM_NO_CONTEXT = (
-    "You are a knowledgeable AI assistant for AudioBench. "
-    "The user hasn't loaded any transcripts yet — suggest using /load <ID> "
-    "to add transcript context for analysis.\n\n"
-    "Without transcripts, you can still:\n"
-    "- Discuss audio/transcription concepts and best practices\n"
-    "- Help plan how to analyze their content\n"
-    "- Answer general questions thoughtfully and thoroughly\n"
-    "- Discuss literature, philosophy, and any topic with depth\n\n"
-    "Be direct, helpful, and substantive in your responses."
+    "You are AudioBench's research companion. No transcripts are loaded yet.\n"
+    "Suggest using /load <ID> to add transcript context.\n\n"
+    "Without transcripts you can still:\n"
+    "- Discuss literature, philosophy, science, or any topic with depth and directness.\n"
+    "- Help plan how to analyse content once it's loaded.\n"
+    "- Answer general questions with the same quality you'd bring to transcript analysis.\n\n"
+    "Be direct and substantive. No filler, no hedging."
 )
 
 TITLE_PROMPT = (
@@ -189,19 +186,19 @@ def auto_bookmark(transcript_with_timestamps: str, *, focus: str | None = None) 
         '  - "type": one of the 5 types below\n'
         '  - "notes": 1-3 sentences explaining WHY this moment matters\n\n'
         "═══ TYPE GUIDE WITH EXAMPLES ═══\n\n"
-        '  "highlight" (⭐) — Key insight, decision, or turning point\n'
+        '  "highlight" [HL] — Key insight, decision, or turning point\n'
         '     Example: A speaker says "we\'ve decided to pivot to Rust"\n'
         "     Example: A profound realization or emotional breakthrough\n\n"
-        '  "todo" (📌) — Action item, task, commitment, or follow-up\n'
+        '  "todo" [TODO] — Action item, task, commitment, or follow-up\n'
         '     Example: "I need to call Sarah about the budget by Friday"\n'
         "     Example: Any stated intention to do something later\n\n"
-        '  "note" (📝) — Interesting context, background info, or observation\n'
+        '  "note" [NOTE] — Interesting context, background info, or observation\n'
         "     Example: Historical background that explains a later point\n"
         "     Example: A tangential but interesting fact or anecdote\n\n"
-        '  "bookmark" (🔖) — Important structural moment (intro, conclusion, topic shift)\n'
+        '  "bookmark" [BM] — Important structural moment (intro, conclusion, topic shift)\n'
         '     Example: "Let me now talk about the second quarter"\n'
         "     Example: Opening/closing of a recording or major section\n\n"
-        '  "edit" (✂️) — Dead air, filler, tangent, repetition, or cut candidate\n'
+        '  "edit" [CUT] — Dead air, filler, tangent, repetition, or cut candidate\n'
         '     Example: Long pause, "um um um", off-topic rambling\n'
         "     Example: Technical interruption, audio glitch, repeated content\n"
         "     ALWAYS use both timestamp AND end_timestamp for edit regions\n\n"
@@ -214,9 +211,9 @@ def auto_bookmark(transcript_with_timestamps: str, *, focus: str | None = None) 
         "   - 15-30 minutes: 8-12 bookmarks\n"
         "   - 30+ minutes: 10-15 bookmarks\n"
         "3. TYPE DIVERSITY: Use ALL 5 types where applicable. Always scan for:\n"
-        "   - At least one ✂️ edit region (dead air, filler, cut candidates)\n"
-        "   - Any 📌 todo/action items if present\n"
-        "   - Structural 🔖 bookmarks for major topic shifts\n"
+        "   - At least one [CUT] edit region (dead air, filler, cut candidates)\n"
+        "   - Any [TODO] todo/action items if present\n"
+        "   - Structural [BM] bookmarks for major topic shifts\n"
         "4. REGIONS vs POINTS: Use regions (start + end) for extended passages.\n"
         "   Use points (end_timestamp = null) only for brief, instant moments.\n"
         "5. QUALITY: Only bookmark truly significant moments. No padding.\n"

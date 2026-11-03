@@ -116,6 +116,8 @@ class ChatREPL:
         preloaded_query: str | None = None,
         preloaded_answer: str | None = None,
         search_session_id: int | None = None,
+        search_query_id: int | None = None,
+        custom_title: bool = False,
         model: str | None = None,
         temperature: float = 0.3,
         think: bool = True,
@@ -147,6 +149,8 @@ class ChatREPL:
                 temperature=temperature,
                 conversation_id=resume_id,
                 show_thinking=think,
+                title=preloaded_title or "New Chat",
+                custom_title=custom_title,
             )
             if resume_id is not None:
                 self.session.restore_from_db(tx_repo=self.tx_repo)
@@ -161,6 +165,8 @@ class ChatREPL:
         self.preloaded_query = preloaded_query
         self.preloaded_answer = preloaded_answer
         self.search_session_id = search_session_id
+        self.search_query_id = search_query_id
+        self.custom_title = custom_title
 
         # Ensure active model and provider are available, auto-falling back if missing
         if session is None and resume_id is not None and not model:
@@ -177,9 +183,14 @@ class ChatREPL:
                 title=title,
                 session_type=self.session_type,
                 search_session_id=self.search_session_id,
+                search_query_id=self.search_query_id,
             )
         elif self.session.conversation_id and self.search_session_id:
-            self.chat_repo.update_search_session_id(self.session.conversation_id, self.search_session_id)
+            self.chat_repo.update_search_session_id(
+                self.session.conversation_id,
+                self.search_session_id,
+                self.search_query_id,
+            )
 
         # Inject preloaded search fragments into chat context
         if self.preloaded_fragments and self.session:
@@ -220,8 +231,18 @@ class ChatREPL:
 
         if not self._active_citations and self.preloaded_fragments:
             for frag in self.preloaded_fragments:
-                sf = getattr(frag, "source_file", None) or ""
-                st = getattr(frag, "start_time", 0.0)
+                if isinstance(frag, dict):
+                    sf = frag.get("source_file") or ""
+                    st = frag.get("start_time", 0.0)
+                else:
+                    sf = getattr(frag, "source_file", None) or ""
+                    st = getattr(frag, "start_time", 0.0)
+                if (sf, st) not in self._active_citations:
+                    self._active_citations.append((sf, st))
+        elif not self._active_citations and self.session and self.session.injected_fragments:
+            for frag in self.session.injected_fragments:
+                sf = frag.get("source_file") or ""
+                st = frag.get("start_time", 0.0)
                 if (sf, st) not in self._active_citations:
                     self._active_citations.append((sf, st))
 
@@ -2412,6 +2433,11 @@ class ChatREPL:
 
         if active_resume_id and self.session.turn_count > 0:
             self._render_history()
+            if self._active_citations:
+                from audiobench.playback.controls import render_citations_banner
+
+                render_citations_banner(console, self._active_citations)
+                console.print()
         elif self._active_citations:
             from audiobench.playback.controls import render_citations_banner
 

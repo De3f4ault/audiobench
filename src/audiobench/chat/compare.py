@@ -172,7 +172,7 @@ class ModelComparison:
                 think_lines = think_text.splitlines()
                 if len(think_lines) > 5:
                     think_text = "…\n" + "\n".join(think_lines[-5:])
-                parts.append(Text(f"💭 {think_text}", style="dim italic"))
+                parts.append(Text(f"[thinking] {think_text}", style="dim italic"))
 
             # Content section
             content = "".join(output) + cursor
