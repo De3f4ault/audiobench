@@ -21,6 +21,7 @@ import sys
 from typing import Any, Callable
 
 from rich.console import Console
+from rich.markup import escape
 
 from audiobench.cli.display.theme import ACCENT, DIM, ERROR, SUCCESS, WARNING
 from audiobench.core.settings import get_settings
@@ -425,15 +426,26 @@ def handle_playback_command(
     default_record: dict | None = None,
 ) -> bool:
     """Handle universal playback slash commands."""
-    cmd = command.lower()
+    if client is None or not hasattr(client, "playback_status"):
+        target_console.print(
+            f"  [{WARNING}]Playback error: Playback is not available (no active daemon or playback service)[/]"
+        )
+        return True
 
+    cmd = command.lower()
     try:
         if cmd == "/play":
             return _cmd_play(arg, client, target_console, transcript_resolver, loaded_transcript_ids)
         elif cmd == "/seek":
             return _cmd_seek(arg, client, target_console)
         elif cmd in ("/pause", "/resume", "/toggle"):
-            return _cmd_toggle(cmd, client, target_console)
+            return _cmd_toggle(
+                cmd,
+                client,
+                target_console,
+                loaded_ids=loaded_transcript_ids,
+                resolver=transcript_resolver,
+            )
         elif cmd == "/speed":
             return _cmd_speed(arg, client, target_console)
         elif cmd == "/stop":
@@ -457,7 +469,7 @@ def handle_playback_command(
             return _cmd_lyrics(client, target_console, transcript_resolver)
         return False
     except Exception as exc:
-        target_console.print(f"  [{WARNING}]Playback error: {exc}[/]")
+        target_console.print(f"  [{WARNING}]Playback error: {escape(str(exc))}[/]")
         return True
 
 
@@ -567,50 +579,161 @@ def _cmd_jump_index(
 def _play_record(
     client: Any,
     rec: dict[str, Any],
-    start_pos: float,
+    start_pos: float | None,
     target_console: Console,
 ) -> bool:
     """Helper to dispatch playback for a resolved transcript/audio record."""
+    pos = float(start_pos or 0.0)
     client.playback_play(
         rec["file_path"],
-        start_pos=start_pos,
+        start_pos=pos,
         audio_file_id=rec.get("audio_file_id"),
         transcription_id=rec.get("id"),
     )
     name = rec.get("file_name") or os.path.basename(rec["file_path"])
-    pos_str = f" from {fmt_timestamp(start_pos)}" if start_pos > 0.0 else ""
+    pos_str = f" from {fmt_timestamp(pos)}" if pos > 0.0 else ""
     target_console.print(f"  [{SUCCESS}][DONE] Playing: {name}{pos_str}[/]")
     return True
+
+
+def _save_current_bookmark(
+    transcription_id: int,
+    position: float,
+    duration: float = 0.0,
+    audio_file_id: int | None = None,
+) -> None:
+    """Save resume bookmark to SQLite defensively."""
+    try:
+        from audiobench.storage.bookmark_repository import BookmarkRepository
+
+        BookmarkRepository().save_resume_position(
+            transcription_id,
+            position,
+            audio_file_id=audio_file_id,
+            duration=duration,
+        )
+    except Exception:
+        pass
+
+
+def is_bg_exit_requested(arg_or_tokens: str | list[str] | None) -> bool:
+    """Return True if background flag (--bg, -b, bg) was requested on exit."""
+    if not arg_or_tokens:
+        return False
+    if isinstance(arg_or_tokens, str):
+        tokens = arg_or_tokens.strip().lower().split()
+    else:
+        tokens = [str(t).strip().lower() for t in arg_or_tokens]
+    return any(t in ("--bg", "-b", "bg") for t in tokens)
+
+
+def pause_playback_if_owned(
+    client: Any,
+    owned_ids: list[int] | set[int] | int | None,
+    target_console: Console | None = None,
+    *,
+    reason: str = "exit",
+    force_bg: bool = False,
+) -> bool:
+    """Pause playback and save resume position if daemon is playing an owned track.
+
+    Respects settings.pause_on_exit and ownership:
+    - Never pauses audio if force_bg is True or settings.pause_on_exit is False on exit.
+    - Never pauses audio belonging to another tab/session (checks transcription_id ownership).
+    - Decouples DB persistence from playback_pause so DB errors never prevent pausing.
+    - Returns True if audio was paused/persisted, False otherwise.
+    """
+    if not client:
+        return False
+
+    settings = get_settings()
+    if reason == "exit" and (force_bg or not settings.pause_on_exit):
+        try:
+            st = client.playback_status()
+            if (st.get("state") == "playing" or (st.get("playing") and not st.get("paused"))) and target_console:
+                target_console.print(f"  [{DIM}]Playback continues in background[/]")
+        except Exception:
+            pass
+        return False
+
+    try:
+        st = client.playback_status()
+        state = st.get("state") or ("paused" if st.get("paused") else "playing" if st.get("playing") else "stopped")
+        tid = st.get("transcription_id")
+
+        if not tid:
+            return False
+
+        if owned_ids is None:
+            allowed_tids = set()
+        elif isinstance(owned_ids, int):
+            allowed_tids = {owned_ids}
+        else:
+            allowed_tids = {int(i) for i in owned_ids if i is not None}
+
+        if tid not in allowed_tids:
+            return False
+
+        pos = float(st.get("position", 0.0))
+        dur = float(st.get("duration", 0.0))
+        audio_file_id = st.get("audio_file_id")
+
+        _save_current_bookmark(tid, pos, dur, audio_file_id)
+
+        if state == "playing":
+            client.playback_pause()
+            if target_console:
+                if reason == "switch":
+                    suffix = " (switched session)" if isinstance(owned_ids, (list, set)) else " (switched transcript)"
+                elif reason == "exit":
+                    suffix = " (exiting)"
+                else:
+                    suffix = ""
+                from audiobench.cli.display.theme import format_duration
+                target_console.print(f"  [{DIM}]Playback paused @ {format_duration(pos)}{suffix}[/]")
+            return True
+        return False
+    except Exception:
+        return False
 
 
 def _cmd_play(
     arg: str,
     client: Any,
     target_console: Console,
-    resolver: Callable[[int], dict | None] | None,
-    loaded_ids: list[int] | None,
+    resolver: Callable[[int], dict | None] | None = None,
+    loaded_ids: list[int] | None = None,
+    status: dict | None = None,
 ) -> bool:
     raw = arg.strip()
+    st = status if status is not None else client.playback_status()
+    daemon_tx_id = st.get("transcription_id")
+    session_primary_id = loaded_ids[0] if (loaded_ids and len(loaded_ids) > 0) else None
 
     # Case 1: /play <timestamp> (e.g. /play 6:30 or /play 01:15:00)
     ts = parse_timestamp(raw) if (raw and ":" in raw) else None
     if ts is not None:
-        st = client.playback_status()
-        if st.get("playing"):
+        if st.get("playing") and (not loaded_ids or daemon_tx_id in loaded_ids):
             client.playback_seek(ts)
             target_console.print(f"  [{SUCCESS}][DONE] Seeked to {fmt_timestamp(ts)}[/]")
             return True
-        elif loaded_ids and resolver:
-            rec = resolver(loaded_ids[0])
+        elif session_primary_id and resolver:
+            rec = resolver(session_primary_id)
             if rec and rec.get("file_path"):
                 return _play_record(client, rec, ts, target_console)
+        else:
+            target_console.print(f"  [{WARNING}]Cannot seek: playback belongs to another session or transcript not loaded.[/]")
+            return False
 
     # Case 2: /play <transcript_id> (e.g. /play 1430)
     if raw.isdigit() and resolver:
         tid = int(raw)
         rec = resolver(tid)
         if rec and rec.get("file_path"):
-            return _play_record(client, rec, 0.0, target_console)
+            from audiobench.storage.bookmark_repository import BookmarkRepository
+
+            resume_pos = BookmarkRepository().get_resume_position(tid) or 0.0
+            return _play_record(client, rec, resume_pos, target_console)
         else:
             target_console.print(f"  [{WARNING}]Transcript #{tid} has no playable audio file.[/]")
             return True
@@ -621,9 +744,15 @@ def _cmd_play(
             from audiobench.storage.repository import TranscriptionRepository
 
             repo = TranscriptionRepository()
-            matches = repo.search(raw, limit=5)
+            matches = repo.search(raw, limit=5, session=None)
             if len(matches) == 1:
-                return _play_record(client, matches[0], 0.0, target_console)
+                from audiobench.storage.bookmark_repository import BookmarkRepository
+
+                m_tid = matches[0].get("id")
+                resume_pos = (
+                    BookmarkRepository().get_resume_position(m_tid) if m_tid else 0.0
+                ) or 0.0
+                return _play_record(client, matches[0], resume_pos, target_console)
             elif len(matches) > 1:
                 target_console.print(f"  [{ACCENT}]Found {len(matches)} matching transcripts:[/]")
                 for m in matches:
@@ -634,17 +763,31 @@ def _cmd_play(
         except Exception:  # noqa: BLE001
             pass
 
-    # Case 4: /play with no args — resume if paused, or play first loaded transcript
-    st = client.playback_status()
-    if st.get("playing") and st.get("paused"):
-        client.playback_resume()
-        target_console.print(f"  [{SUCCESS}][DONE] Resumed playback[/]")
+    # Case 4: /play with no args — resume if already playing/paused on this session's track,
+    # or start this session's active transcript from its saved resume bookmark.
+    if st.get("playing") and (not loaded_ids or daemon_tx_id in loaded_ids):
+        if st.get("paused"):
+            client.playback_resume()
+            target_console.print(f"  [{SUCCESS}][DONE] Resumed playback[/]")
+        else:
+            client.playback_pause()
+            if daemon_tx_id:
+                _save_current_bookmark(
+                    daemon_tx_id,
+                    st.get("position", 0.0),
+                    st.get("duration", 0.0),
+                    st.get("audio_file_id"),
+                )
+            target_console.print(f"  [{SUCCESS}][DONE] Paused playback[/]")
         return True
 
-    if loaded_ids and resolver:
-        rec = resolver(loaded_ids[0])
+    if session_primary_id and resolver:
+        rec = resolver(session_primary_id)
         if rec and rec.get("file_path"):
-            return _play_record(client, rec, 0.0, target_console)
+            from audiobench.storage.bookmark_repository import BookmarkRepository
+
+            resume_pos = BookmarkRepository().get_resume_position(session_primary_id) or 0.0
+            return _play_record(client, rec, resume_pos, target_console)
 
     target_console.print(f"  [{DIM}]Nothing to play — load a transcript first (/load <ID>)[/]")
     return True
@@ -676,16 +819,45 @@ def _cmd_seek(arg: str, client: Any, target_console: Console) -> bool:
     return True
 
 
-def _cmd_toggle(cmd: str, client: Any, target_console: Console) -> bool:
+def _cmd_toggle(
+    cmd: str,
+    client: Any,
+    target_console: Console,
+    loaded_ids: list[int] | None = None,
+    resolver: Callable[[int], dict | None] | None = None,
+) -> bool:
+    st = client.playback_status()
+    daemon_tx_id = st.get("transcription_id")
+    session_primary_id = loaded_ids[0] if (loaded_ids and len(loaded_ids) > 0) else None
+
+    # Cold start or foreign session takeover: if audio is not playing or belongs to another session
+    if not st.get("playing") or (loaded_ids and daemon_tx_id not in loaded_ids):
+        if cmd in ("/resume", "/toggle") and session_primary_id and resolver:
+            return _cmd_play("", client, target_console, resolver, loaded_ids, status=st)
+
     if cmd == "/pause":
         client.playback_pause()
+        if daemon_tx_id:
+            _save_current_bookmark(
+                daemon_tx_id,
+                st.get("position", 0.0),
+                st.get("duration", 0.0),
+                st.get("audio_file_id"),
+            )
         target_console.print(f"  [{SUCCESS}][DONE] Paused[/]")
     elif cmd == "/resume":
         client.playback_resume()
         target_console.print(f"  [{SUCCESS}][DONE] Resumed[/]")
     else:
-        st = client.playback_toggle()
-        state = "Paused" if st.get("paused") else "Playing"
+        st_after = client.playback_toggle()
+        state = "Paused" if st_after.get("paused") else "Playing"
+        if st_after.get("paused") and daemon_tx_id:
+            _save_current_bookmark(
+                daemon_tx_id,
+                st_after.get("position", 0.0),
+                st_after.get("duration", 0.0),
+                st_after.get("audio_file_id"),
+            )
         target_console.print(f"  [{SUCCESS}][DONE] {state}[/]")
     return True
 

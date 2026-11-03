@@ -163,7 +163,7 @@ def test_mpv_controller_cleans_up_on_premature_exit(tmp_path):
 
     with patch("subprocess.Popen", return_value=mock_proc):
         with pytest.raises(RuntimeError, match="mpv process exited prematurely"):
-            ctrl.start("/dummy/audio.mp3")
+            ctrl.start()
 
 
 def test_mpv_controller_kills_proc_on_socket_timeout(tmp_path):
@@ -178,7 +178,7 @@ def test_mpv_controller_kills_proc_on_socket_timeout(tmp_path):
 
     with patch("subprocess.Popen", return_value=mock_proc), patch("time.sleep"):
         with pytest.raises(RuntimeError, match="mpv IPC socket not created"):
-            ctrl.start("/dummy/audio.mp3")
+            ctrl.start()
 
     mock_proc.kill.assert_called()
 
@@ -402,5 +402,56 @@ def test_extract_timestamps_synthesis_formats():
         ("10:46", 646.0),
     ]
     assert extracted == expected_times
+
+
+def test_play_record_handles_none_start_pos():
+    """Verify _play_record handles None start_pos without TypeError."""
+    from audiobench.playback.controls import _play_record
+
+    client = MagicMock()
+    console = Console(quiet=True)
+    rec = {"file_path": "/fake/path/audio.mp3", "file_name": "audio.mp3", "id": 1196, "audio_file_id": 672}
+
+    success = _play_record(client, rec, None, console)
+    assert success is True
+    client.playback_play.assert_called_once_with(
+        "/fake/path/audio.mp3",
+        start_pos=0.0,
+        audio_file_id=672,
+        transcription_id=1196,
+    )
+
+
+def test_cmd_play_handles_unbookmarked_transcript():
+    """Verify /play handles transcript with no resume position (None) without TypeError."""
+    from unittest.mock import patch
+    from audiobench.playback.controls import _cmd_play
+
+    client = MagicMock()
+    console = Console(quiet=True)
+    rec = {"file_path": "/fake/path/audio.mp3", "file_name": "audio.mp3", "id": 1196, "audio_file_id": 672}
+    resolver = MagicMock(return_value=rec)
+
+    with patch("audiobench.storage.bookmark_repository.BookmarkRepository.get_resume_position", return_value=None):
+        # Case 2: /play 1196
+        handled = _cmd_play("1196", client, console, resolver=resolver)
+        assert handled is True
+        client.playback_play.assert_called_with(
+            "/fake/path/audio.mp3",
+            start_pos=0.0,
+            audio_file_id=672,
+            transcription_id=1196,
+        )
+
+        # Case 4: /play with session loaded_ids
+        client.reset_mock()
+        handled = _cmd_play("", client, console, resolver=resolver, loaded_ids=[1196])
+        assert handled is True
+        client.playback_play.assert_called_with(
+            "/fake/path/audio.mp3",
+            start_pos=0.0,
+            audio_file_id=672,
+            transcription_id=1196,
+        )
 
 

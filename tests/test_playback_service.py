@@ -14,12 +14,16 @@ def test_playback_service_initial_state():
     assert st == {
         "playing": False,
         "paused": False,
+        "state": "stopped",
         "position": 0.0,
         "duration": 0.0,
         "speed": 1.0,
         "file": None,
         "audio_file_id": None,
         "transcription_id": None,
+        "loop_a": None,
+        "loop_b": None,
+        "filter": "",
     }
     assert svc.get_segment_at(10.0) is None
     ctx = svc.get_context_window(10.0)
@@ -102,15 +106,22 @@ def test_playback_service_controls(mock_mpv_cls):
     assert st == {
         "playing": False,
         "paused": False,
+        "state": "stopped",
         "position": 0.0,
         "duration": 0.0,
         "speed": 1.0,
         "file": None,
         "audio_file_id": None,
         "transcription_id": None,
+        "loop_a": None,
+        "loop_b": None,
+        "filter": "",
     }
-    mock_mpv.quit.assert_called_once()
-    assert svc._mpv is None
+    # Phase 2A: stop() sends 'stop' command (daemon stays alive), not quit()
+    mock_mpv.stop.assert_called_once()
+    mock_mpv.quit.assert_not_called()
+    # _mpv handle is preserved — daemon remains ready for next play()
+    assert svc._mpv is mock_mpv
 
 
 @patch.object(PlaybackService, "_load_segments_from_db")
@@ -143,3 +154,143 @@ def test_playback_service_sync_session(mock_load_segs):
     assert len(ctx["segments"]) == 2
     assert ctx["position"] == 12.5
     assert ctx["current_idx"] == 1
+
+
+@patch("audiobench.playback.service.MpvController")
+def test_playback_service_custom_segments_and_context_window(mock_mpv_cls):
+    """Test PlaybackService with in-memory speech segments (transcription_id is None)."""
+    mock_mpv = MagicMock()
+    mock_mpv.is_running.return_value = True
+    mock_mpv.get_playback_state.return_value = (3.5, 1.0, False)
+    mock_mpv.get_duration.return_value = 10.0
+    mock_mpv_cls.return_value = mock_mpv
+
+    custom_segs = [
+        {"start": 0.0, "end": 2.0, "text": "First sentence."},
+        {"start": 2.0, "end": 5.0, "text": "Second sentence."},
+        {"start": 5.0, "end": 8.0, "text": "Third sentence."},
+    ]
+
+    svc = PlaybackService()
+    st = svc.play(
+        "/path/to/speech.wav",
+        start_pos=0.0,
+        segments=custom_segs,
+    )
+
+    assert st["playing"] is True
+    assert st["transcription_id"] is None
+    ctx = svc.get_context_window(position=3.5, window=1)
+    assert len(ctx["segments"]) == 3
+    assert ctx["current_idx"] == 1
+    assert ctx["segments"][1]["text"] == "Second sentence."
+
+
+@patch.object(PlaybackService, "_write_resume_position")
+@patch("audiobench.playback.service.MpvController")
+def test_playback_service_auto_resume_flow(mock_mpv_cls, mock_write_pos):
+    """Test auto-resume stashes track and restores it on EOF."""
+    # Phase 2A: one persistent mpv controller throughout
+    mock_mpv = MagicMock()
+    mock_mpv.is_running.return_value = True
+    mock_mpv.get_playback_state.return_value = (42.0, 1.25, False)
+    mock_mpv.get_position.return_value = 42.0
+    mock_mpv.get_duration.return_value = 200.0
+    mock_mpv_cls.return_value = mock_mpv
+
+    svc = PlaybackService()
+    # Play original track
+    svc.play("/path/to/track1.mp3", start_pos=10.0, speed=1.25, audio_file_id=7, transcription_id=99)
+    assert svc._current_file.endswith("track1.mp3")
+
+    # Speak interrupts track1 with auto_resume=True
+    speech_segs = [{"start": 0.0, "end": 3.0, "text": "Speech prompt"}]
+    svc.play("/path/to/speech.wav", segments=speech_segs, auto_resume=True)
+
+    assert svc._interrupted_playback is not None
+    assert svc._interrupted_playback["file_path"].endswith("track1.mp3")
+    assert svc._interrupted_playback["start_pos"] == 42.0
+    assert svc._interrupted_playback["speed"] == 1.25
+    assert svc._interrupted_playback["transcription_id"] == 99
+
+    # Simulate speech finishing: Phase 2A uses _on_eof("eof") from reader thread
+    mock_mpv.get_playback_state.return_value = (3.0, 1.0, False)
+    mock_mpv.get_position.return_value = 3.0
+    svc._on_eof("eof")
+
+    # Track 1 should be resumed
+    assert svc._interrupted_playback is None
+    assert svc._current_file.endswith("track1.mp3")
+    assert svc._transcription_id == 99
+
+
+@patch("audiobench.playback.service.MpvController")
+def test_playback_service_stop_clears_interrupted(mock_mpv_cls):
+    """Test that stop() clears any stashed interrupted track so it does not auto-resume."""
+    mock_mpv = MagicMock()
+    mock_mpv.is_running.return_value = True
+    mock_mpv.get_playback_state.return_value = (10.0, 1.0, False)
+    mock_mpv_cls.return_value = mock_mpv
+
+    svc = PlaybackService()
+    svc.play("/path/to/track1.mp3", start_pos=0.0)
+    svc.play("/path/to/speech.wav", auto_resume=True)
+    assert svc._interrupted_playback is not None
+
+    svc.stop()
+    assert svc._interrupted_playback is None
+
+
+@patch.object(PlaybackService, "_write_resume_position")
+@patch("audiobench.playback.service.MpvController")
+def test_stop_eof_event_does_not_trigger_auto_resume(mock_mpv_cls, mock_write_pos):
+    """stop() sends mpv 'stop' which fires end-file(reason='stop').
+    _on_eof('stop') must NOT trigger auto-resume or advance to next track.
+    """
+    mock_mpv = MagicMock()
+    mock_mpv.is_running.return_value = True
+    mock_mpv.get_playback_state.return_value = (10.0, 1.0, False)
+    mock_mpv.get_position.return_value = 10.0
+    mock_mpv_cls.return_value = mock_mpv
+
+    svc = PlaybackService()
+    svc.play("/path/to/track1.mp3", start_pos=0.0)
+    svc.play("/path/to/speech.wav", auto_resume=True)
+    assert svc._interrupted_playback is not None
+
+    # User calls stop() — then mpv fires end-file(reason='stop')
+    svc.stop()
+    svc._on_eof("stop")
+
+    # Auto-resume must NOT have fired: interrupted_playback cleared by stop(),
+    # _on_eof("stop") returns early without restoring it or calling play()
+    assert svc._interrupted_playback is None
+    assert svc._current_file is None   # stop() cleared this
+    # play() was called twice above, stop() adds 0 additional play calls
+    total_load_calls = mock_mpv.load_file.call_count
+    svc._on_eof("stop")   # fire again — still nothing
+    assert mock_mpv.load_file.call_count == total_load_calls
+
+
+@patch.object(PlaybackService, "_schedule_pos_timer")
+@patch("audiobench.playback.service.MpvController")
+def test_resume_rearms_position_timer(mock_mpv_cls, mock_schedule):
+    """resume() must re-arm the 30s position timer when transcription_id is set.
+    Without this, a pause of >30s would leave no timer running after resume.
+    """
+    mock_mpv = MagicMock()
+    mock_mpv.is_running.return_value = True
+    mock_mpv.is_paused.return_value = True   # currently paused
+    mock_mpv.get_playback_state.return_value = (30.0, 1.0, True)
+    mock_mpv.get_duration.return_value = 100.0
+    mock_mpv_cls.return_value = mock_mpv
+
+    svc = PlaybackService()
+    svc._mpv = mock_mpv
+    svc._current_file = "/path/to/track.mp3"
+    svc._transcription_id = 42
+
+    mock_schedule.reset_mock()
+    svc.resume()
+
+    mock_schedule.assert_called_once()
