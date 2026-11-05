@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from sqlalchemy import desc
@@ -114,7 +115,100 @@ class TranscriptionRepository:
                         shutil.move(str(dest), str(src))
                 except Exception as rb_err:
                     logger.error("Rollback failed for %s → %s: %s", dest, src, rb_err)
-            raise
+    def _resolve_segment_chapters(
+        self,
+        segments: list[Any],
+        audio_file_id: int | None,
+        session: Any,
+        explicit_chapter_id: int | None = None,
+    ) -> list[int | None]:
+        """Resolve database chapter_id for each segment based on chapter bounds or metadata.
+
+        Args:
+            segments: List of segment objects or dicts with start and end times.
+            audio_file_id: The ID of the audio file.
+            session: Active SQLAlchemy session.
+            explicit_chapter_id: Optional explicit chapter ID if transcribing a single chapter.
+
+        Returns:
+            List of ChapterRecord.id (or None) corresponding 1:1 with input segments.
+        """
+        if not segments:
+            return []
+
+        if explicit_chapter_id is not None:
+            return [explicit_chapter_id] * len(segments)
+
+        if not audio_file_id:
+            return [None] * len(segments)
+
+        from audiobench.storage.models import ChapterRecord
+
+        chapters = (
+            session.query(ChapterRecord)
+            .filter_by(audio_file_id=audio_file_id, is_ghost=0)
+            .order_by(ChapterRecord.start_time.asc())
+            .all()
+        )
+
+        if not chapters:
+            return [None] * len(segments)
+
+        if len(chapters) == 1:
+            single_id = chapters[0].id
+            return [single_id] * len(segments)
+
+        idx_to_id = {c.chapter_index: c.id for c in chapters}
+        max_idx = max(c.chapter_index for c in chapters)
+
+        chap_intervals = [
+            (float(c.start_time), float(c.end_time), c.chapter_index, c.id)
+            for c in chapters
+        ]
+
+        resolved: list[int | None] = []
+        for seg in segments:
+            seg_chap_val = getattr(seg, "chapter_id", None)
+            if isinstance(seg, dict) and "chapter_id" in seg:
+                seg_chap_val = seg["chapter_id"]
+
+            if seg_chap_val is not None:
+                if seg_chap_val in idx_to_id:
+                    resolved.append(idx_to_id[seg_chap_val])
+                    continue
+                if any(c.id == seg_chap_val for c in chapters):
+                    resolved.append(seg_chap_val)
+                    continue
+
+            s_start = getattr(seg, "start", None)
+            if s_start is None:
+                s_start = getattr(seg, "start_time", 0.0)
+            if isinstance(seg, dict):
+                s_start = seg.get("start", seg.get("start_time", 0.0))
+
+            s_end = getattr(seg, "end", None)
+            if s_end is None:
+                s_end = getattr(seg, "end_time", 0.0)
+            if isinstance(seg, dict):
+                s_end = seg.get("end", seg.get("end_time", 0.0))
+
+            midpoint = (float(s_start) + float(s_end)) / 2.0
+
+            matched_id = None
+            for ch_start, ch_end, ch_idx, ch_id in chap_intervals:
+                if midpoint >= ch_start and (midpoint < ch_end or ch_idx == max_idx):
+                    matched_id = ch_id
+                    break
+
+            if matched_id is None:
+                if midpoint < chap_intervals[0][0]:
+                    matched_id = chap_intervals[0][3]
+                else:
+                    matched_id = chap_intervals[-1][3]
+
+            resolved.append(matched_id)
+
+        return resolved
 
     def save_transcription(
         self,
@@ -125,6 +219,7 @@ class TranscriptionRepository:
         overwrite: bool = False,
         privacy_tier: int = 0,
         is_audiobook: bool = False,
+        audit_provenance: dict | None = None,
     ) -> int:
         """
         Save a complete transcription to the database.
@@ -140,6 +235,9 @@ class TranscriptionRepository:
                           2 = intimate (--sensitive flag, stamps all segments Tier 2
                               regardless of voiceprint match).
             is_audiobook: If True, marks file as verified audiobook (Class A bypass).
+            audit_provenance: Optional audit metadata dict for forced/relaxed imports
+                              (e.g. tag-modified SHA-256 bypass), recording verification
+                              in tags, source marker, and reimport audit log.
 
         Returns:
             The transcription record ID.
@@ -197,8 +295,6 @@ class TranscriptionRepository:
                 session.flush()  # Get the ID
 
                 # Auto-detect chapters
-                from pathlib import Path
-
                 from audiobench.chapters.detector import ChapterDetector
 
                 try:
@@ -237,9 +333,15 @@ class TranscriptionRepository:
                     )
 
             # Create transcription record
+            source_val = "file"
+            if audit_provenance and "source" in audit_provenance:
+                source_val = audit_provenance["source"]
+            elif audit_provenance:
+                source_val = "reimport:hash_override"
+
             tx_record = TranscriptionRecord(
                 audio_file_id=audio_record.id if audio_record else None,
-                source="file",
+                source=source_val,
                 file_name=audio_metadata.file_name if audio_metadata else "",
                 full_text=transcript.text,
                 language=transcript.language,
@@ -255,9 +357,35 @@ class TranscriptionRepository:
             session.add(tx_record)
             session.flush()
 
+            # Ensure chapters exist for audio_record if none recorded yet
+            if audio_record and not chapter_id:
+                from audiobench.storage.models import ChapterRecord
+                from audiobench.storage.chapter_repository import get_chapter_repo
+
+                existing_chaps_count = session.query(ChapterRecord).filter_by(audio_file_id=audio_record.id).count()
+                if existing_chaps_count == 0:
+                    if getattr(transcript, "chapters", None):
+                        get_chapter_repo().save_chapters(audio_record.id, transcript.chapters)
+                    elif audio_record.file_path and Path(audio_record.file_path).exists():
+                        from audiobench.chapters.detector import ChapterDetector
+                        try:
+                            chaps = ChapterDetector().detect(Path(audio_record.file_path))
+                            if chaps:
+                                get_chapter_repo().save_chapters(audio_record.id, chaps)
+                        except Exception as det_err:
+                            logger.debug("Chapter detection on save_transcription skipped: %s", det_err)
+
+            # Resolve segment chapters
+            seg_chapter_ids = self._resolve_segment_chapters(
+                transcript.segments,
+                audio_record.id if audio_record else None,
+                session,
+                explicit_chapter_id=chapter_id,
+            )
+
             # Save segments — stamp privacy_tier from --sensitive flag (or 0 default)
             saved_segment_ids = []
-            for seg in transcript.segments:
+            for seg, seg_cid in zip(transcript.segments, seg_chapter_ids):
                 seg_record = SegmentRecord(
                     transcription_id=tx_record.id,
                     segment_index=seg.id,
@@ -265,7 +393,7 @@ class TranscriptionRepository:
                     start_time=seg.start,
                     end_time=seg.end,
                     speaker=seg.speaker,
-                    chapter_id=chapter_id,
+                    chapter_id=seg_cid,
                     privacy_tier=privacy_tier,
                 )
                 session.add(seg_record)
@@ -276,7 +404,45 @@ class TranscriptionRepository:
                 chapter_record.transcription_id = tx_record.id
                 chapter_record.transcription_status = "completed"
 
+            if audit_provenance and audio_record:
+                try:
+                    tags_dict = json.loads(audio_record.tags) if audio_record.tags else {}
+                    if not isinstance(tags_dict, dict):
+                        tags_dict = {"tags": tags_dict}
+                except Exception:
+                    tags_dict = {}
+                tags_dict["hash_verification"] = audit_provenance.get("hash_verification", "bypassed_tag_modified")
+                tags_dict["verified_by"] = audit_provenance.get("verified_by", "operator_interactive")
+                if "original_json_hash" in audit_provenance:
+                    tags_dict["original_json_hash"] = audit_provenance["original_json_hash"]
+                if "actual_audio_hash" in audit_provenance:
+                    tags_dict["actual_audio_hash"] = audit_provenance["actual_audio_hash"]
+                if "duration_delta_sec" in audit_provenance:
+                    tags_dict["duration_delta_sec"] = audit_provenance["duration_delta_sec"]
+                if "size_delta_bytes" in audit_provenance:
+                    tags_dict["size_delta_bytes"] = audit_provenance["size_delta_bytes"]
+                audio_record.tags = json.dumps(tags_dict)
+
             session.commit()
+
+            if audit_provenance:
+                try:
+                    from datetime import datetime, timezone
+                    from audiobench.core.settings import get_settings
+                    audit_log_file = get_settings().data_dir / "logs" / "reimport_audit.log"
+                    audit_log_file.parent.mkdir(parents=True, exist_ok=True)
+                    entry = {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "transcription_id": tx_record.id,
+                        "audio_file_id": audio_record.id if audio_record else None,
+                        "file_name": audio_record.file_name if audio_record else (audio_metadata.file_name if audio_metadata else ""),
+                        **audit_provenance,
+                    }
+                    with open(audit_log_file, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(entry) + "\n")
+                except Exception as log_err:
+                    logger.warning("Failed to write reimport audit log: %s", log_err)
+
             logger.info(
                 "Saved transcription #%d (%d segments, privacy_tier=%d)",
                 tx_record.id, len(transcript.segments), privacy_tier,
@@ -1492,7 +1658,15 @@ class TranscriptionRepository:
             # Delete old segments if this is a retry
             session.query(SegmentRecord).filter_by(transcription_id=tx_id).delete()
 
-            for seg in transcript.segments:
+            # Resolve segment chapters
+            seg_chapter_ids = self._resolve_segment_chapters(
+                transcript.segments,
+                tx_record.audio_file_id,
+                session,
+                explicit_chapter_id=chapter_id,
+            )
+
+            for seg, seg_cid in zip(transcript.segments, seg_chapter_ids):
                 seg_record = SegmentRecord(
                     transcription_id=tx_record.id,
                     segment_index=seg.id,
@@ -1500,7 +1674,7 @@ class TranscriptionRepository:
                     start_time=seg.start,
                     end_time=seg.end,
                     speaker=seg.speaker,
-                    chapter_id=chapter_id,
+                    chapter_id=seg_cid,
                     privacy_tier=privacy_tier,
                 )
                 session.add(seg_record)

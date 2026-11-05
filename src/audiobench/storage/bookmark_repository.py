@@ -20,17 +20,20 @@ from audiobench.storage.models import AudioFileRecord, BookmarkRecord
 
 logger = get_logger("storage.bookmark_repository")
 
-# ── Bookmark type emoji mapping ────────────────────────────
+# ── Bookmark type badge mapping ────────────────────────────
 BOOKMARK_TYPES = {
-    "bookmark": "🔖",
-    "highlight": "⭐",
-    "todo": "📌",
-    "note": "📝",
-    "edit": "✂️",
+    "bookmark": "[BM]",
+    "highlight": "[HL]",
+    "todo": "[TODO]",
+    "note": "[NOTE]",
+    "edit": "[CUT]",
+    "clip": "[CLIP]",
+    "explain": "[EXPLAIN]",
+    "resume": "[>]",
 }
 
-# Ordered list for cycling through types
-BOOKMARK_TYPE_CYCLE = list(BOOKMARK_TYPES.keys())
+# Ordered list for cycling through types (manual UI cycle)
+BOOKMARK_TYPE_CYCLE = ["bookmark", "highlight", "todo", "note", "edit"]
 
 
 def _format_timestamp(secs: float) -> str:
@@ -513,3 +516,114 @@ class BookmarkRepository:
             "is_region": rec.is_region,
             "created_at": rec.created_at.isoformat() if rec.created_at else "",
         }
+
+    # ── Playback Resume Bookmarks ─────────────────────────────
+
+    def get_resume_position(
+        self,
+        transcription_id: int,
+        *,
+        apply_courtesy_rollback: bool = True,
+    ) -> float | None:
+        """Fetch the saved resume position for a transcript in seconds.
+
+        If apply_courtesy_rollback is True and the bookmark was saved more than 60 seconds ago,
+        applies a 2.5-second courtesy rewind to ensure speech lead-in context.
+        Returns None if no bookmark exists.
+        """
+        from datetime import UTC, datetime
+
+        with get_session() as session:
+            rec = (
+                session.query(BookmarkRecord)
+                .filter_by(transcription_id=transcription_id, bookmark_type="resume")
+                .order_by(desc(BookmarkRecord.created_at))
+                .first()
+            )
+            if not rec:
+                return None
+
+            pos = float(rec.timestamp or 0.0)
+            if pos <= 0.0:
+                return 0.0
+
+            if apply_courtesy_rollback and rec.created_at:
+                now = datetime.now(UTC)
+                rec_created = (
+                    rec.created_at
+                    if rec.created_at.tzinfo
+                    else rec.created_at.replace(tzinfo=UTC)
+                )
+                age = (now - rec_created).total_seconds()
+                if age >= 60.0:
+                    return max(0.0, round(pos - 2.5, 2))
+
+            return round(pos, 2)
+
+    def save_resume_position(
+        self,
+        transcription_id: int,
+        position: float,
+        *,
+        audio_file_id: int | None = None,
+        duration: float = 0.0,
+    ) -> float:
+        """Persist or update the resume position for a transcription.
+
+        - If position >= duration - 3.0 (or >= 98% of duration), resets bookmark to 0.0 (track finished).
+        - Upserts BookmarkRecord with bookmark_type="resume".
+        - Returns the effectively saved position.
+        """
+        from datetime import UTC, datetime
+
+        eff_pos = max(0.0, float(position))
+        if duration > 0.0 and (eff_pos >= duration - 3.0 or eff_pos >= duration * 0.98):
+            eff_pos = 0.0
+
+        with get_session() as session:
+            af_id = audio_file_id
+            if af_id is None:
+                from audiobench.storage.models import TranscriptionRecord
+
+                tx = (
+                    session.query(TranscriptionRecord)
+                    .filter_by(id=transcription_id)
+                    .first()
+                )
+                if tx and tx.audio_file_id:
+                    af_id = tx.audio_file_id
+
+            if af_id is None:
+                logger.warning(
+                    "Cannot save resume position for tx #%s: missing audio_file_id",
+                    transcription_id,
+                )
+                return eff_pos
+
+            rec = (
+                session.query(BookmarkRecord)
+                .filter_by(transcription_id=transcription_id, bookmark_type="resume")
+                .first()
+            )
+            if rec:
+                rec.timestamp = round(eff_pos, 2)
+                rec.audio_file_id = af_id
+                rec.created_at = datetime.now(UTC)
+            else:
+                rec = BookmarkRecord(
+                    audio_file_id=af_id,
+                    transcription_id=transcription_id,
+                    timestamp=round(eff_pos, 2),
+                    name="Resume Position",
+                    bookmark_type="resume",
+                    created_at=datetime.now(UTC),
+                )
+                session.add(rec)
+            session.commit()
+            logger.debug(
+                "Saved resume position for tx #%s: %.2fs (af #%s)",
+                transcription_id,
+                eff_pos,
+                af_id,
+            )
+            return eff_pos

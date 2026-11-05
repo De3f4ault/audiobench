@@ -2,20 +2,16 @@
 
 from __future__ import annotations
 
-import re
-from datetime import datetime, UTC
-
 from audiobench.core.db_session import get_session
 from audiobench.core.logger_factory import get_logger
-from audiobench.memory.enums import SourceType, RelationType
+from audiobench.daemon.client import DaemonClient
+from audiobench.memory.enums import RelationType, SourceType
 from audiobench.storage.models import (
-    NoteCollection,
-    NoteCapture,
     ExpressionRecord,
     ExpressionRelation,
-    PendingRelation
+    NoteCapture,
+    NoteCollection,
 )
-from audiobench.daemon.client import DaemonClient
 
 logger = get_logger("storage.note_repository")
 
@@ -31,7 +27,7 @@ class NoteRepository:
                 col = session.query(NoteCollection).filter_by(title=title, audio_file_id=audio_file_id).first()
             else:
                 col = session.query(NoteCollection).filter_by(title=title).first()
-            
+
             if col:
                 session.expunge(col)
                 return col
@@ -63,10 +59,10 @@ class NoteRepository:
             return col
 
     def create_capture(
-        self, 
-        collection_id: int, 
-        body: str, 
-        segment_id: int | None, 
+        self,
+        collection_id: int,
+        body: str,
+        segment_id: int | None,
         transcript_expression_id: int | None,
         collection_expression_id: int | None
     ) -> NoteCapture:

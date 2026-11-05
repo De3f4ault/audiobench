@@ -119,6 +119,45 @@ class ChapterRepository:
         """Alias for ``get_chapters``."""
         return self.get_chapters(audio_file_id)
 
+    def get_ordered_chapters(
+        self, work_id: int | None = None, audio_file_id: int | None = None
+    ) -> list[ChapterInfo]:
+        """Get chapters ordered by canonical sequence across a work or file.
+
+        Ordering contract:
+            - Files with explicit sequence_key sort by sequence_key ASC
+            - Within each file, chapters sort by chapter_index ASC
+            - Files without sequence_key sort by file_name ASC
+        """
+        from sqlalchemy import case
+        from audiobench.storage.models import AudioFileRecord
+
+        with get_session() as session:
+            query = (
+                session.query(ChapterRecord)
+                .join(AudioFileRecord, ChapterRecord.audio_file_id == AudioFileRecord.id)
+                .filter(ChapterRecord.is_ghost == 0)
+            )
+            if audio_file_id is not None:
+                query = query.filter(ChapterRecord.audio_file_id == audio_file_id)
+            if work_id is not None:
+                query = query.filter(AudioFileRecord.work_id == work_id)
+
+            has_seq = case(
+                (AudioFileRecord.sequence_key.isnot(None), 0),
+                else_=1,
+            )
+
+            records = (
+                query.order_by(
+                    has_seq,
+                    AudioFileRecord.sequence_key.asc(),
+                    ChapterRecord.chapter_index.asc(),
+                    AudioFileRecord.file_name.asc(),
+                ).all()
+            )
+            return [_record_to_info(r) for r in records]
+
     def get_chapter(self, chapter_id: int) -> ChapterInfo | None:
         """Get a single chapter by DB primary key."""
         with get_session() as session:
@@ -162,14 +201,27 @@ class ChapterRepository:
             return True
 
     def update_chapter_summary(self, chapter_id: int, summary_text: str) -> bool:
-        """Update a chapter's AI-generated summary."""
+        """Update a chapter's AI-generated summary and mark dirty for re-embedding."""
         with get_session() as session:
             rec = session.query(ChapterRecord).filter_by(id=chapter_id).first()
             if not rec:
                 return False
             rec.summary = summary_text
+            rec.last_embedded_at = None  # Dirty flag trigger
             session.commit()
-            logger.info("Updated chapter #%d summary", chapter_id)
+            logger.info("Updated chapter #%d summary (marked dirty for embedding)", chapter_id)
+            return True
+
+    def update_chapter_title(self, chapter_id: int, title: str) -> bool:
+        """Update a chapter's title and mark dirty for re-embedding."""
+        with get_session() as session:
+            rec = session.query(ChapterRecord).filter_by(id=chapter_id).first()
+            if not rec:
+                return False
+            rec.title = title
+            rec.last_embedded_at = None  # Dirty flag trigger
+            session.commit()
+            logger.info("Updated chapter #%d title (marked dirty for embedding)", chapter_id)
             return True
 
     def update_chapter_tags(self, chapter_id: int, tags: list[str]) -> bool:

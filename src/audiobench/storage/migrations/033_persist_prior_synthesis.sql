@@ -1,7 +1,7 @@
 -- Migration 033: Persist prior synthesis hits per search query
 --
 -- prior_synthesis_json stores a JSON array of the synthesis hit objects
--- that were surfaced at search time (the 🧠 blocks). These are the LLM
+-- that were surfaced at search time (the [synthesis] blocks). These are the LLM
 -- answers from earlier searches in the same session that were retrieved
 -- by SynthesisStream and displayed above the audio fragments.
 --

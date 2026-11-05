@@ -9,20 +9,47 @@ Provides a clean interface for managing semantic memory expressions:
 Batch methods (EQ-1 / EQ-2):
 - get_by_ids(): single WHERE IN query for N expressions — replaces N individual get_by_id() calls.
 - get_parents_batch(): one JOIN to resolve all source-relation parents — replaces N walk_to_parent() calls.
+
+Privacy-tier enforcement (Stage 2):
+- register() accepts privacy_tier, stored in expressions.privacy_tier.
+- get_by_id / get_by_ids / get_parents_batch / walk_to_parent accept session=None.
+  When session is None or session.effective_tier() < record.privacy_tier, the
+  returned record's content is replaced with "[REDACTED]" in-memory only.
+  The underlying SQLite row is never mutated (session.expunge() is called before
+  any redaction assignment, closing the write path).
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from sqlalchemy import asc
+from sqlalchemy.orm import Session
 
 from audiobench.core.db_session import get_session
 from audiobench.core.logger_factory import get_logger
 from audiobench.memory.enums import RelationType
-from audiobench.storage.models import ExpressionRecord, ExpressionRelation
+from audiobench.storage.models import ExpressionRecord, ExpressionRelation, ExpressionSegmentMap
+
+if TYPE_CHECKING:
+    from audiobench.cli.repl.session import ReplSession
 
 logger = get_logger("storage.expression_repository")
+
+
+def _redact_expression(record: ExpressionRecord, session: "ReplSession | None") -> None:
+    """Redact record.content in-place if session tier < record.privacy_tier.
+
+    The record MUST already be expunged from SQLAlchemy before this is called
+    so the assignment cannot be flushed back to the database.
+    """
+    effective_tier: int = session.effective_tier() if session is not None else 0
+    if record.privacy_tier > 0 and record.privacy_tier > effective_tier:
+        record.content = "[REDACTED]"
+        # Attach a sentinel so callers can detect redaction without re-checking tiers.
+        object.__setattr__(record, "redacted", True)
+    else:
+        object.__setattr__(record, "redacted", False)
 
 
 class ExpressionRepository:
@@ -39,8 +66,19 @@ class ExpressionRepository:
         speaker: str | None = None,
         work_id: int | None = None,
         graph_role: str | None = None,
+        privacy_tier: int = 0,
+        chapter_id: int | None = None,
+        calibration_key: str | None = None,
     ) -> ExpressionRecord:
         """Register a new semantic expression.
+
+        Args:
+            privacy_tier: Security classification to persist on the row.
+                0 = public (default). 2 = intimate (owner-voice or derived from it).
+                The caller is responsible for computing the correct tier via
+                TranscriptionRepository.get_max_privacy_tier_for_transcriptions()
+                or get_max_privacy_tier_for_segments() before calling register().
+            chapter_id: Optional ID of the chapter containing this expression.
 
         Returns:
             The created ExpressionRecord.
@@ -62,6 +100,31 @@ class ExpressionRepository:
             ).first()
             if existing:
                 logger.debug("Deduplicated expression #%d via content_hash", existing.id)
+                mutated = False
+                # Upgrade tier if the new call claims a higher tier for the same content.
+                if privacy_tier > existing.privacy_tier:
+                    existing.privacy_tier = privacy_tier
+                    mutated = True
+                    logger.debug(
+                        "Upgraded expression #%d privacy_tier to %d",
+                        existing.id, privacy_tier,
+                    )
+                if existing.chapter_id is None and chapter_id is not None:
+                    existing.chapter_id = chapter_id
+                    mutated = True
+                    logger.debug(
+                        "Linked expression #%d to chapter %d",
+                        existing.id, chapter_id,
+                    )
+                if existing.work_id is None and work_id is not None:
+                    existing.work_id = work_id
+                    mutated = True
+                    logger.debug(
+                        "Assigned work_id %d to existing expression #%d",
+                        work_id, existing.id,
+                    )
+                if mutated:
+                    session.commit()
                 session.expunge(existing)
                 return existing
 
@@ -75,6 +138,9 @@ class ExpressionRepository:
                 speaker=speaker,
                 work_id=work_id,
                 graph_role=graph_role,
+                privacy_tier=privacy_tier,
+                chapter_id=chapter_id,
+                calibration_key=calibration_key,
             )
             session.add(record)
             session.commit()
@@ -82,7 +148,10 @@ class ExpressionRepository:
             self._resolve_pending_relations(session, record)
 
             session.refresh(record)
-            logger.info("Registered %s expression #%d", source_type, record.id)
+            logger.info(
+                "Registered %s expression #%d (privacy_tier=%d)",
+                source_type, record.id, privacy_tier,
+            )
             # Create a detached instance to return outside session
             session.expunge(record)
             return record
@@ -120,7 +189,8 @@ class ExpressionRepository:
 
         Args:
             items:        List of dicts with keys: content, source_type,
-                          source_id (optional), speaker (optional).
+                          source_id (optional), speaker (optional),
+                          privacy_tier (optional, default 0).
             known_hashes: The in-memory O(1) hash set from SweepState.
                           When provided, deduplication is a pure RAM lookup —
                           no SQL query fires for already-known content.
@@ -151,7 +221,7 @@ class ExpressionRepository:
         # If we drop it here, the caller (RAG sweep) will never pass it to LanceDB
         # for embedding, breaking startup recovery!
         need_db_lookup = items_to_process
-        already_known = []
+        already_known: list = []
 
         # ── Step 3: for items still uncertain, query DB once ────────────────
         deduped: list[ExpressionRecord] = []
@@ -174,12 +244,16 @@ class ExpressionRepository:
 
                 for item in need_db_lookup:
                     key = (item["_hash"], item.get("source_id"))
+                    item_tier = int(item.get("privacy_tier", 0))
                     if key in existing_by_key:
                         rec = existing_by_key[key]
                         logger.debug(
                             "Deduplicated expression #%d via content_hash and source_id",
                             rec.id,
                         )
+                        # Upgrade tier if the new batch claims a higher tier.
+                        if item_tier > rec.privacy_tier:
+                            rec.privacy_tier = item_tier
                         deduped.append(rec)
                         # Teach the set so next batch hits RAM only
                         if known_hashes is not None:
@@ -192,6 +266,7 @@ class ExpressionRepository:
                             source_id=item.get("source_id"),
                             speaker=item.get("speaker"),
                             work_id=item.get("work_id"),
+                            privacy_tier=item_tier,
                         )
                         session.add(rec)
                         new_records.append(rec)
@@ -225,22 +300,41 @@ class ExpressionRepository:
 
         return deduped + new_records
 
-    def get_by_id(self, expression_id: int) -> ExpressionRecord | None:
-        """Get a single expression by ID."""
-        with get_session() as session:
-            record = session.query(ExpressionRecord).filter_by(id=expression_id).first()
+    def get_by_id(
+        self,
+        expression_id: int,
+        session: "ReplSession | None" = None,
+    ) -> ExpressionRecord | None:
+        """Get a single expression by ID.
+
+        Args:
+            session: The active ReplSession, or None.  When None (all standalone
+                CLI commands, daemon workers, and background tasks), the caller is
+                treated as locked at Tier 0.  Expressions whose privacy_tier >= 2
+                have their content replaced with "[REDACTED]" in memory only —
+                the underlying SQLite row is never written.
+        """
+        with get_session() as db_session:
+            record = db_session.query(ExpressionRecord).filter_by(id=expression_id).first()
             if record:
-                session.expunge(record)
+                db_session.expunge(record)
+                _redact_expression(record, session)
             return record
 
-    def get_by_ids(self, ids: list[int]) -> dict[int, ExpressionRecord]:
+    def get_by_ids(
+        self,
+        ids: list[int],
+        session: "ReplSession | None" = None,
+    ) -> dict[int, ExpressionRecord]:
         """Batch-fetch expressions by ID in a single WHERE IN query.
 
         Returns a dict keyed by expression ID.  Returns ``{}`` immediately when
         *ids* is empty — no query is issued (SQLite raises on empty IN clause).
 
         Args:
-            ids: List of expression IDs to fetch.
+            ids:     List of expression IDs to fetch.
+            session: The active ReplSession, or None.  Protected records are
+                     redacted in-memory before being placed in the result dict.
 
         Returns:
             Dict mapping expression_id → ExpressionRecord for every ID found.
@@ -248,20 +342,23 @@ class ExpressionRepository:
         """
         if not ids:
             return {}
-        with get_session() as session:
+        with get_session() as db_session:
             records = (
-                session.query(ExpressionRecord)
+                db_session.query(ExpressionRecord)
                 .filter(ExpressionRecord.id.in_(ids))
                 .all()
             )
             result: dict[int, ExpressionRecord] = {}
             for r in records:
-                session.expunge(r)
+                db_session.expunge(r)
+                _redact_expression(r, session)
                 result[r.id] = r
             return result
 
     def get_parents_batch(
-        self, child_ids: list[int]
+        self,
+        child_ids: list[int],
+        session: "ReplSession | None" = None,
     ) -> dict[int, ExpressionRecord]:
         """Resolve source-relation parents for a batch of child expression IDs.
 
@@ -273,15 +370,17 @@ class ExpressionRepository:
 
         Args:
             child_ids: List of expression IDs whose parents we want.
+            session:   The active ReplSession, or None.  Protected parent records
+                       are redacted in-memory before being placed in the result dict.
 
         Returns:
             Dict mapping child_expression_id → parent ExpressionRecord.
         """
         if not child_ids:
             return {}
-        with get_session() as session:
+        with get_session() as db_session:
             rows = (
-                session.query(
+                db_session.query(
                     ExpressionRelation.from_expression_id,
                     ExpressionRecord,
                 )
@@ -299,7 +398,8 @@ class ExpressionRepository:
             result: dict[int, ExpressionRecord] = {}
             for child_id, parent_rec in rows:
                 if child_id not in result:  # keep first source relation only
-                    session.expunge(parent_rec)
+                    db_session.expunge(parent_rec)
+                    _redact_expression(parent_rec, session)
                     result[child_id] = parent_rec
             return result
 
@@ -360,6 +460,31 @@ class ExpressionRepository:
             logger.info("Linked %d -> %d (type: %s)", from_id, to_id, relation_type)
             session.expunge(relation)
             return relation
+
+    def link_segments_batch(self, links: list[tuple[int, int]]) -> None:
+        """Batch link expressions to segments in expression_segment_map.
+
+        Idempotent: ignores already-existing expression-segment pairs.
+
+        Args:
+            links: list of (expression_id, segment_id) tuples.
+        """
+        if not links:
+            return
+        with get_session() as session:
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+            unique_links = [{"expression_id": eid, "segment_id": sid} for eid, sid in set(links)]
+            stmt = (
+                sqlite_insert(ExpressionSegmentMap)
+                .values(unique_links)
+                .on_conflict_do_nothing(
+                    index_elements=["expression_id", "segment_id"]
+                )
+            )
+            session.execute(stmt)
+            session.commit()
+            logger.info("Linked %d expression-segment entries in junction table", len(unique_links))
 
     def get_relations(
         self,
@@ -422,11 +547,20 @@ class ExpressionRepository:
             logger.info("Updated expression #%d inference_status to '%s'", expression_id, status)
             return True
 
-    def walk_to_parent(self, expression_id: int) -> ExpressionRecord | None:
+    def walk_to_parent(
+        self,
+        expression_id: int,
+        session: "ReplSession | None" = None,
+    ) -> ExpressionRecord | None:
         """Follow a 'source' relation upward to find the parent expression.
 
         Returns the target expression of the first outbound 'source' relation found,
         or None if no such relation exists.
+
+        Args:
+            session: The active ReplSession, or None.  Propagated to get_by_id()
+                     so the parent's content is redacted if its tier exceeds the
+                     caller's effective tier.
         """
         out_relations = self.get_relations(
             expression_id, direction="out", relation_type=RelationType.SOURCE.value
@@ -437,49 +571,71 @@ class ExpressionRepository:
 
         # Follow the first source relation
         parent_id = out_relations[0].to_expression_id
-        return self.get_by_id(parent_id)
+        return self.get_by_id(parent_id, session=session)
 
-    def delete_by_source(self, source_type: str, source_id: int) -> int:
+    def delete_by_source(
+        self,
+        source_type: str,
+        source_id: int,
+        session: Session | None = None,
+    ) -> int:
         """Delete all expressions for a given source entity from SQLite and LanceDB.
 
         Returns the number of expressions deleted.
         """
-        with get_session() as session:
-            records = (
-                session.query(ExpressionRecord)
-                .filter_by(source_type=source_type, source_id=source_id)
-                .all()
-            )
-            if not records:
-                return 0
+        if session is not None:
+            return self._delete_by_source_impl(session, source_type, source_id, should_commit=False)
+        else:
+            with get_session() as s:
+                return self._delete_by_source_impl(s, source_type, source_id, should_commit=True)
 
-            expr_ids = [r.id for r in records]
+    def _delete_by_source_impl(
+        self,
+        session: Session,
+        source_type: str,
+        source_id: int,
+        should_commit: bool,
+    ) -> int:
+        records = (
+            session.query(ExpressionRecord)
+            .filter_by(source_type=source_type, source_id=source_id)
+            .all()
+        )
+        if not records:
+            return 0
 
-            from audiobench.core.settings import get_settings
-            if not get_settings().disable_memory:
+        expr_ids = [r.id for r in records]
+
+        from audiobench.core.settings import get_settings
+        if not get_settings().disable_memory:
+            try:
+                from audiobench.daemon.factory import get_daemon_client
+                client = get_daemon_client()
                 try:
-                    from audiobench.daemon.factory import get_daemon_client
-                    client = get_daemon_client()
-                    try:
-                        # Single batch IPC call — O(1) round-trips regardless of size
-                        client.delete_batch(expr_ids)
-                    except AttributeError:
-                        # Graceful fallback for older daemon builds during rolling restart
-                        for expr_id in expr_ids:
-                            try:
-                                client.delete(expr_id)
-                            except Exception as e:
-                                logger.warning("Failed to delete vector %d from daemon: %s", expr_id, e)
-                except Exception as e:
-                    logger.warning("Could not connect to daemon for vector deletion: %s", e)
+                    # Single batch IPC call — O(1) round-trips regardless of size
+                    client.delete_batch(expr_ids)
+                except AttributeError:
+                    # Graceful fallback for older daemon builds during rolling restart
+                    for expr_id in expr_ids:
+                        try:
+                            client.delete(expr_id)
+                        except Exception as e:
+                            logger.warning("Failed to delete vector %d from daemon: %s", expr_id, e)
+            except Exception as e:
+                logger.warning("Could not connect to daemon for vector deletion: %s", e)
 
-            for r in records:
-                session.delete(r)
+        for r in records:
+            session.delete(r)
+
+        if should_commit:
             session.commit()
-            logger.info(
-                "Deleted %d expression(s) for source_type='%s' source_id=%d",
-                len(records),
-                source_type,
-                source_id,
-            )
-            return len(records)
+        else:
+            session.flush()
+
+        logger.info(
+            "Deleted %d expression(s) for source_type='%s' source_id=%d",
+            len(records),
+            source_type,
+            source_id,
+        )
+        return len(records)

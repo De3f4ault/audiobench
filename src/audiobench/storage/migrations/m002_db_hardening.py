@@ -56,7 +56,7 @@ def migrate(db_path: str) -> None:
             # Backfill live sessions
             cursor.execute("""
                 UPDATE transcriptions
-                SET file_name = '🎤 Live session'
+                SET file_name = 'Live session'
                 WHERE source = 'live' AND file_name = ''
             """)
             logger.info("Added file_name column to transcriptions")

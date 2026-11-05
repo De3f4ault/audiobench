@@ -1,7 +1,7 @@
 -- Migration 034: Synthesis Context Relational Storage
 --
 -- Replaces the JSON-based prior_synthesis_json column introduced in 033
--- with a dedicated relational table. This stores the 🧠 synthesis hits
+-- with a dedicated relational table. This stores the [synthesis] hits
 -- that were surfaced during a search.
 --
 -- Advantages:

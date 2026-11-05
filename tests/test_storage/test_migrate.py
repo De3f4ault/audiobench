@@ -25,7 +25,7 @@ def test_migration_runner_idempotency(tmp_path: Path, monkeypatch):
     db_path = tmp_path / "test_migrations.db"
 
     # 2. Run migrations first time
-    migrate.run_migrations(db_path)
+    migrate.run_migrations(db_path, allow_path_mismatch=True)
 
     # Verify WAL mode and schema_version table
     with sqlite3.connect(db_path) as conn:
@@ -43,7 +43,7 @@ def test_migration_runner_idempotency(tmp_path: Path, monkeypatch):
         assert "name" in columns
 
     # 3. Run migrations second time (idempotency check)
-    migrate.run_migrations(db_path)
+    migrate.run_migrations(db_path, allow_path_mismatch=True)
 
     with sqlite3.connect(db_path) as conn:
         cursor = conn.execute("SELECT version FROM schema_version ORDER BY version")
@@ -64,7 +64,7 @@ def test_real_migrations(tmp_path: Path):
     Base.metadata.create_all(bind=engine)
 
     # Run migrations using the real MIGRATIONS_DIR
-    migrate.run_migrations(db_path)
+    migrate.run_migrations(db_path, allow_path_mismatch=True)
 
     with sqlite3.connect(db_path) as conn:
         # Check that schema_version has records (at least 6 since we have 6 migrations)
@@ -77,4 +77,5 @@ def test_real_migrations(tmp_path: Path):
         assert len(cursor.fetchall()) > 0
 
         # We shouldn't fail if we run it again (idempotent)
-    migrate.run_migrations(db_path)
+    migrate.run_migrations(db_path, allow_path_mismatch=True)
+

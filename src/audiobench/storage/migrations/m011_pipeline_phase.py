@@ -2,6 +2,7 @@
 
 import sqlite3
 
+
 def upgrade(db: sqlite3.Connection) -> None:
     db.execute("ALTER TABLE transcriptions ADD COLUMN failure_reason VARCHAR(256)")
     db.execute("ALTER TABLE transcriptions ADD COLUMN attempt_count INTEGER DEFAULT 0")

@@ -58,6 +58,11 @@ class AudioFileRecord(Base):
     file_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
     tags: Mapped[str] = mapped_column(Text, default="[]")
+    track_title: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    sequence_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    codec: Mapped[str] = mapped_column(String(32), default="unknown", server_default="unknown")
+    bit_rate: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    genre: Mapped[str | None] = mapped_column(String(128), nullable=True)
     work_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("works.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -87,6 +92,35 @@ class AudioFileRecord(Base):
         """True if the audio file has any chapters."""
         return len(self.chapters) > 0
 
+    @property
+    def tags_dict(self) -> dict[str, str]:
+        """Deserialise the JSON tags column to a Python dict."""
+        import json as _json
+
+        try:
+            val = _json.loads(self.tags) if self.tags else {}
+            return val if isinstance(val, dict) else {}
+        except Exception:
+            return {}
+
+    @property
+    def tags_list(self) -> list[str]:
+        """Deserialise the JSON tags column to a Python list.
+
+        Safely handles legacy list JSON as well as dictionary JSON with `_labels`.
+        """
+        import json as _json
+
+        try:
+            val = _json.loads(self.tags) if self.tags else []
+            if isinstance(val, list):
+                return val
+            if isinstance(val, dict):
+                return val.get("_labels", [])
+            return []
+        except Exception:
+            return []
+
     def __repr__(self) -> str:
         return (
             f"<AudioFile(id={self.id}, name='{self.file_name}', "
@@ -115,6 +149,7 @@ class ChapterRecord(Base):
     tags: Mapped[str] = mapped_column(Text, default="[]")
     is_ghost: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+    last_embedded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
 
     # Relationships
     audio_file: Mapped[AudioFileRecord] = relationship(back_populates="chapters")
@@ -254,10 +289,25 @@ class ChatConversation(Base):
         onupdate=lambda: datetime.now(UTC),
     )
 
+    audio_file_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("audio_files.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    transcription_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("transcriptions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    search_session_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, index=True, default=None
+    )
+    search_query_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, index=True, default=None
+    )
+
     # Relationships
     messages: Mapped[list[ChatMessage]] = relationship(
         back_populates="conversation", cascade="all, delete-orphan"
     )
+    audio_file: Mapped[AudioFileRecord | None] = relationship()
+    transcription: Mapped[TranscriptionRecord | None] = relationship()
 
     def __repr__(self) -> str:
         return (
@@ -281,12 +331,23 @@ class ChatMessage(Base):
     token_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
 
+    # Voice coupling metadata
+    modality: Mapped[str] = mapped_column(String(16), default="text", server_default="text", index=True)
+    duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    audio_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    interrupted: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    voice_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    segment_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("segments.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+
     # Relationships
     conversation: Mapped[ChatConversation] = relationship(back_populates="messages")
+    segment: Mapped[SegmentRecord | None] = relationship()
 
     def __repr__(self) -> str:
         preview = self.content[:40] if self.content else ""
-        return f"<ChatMessage(id={self.id}, role='{self.role}', text='{preview}...')>"
+        return f"<ChatMessage(id={self.id}, role='{self.role}', modality='{self.modality}', text='{preview}...')>"
 
 
 class BookmarkRecord(Base):
@@ -366,6 +427,9 @@ class ExpressionRecord(Base):
     work_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("works.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    chapter_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("chapters.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     # Security: mirrors segments.privacy_tier — inherited during expression creation
     privacy_tier: Mapped[int] = mapped_column(Integer, default=0, nullable=False, index=True)
     # Graph topology role — set by the RAG sweep to distinguish tiered nodes.
@@ -374,12 +438,19 @@ class ExpressionRecord(Base):
     # (chat, memoir, bookmark, etc.). Future consumers must treat NULL as
     # "role unknown / not a tiered sweep node" — not as an implicit tier value.
     graph_role: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    community_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("expression_communities.community_id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    calibration_key: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(UTC), index=True
     )
 
     # Relationships
     work: Mapped[WorkRecord | None] = relationship(back_populates="expressions")
+    chapter: Mapped[ChapterRecord | None] = relationship()
     relations_from: Mapped[list[ExpressionRelation]] = relationship(
         "ExpressionRelation",
         foreign_keys="ExpressionRelation.from_expression_id",
@@ -450,8 +521,28 @@ class ExpressionRelation(Base):
         "ExpressionRecord", foreign_keys=[to_expression_id], back_populates="relations_to"
     )
 
-    def __repr__(self) -> str:
-        return f"<ExpressionRelation({self.from_expression_id} -> {self.to_expression_id}, type='{self.relation_type}')>"
+class ExpressionCommunityRecord(Base):
+    """A detected semantic community / school of thought."""
+
+    __tablename__ = "expression_communities"
+
+    community_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    name_source: Mapped[str] = mapped_column(String(32), default="fallback", nullable=False)
+    is_active: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    medoid_expr_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("expressions.id", ondelete="SET NULL"), nullable=True
+    )
+    node_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    medoid_at_node_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    resolution: Mapped[float] = mapped_column(Float, default=0.6, nullable=False)
+    seed: Mapped[int] = mapped_column(Integer, default=42, nullable=False)
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(UTC), nullable=False
+    )
+    naming_attempted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    naming_failure_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
 
 class PendingRelation(Base):
@@ -897,3 +988,81 @@ class YouTubePlaylistCache(Base):
             f"available={self.video_count_available}/{self.video_count_total}, "
             f"fetched={self.fetched_at.date() if self.fetched_at else None})>"
         )
+
+
+class ArchivedTranscriptionRecord(Base):
+    """Archived transcription snapshot created prior to an upgrade/re-transcription."""
+
+    __tablename__ = "archived_transcriptions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    original_transcription_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    audio_file_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    source: Mapped[str] = mapped_column(String(20), default="file")
+    file_name: Mapped[str] = mapped_column(String(256), default="", nullable=False)
+    full_text: Mapped[str] = mapped_column(Text, default="")
+    raw_text: Mapped[str] = mapped_column(Text, default="")
+    language: Mapped[str] = mapped_column(String(10), default="en", index=True)
+    language_probability: Mapped[float] = mapped_column(Float, default=0.0)
+    engine: Mapped[str] = mapped_column(String(64), default="faster-whisper")
+    model_name: Mapped[str] = mapped_column(String(64), default="large-v3-turbo")
+    duration_seconds: Mapped[float] = mapped_column(Float, default=0.0)
+    word_count: Mapped[int] = mapped_column(Integer, default=0)
+    segment_count: Mapped[int] = mapped_column(Integer, default=0)
+    pipeline_phase: Mapped[str] = mapped_column("status", String(20), default="complete")
+    failure_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    backfill_attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    backfill_next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
+    speaker_map: Mapped[str] = mapped_column(Text, default="{}")
+    refined_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
+    is_indexed: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+
+    # Archival metadata
+    upgrade_batch_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    archived_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(UTC), index=True
+    )
+
+    # Relationships
+    segments: Mapped[list[ArchivedSegmentRecord]] = relationship(
+        back_populates="transcription", cascade="all, delete-orphan"
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ArchivedTranscription(id={self.id}, orig_id={self.original_transcription_id}, "
+            f"batch='{self.upgrade_batch_id}', model='{self.model_name}')>"
+        )
+
+
+class ArchivedSegmentRecord(Base):
+    """Archived segment snapshot linked to an archived transcription."""
+
+    __tablename__ = "archived_segments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    archived_transcription_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("archived_transcriptions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    original_segment_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    transcription_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    segment_index: Mapped[int] = mapped_column(Integer, default=0)
+    text: Mapped[str] = mapped_column(Text, default="")
+    start_time: Mapped[float] = mapped_column(Float, default=0.0)
+    end_time: Mapped[float] = mapped_column(Float, default=0.0)
+    speaker: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    chapter_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    privacy_tier: Mapped[int] = mapped_column(Integer, default=0, nullable=False, index=True)
+
+    # Relationships
+    transcription: Mapped[ArchivedTranscriptionRecord] = relationship(back_populates="segments")
+
+    def __repr__(self) -> str:
+        return (
+            f"<ArchivedSegment(id={self.id}, arch_tx={self.archived_transcription_id}, "
+            f"orig_id={self.original_segment_id}, t={self.start_time:.1f}-{self.end_time:.1f})>"
+        )
+

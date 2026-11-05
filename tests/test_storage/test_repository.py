@@ -11,38 +11,11 @@ from audiobench.core.settings import AudioBenchSettings
 
 
 @pytest.fixture
-def repo(tmp_path):
-    """Create a fresh repository with a temp database."""
-    import audiobench.core.db_engine as db_mod
-    import audiobench.core.db_session as sess_mod
+def repo(test_db):
+    """Create a fresh repository using the isolated test_db fixture."""
+    from audiobench.storage.repository import TranscriptionRepository
 
-    db_path = tmp_path / "test_repo.db"
-    settings = AudioBenchSettings(
-        database_url=f"sqlite:///{db_path}",
-        data_dir=tmp_path,
-        disable_memory=True,
-        daemon_socket_path=Path("/tmp/audiobench-test-isolated.sock"),
-    )
-
-    old_engine = db_mod._engine
-    old_session_factory = sess_mod._SessionLocal
-    db_mod._engine = None
-    sess_mod._SessionLocal = None
-
-    with patch("audiobench.core.db_engine.get_settings", return_value=settings), \
-         patch("audiobench.core.settings.get_settings", return_value=settings):
-        from audiobench.core.db_engine import init_db
-
-        init_db()
-
-        from audiobench.storage.repository import TranscriptionRepository
-
-        yield TranscriptionRepository()
-
-    if db_mod._engine is not None:
-        db_mod._engine.dispose()
-    db_mod._engine = old_engine
-    sess_mod._SessionLocal = old_session_factory
+    return TranscriptionRepository()
 
 
 def _make_transcript(text="Hello world", file_name="test.mp3", duration=10.0):
@@ -169,3 +142,62 @@ class TestUpdateAndDelete:
 
         records = repo.get_history(limit=100)
         assert len(records) == 0
+
+
+class TestOverwritePath:
+    """Regression tests for the overwrite=True / existing audio_record code path.
+
+    Before the fix, `from pathlib import Path` lived inside the
+    `if audio_record is None` branch of save_transcription.  Python's
+    function-level scoping makes any locally-imported name a local
+    throughout the *entire* function, so on the overwrite path (audio_record
+    already exists, that branch is skipped) `Path` was an unbound local and
+    line 370 raised UnboundLocalError.
+    """
+
+    def test_overwrite_existing_audio_record_with_no_chapters_does_not_raise(
+        self, repo, tmp_path
+    ):
+        """The exact crash scenario: second save on an already-known file,
+        zero chapters stored, file exists on disk so the elif at L370 is entered."""
+        from unittest.mock import MagicMock, patch
+
+        from audiobench.transcribe.transcription_result import AudioMetadata
+
+        audio_file = tmp_path / "regression_overwrite.mp3"
+        audio_file.touch()  # must exist so Path(...).exists() is True
+
+        meta = AudioMetadata(
+            file_path=str(audio_file),
+            file_name=audio_file.name,
+            file_size_bytes=1000,
+            format="mp3",
+            duration_seconds=60.0,
+            sample_rate=16000,
+            channels=1,
+            file_hash="regression_test_hash_overwrite_path",
+        )
+        transcript = _make_transcript(text="Regression: overwrite path")
+
+        repo._import_to_library = lambda p: str(p)
+        repo._schedule_biometric_pass = MagicMock()
+
+        # Patch ChapterDetector at its definition site — it is imported lazily
+        # inside save_transcription, so patching the repository module namespace
+        # would not work.
+        with patch(
+            "audiobench.chapters.detector.ChapterDetector"
+        ) as MockDetector:
+            MockDetector.return_value.detect.return_value = []
+
+            # First save — creates audio_record (new-file branch)
+            repo.save_transcription(transcript, audio_metadata=meta, overwrite=True)
+
+            # Second save — audio_record already exists (overwrite path).
+            # File exists on disk → enters elif at line 370 → before the fix
+            # this raised UnboundLocalError on Path(...).
+            # Must not raise — this is the regression gate.
+            repo.save_transcription(
+                transcript, audio_metadata=meta, overwrite=True
+            )
+
