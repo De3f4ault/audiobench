@@ -455,3 +455,38 @@ def test_cmd_play_handles_unbookmarked_transcript():
         )
 
 
+def test_mpv_controller_load_file_per_file_options():
+    """Verify load_file passes atomic start_pos and speed options via mpv loadfile command."""
+    from audiobench.playback import MpvController
+
+    ctrl = MpvController(socket_path="/tmp/fake.sock")
+    ctrl.is_running = MagicMock(return_value=True)
+    ctrl._send_command_nowait = MagicMock()
+
+    # Case 1: Standard load from start (start_pos=0, default speed)
+    ctrl.load_file("/music/track.mp3", start_pos=0.0)
+    ctrl._send_command_nowait.assert_called_once_with(["loadfile", "/music/track.mp3", "replace"])
+
+    # Case 2: Load at specific citation offset (start_pos=1155.0, speed=None)
+    ctrl._send_command_nowait.reset_mock()
+    ctrl.load_file("/audiobook/taleb.m4b", start_pos=1155.0)
+    ctrl._send_command_nowait.assert_called_once_with(
+        ["loadfile", "/audiobook/taleb.m4b", "replace", -1, {"start": "1155.000"}]
+    )
+
+    # Case 3: Load with both start offset and speed
+    ctrl._send_command_nowait.reset_mock()
+    ctrl.load_file("/audiobook/taleb.m4b", start_pos=1155.0, speed=1.25)
+    calls = ctrl._send_command_nowait.call_args_list
+    assert len(calls) == 2
+    assert calls[0][0][0] == [
+        "loadfile",
+        "/audiobook/taleb.m4b",
+        "replace",
+        -1,
+        {"start": "1155.000", "speed": "1.250"},
+    ]
+    assert calls[1][0][0] == ["set_property", "speed", 1.25]
+
+
+
