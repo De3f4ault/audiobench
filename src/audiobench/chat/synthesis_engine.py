@@ -39,19 +39,29 @@ class SynthesisResponse:
     citations: dict[int, int] = field(default_factory=dict)  # {1: eid1, 2: eid2, ...}
     fragments: list[SynthesisFragment] = field(default_factory=list)
     elapsed_seconds: float = 0.0
-    model_used: str = "ollama"
+    model_used: str = "digest_fallback"
 
 
+# Provisional adoption (Structure 2: Dialectic Triad):
+# Validated 2026-11-07 to yield 2x citation density (20 vs 10), zero preamble fluff,
+# faster inference (2.23s vs 3.85s), and explicit dialectic friction over serial listing.
 _SYNTHESIS_SYSTEM_PROMPT = """You are AudioBench's Dialectic Synthesis Engine.
-Your role is to synthesize divergent literary, philosophical, and biographical perspectives
-retrieved from the user's personal audio library.
+Transform the provided library excerpts into a rigorous dialectic synthesis structured across three specific phases:
+
+Required Output Format:
+### 1. Foundational Convergence
+Identify the shared fundamental premise or existential reality all authors accept.
+
+### 2. Dialectic Tension & Divergence
+Examine where their mechanics, priorities, or worldviews clash, diverge, or challenge one another. Highlight the friction between their approaches.
+
+### 3. Integrated Synthesis
+Formulate a higher-order principle or operational framework that integrates these contrasting perspectives.
 
 Strict Rules:
-1. Synthesize the passages into a cohesive, insightful comparative analysis.
-2. Ground every claim using inline bracketed citation numbers: [1], [2], [3], etc. Use strictly plain integers (e.g. [1], [2]). Never append line numbers, daggers (†), or pipes (e.g. do not write [1†L1-L5] or [1|L1-L5]).
-3. Compare how the authors agree, disagree, or complement each other on the core question.
-4. Do not invent facts or extrapolate beyond what is supported by the excerpts.
-5. Keep your tone intellectual, concise, and direct. Avoid conversational filler.
+1. Ground every claim using inline bracketed citation numbers: [1], [2], [3], etc. Use strictly plain integers (e.g. [1], [2]). Never append line numbers, daggers (†), or pipes (e.g. do not write [1†L1-L5] or [1|L1-L5]).
+2. Do not invent facts or extrapolate beyond what is supported by the excerpts.
+3. Keep your tone intellectual, concise, and direct. Avoid conversational filler or introductory/concluding preambles. Start directly with the first section header (### 1. Foundational Convergence).
 """
 
 
@@ -79,8 +89,8 @@ def format_synthesis_prompt(query: str, fragments: list[SynthesisFragment]) -> s
         )
 
     lines.append(
-        "\nTask: Synthesize these perspectives on the core question. "
-        "Explicitly cite your sources using [1], [2], [3] throughout your response."
+        "\nTask: Synthesize these perspectives across the three required phases. "
+        "Explicitly cite your sources using [1], [2], [3] throughout every section of your response."
     )
     return "\n".join(lines)
 
@@ -127,9 +137,11 @@ def generate_synthesis(
 
     llm_res = _call_llm(full_prompt, temperature, client, api_key)
 
-    model_used = "ollama"
+    model_used = "digest_fallback"
     if isinstance(llm_res, Ok):
         answer = _clean_synthesis_citations(llm_res.value)
+        res_model = getattr(llm_res, "model", None)
+        model_used = res_model if res_model and res_model != "unknown" else getattr(client, "_model", "gemma4:31b-cloud")
     else:
         logger.warning("LLM call failed in synthesis engine: %s; falling back to digest.", llm_res.error)
         model_used = "digest_fallback"

@@ -139,7 +139,7 @@ _daemon_forked_at: float | None = None
 _DAEMON_FORK_WAIT = _FAST_PATH_TIMEOUT  # 180 s — same value as before
 
 # When no fork is pending, do a short grace-period to catch an already-running daemon.
-_DAEMON_QUICK_WAIT = 2.0
+_DAEMON_QUICK_WAIT = 5.0
 
 
 def ensure_daemon_running() -> None:
@@ -171,15 +171,13 @@ def ensure_daemon_running() -> None:
         _daemon_forked_at = time.monotonic()
 
 
-def get_daemon_client() -> RetrievalClient:
+def get_daemon_client(autostart: bool = True) -> RetrievalClient:
     """Return a connected DaemonClient, or fall back to LocalRetrievalClient.
 
-    Checks whether the daemon is alive.  If it was recently started via
-    ensure_daemon_running(), waits up to _DAEMON_FORK_WAIT seconds for it
-    to become ready (models usually load within 3-8 s on warm hardware).
-    If no fork is pending, only waits _DAEMON_QUICK_WAIT seconds so that
-    DenseStream / ColBERTStream calls don't block for 3 minutes when the
-    daemon was never started.
+    Checks whether the daemon is alive. If not alive and autostart is True,
+    attempts to fork the daemon in the background. If it was recently started,
+    waits up to _DAEMON_FORK_WAIT seconds for it to become ready (models usually
+    load within 3-8 s on warm hardware).
     If it never comes up, falls back to the in-process client silently.
     """
     settings = get_settings()
@@ -198,13 +196,24 @@ def get_daemon_client() -> RetrievalClient:
     if socket_path.exists():
         _clean_stale_socket(socket_path)
 
-    # 2. Decide how long to wait:
+    # 2. If not alive and autostart is requested, fork if no fork is pending
+    global _daemon_forked_at
+    if autostart and _daemon_forked_at is None and _FAST_PATH_TIMEOUT > 0:
+        logger.info("Daemon not running — auto-starting in background...")
+        if _fork_daemon(socket_path):
+            _daemon_forked_at = time.monotonic()
+
+    if not autostart and _daemon_forked_at is None:
+        return LocalRetrievalClient()
+
+    # 3. Decide how long to wait:
     #    • If we forked a daemon during this session → wait the full timeout.
     #    • Otherwise → short grace period so we don't freeze for 3 minutes.
     now = time.monotonic()
-    if _daemon_forked_at is not None and (now - _daemon_forked_at) < _DAEMON_FORK_WAIT:
-        poll_deadline = _daemon_forked_at + _DAEMON_FORK_WAIT
-        timeout_used = _DAEMON_FORK_WAIT
+    fork_wait = _FAST_PATH_TIMEOUT
+    if _daemon_forked_at is not None and (now - _daemon_forked_at) < fork_wait:
+        poll_deadline = _daemon_forked_at + fork_wait
+        timeout_used = fork_wait
     else:
         poll_deadline = now + _DAEMON_QUICK_WAIT
         timeout_used = _DAEMON_QUICK_WAIT
@@ -216,7 +225,7 @@ def get_daemon_client() -> RetrievalClient:
             return client
         time.sleep(0.25)
 
-    # 3. Not up yet — fall back to local in-process models.
+    # 4. Not up yet — fall back to local in-process models.
     logger.warning(
         "Daemon not ready within %.1fs — using local in-process client. "
         "Run `audiobench daemon start` for persistent background service.",

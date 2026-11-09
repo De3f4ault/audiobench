@@ -39,7 +39,7 @@ class OllamaClient:
     def __init__(
         self,
         base_url: str = "http://localhost:11434",
-        model: str = "gpt-oss:120b-cloud",
+        model: str = "gemma4:31b-cloud",
         timeout: tuple[int, int] = (10, 600),
     ) -> None:
         self._base_url = base_url.rstrip("/")

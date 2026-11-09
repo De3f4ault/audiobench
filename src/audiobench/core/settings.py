@@ -168,9 +168,19 @@ class AudioBenchSettings(BaseSettings):
         description="Directory for TTS voice models",
     )
 
+    # --- Speech-to-Text (Voice Input) ---
+    stt_provider: str = Field(
+        default="auto",
+        description="Speech-to-text provider for voice input: auto, local, cloud",
+    )
+    stt_model: str = Field(
+        default="base",
+        description="Whisper model tier (tiny, base, small, medium, turbo) or Gemini STT model",
+    )
+
     # --- AI / LLM ---
     ollama_model: str = Field(
-        default="gpt-oss:120b-cloud",
+        default="gemma4:31b-cloud",
         description="Default Ollama model for AI features",
     )
     ollama_base_url: str = Field(
@@ -236,6 +246,36 @@ class AudioBenchSettings(BaseSettings):
         default=15, description="Initial candidates to retrieve from LanceDB"
     )
     rerank_top_k: int = Field(default=5, description="Candidates to keep after reranking")
+    # ── ConnectionSurfer / Knowledge Graph ────────────────────────────────────
+    surfer_sim_threshold: float = Field(
+        default=0.78,
+        description=(
+            "Minimum cosine similarity for ConnectionSurfer to draw a SEMANTIC edge "
+            "between two sweep_chunk expressions. 0.78 is calibrated for ~150-300 word "
+            "chunks; lower than document-level 0.85 because shorter passages share "
+            "vocabulary more selectively."
+        ),
+    )
+    surfer_sample_size: int = Field(
+        default=2000,
+        description="Number of sweep_chunk expressions sampled per ConnectionSurfer cycle.",
+    )
+    surfer_max_edges_per_node: int = Field(
+        default=5,
+        description=(
+            "Maximum number of outbound SEMANTIC edges allowed per sweep_chunk node "
+            "per surfer cycle. Prevents hub-and-spoke super-attractor collapse on "
+            "high-frequency philosophical phrases."
+        ),
+    )
+    surfer_min_content_length: int = Field(
+        default=120,
+        description=(
+            "Minimum character length of trimmed expression content for ConnectionSurfer "
+            "to sample or link as a sweep_chunk. Excludes conversational turns, punctuation "
+            "glitches, and short stubs from candidate selection."
+        ),
+    )
     summary_min_turns: int = Field(
         default=3, description="Minimum chat turns required to trigger session summary"
     )

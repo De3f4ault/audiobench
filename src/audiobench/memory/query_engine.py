@@ -44,6 +44,7 @@ _search_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="search_stre
 class Ok:
     """Successful LLM call result."""
     value: str
+    model: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -100,7 +101,8 @@ def _call_ollama(prompt: str, temperature: float, llm: OllamaClient) -> LLMResul
 
     try:
         text = _retry_with_backoff(_do_call, max_retries=2, base_delay=1.0, jitter=True)
-        return Ok(value=text)
+        model_name = getattr(llm, "_model", "ollama")
+        return Ok(value=text, model=model_name)
     except Exception as exc:  # noqa: BLE001
         return Err(error=f"ollama: {exc}")
 
@@ -207,7 +209,7 @@ def _call_gemini(prompt: str, temperature: float, api_key: str) -> LLMResult:
         # Only retry on RateLimitError; ConnectionError / RuntimeError (timeout)
         # are structural and should fast-fail without wasting extra wall time.
         text = breaker.call(lambda: _retry_with_backoff(_do_call, max_retries=1, base_delay=2.0, jitter=True))
-        return Ok(value=text)
+        return Ok(value=text, model=_MODEL)
     except Exception as exc:  # noqa: BLE001
         return Err(error=f"gemini: {exc}")
 
@@ -435,14 +437,36 @@ class MemoryQueryEngine:
         bookmark_map: dict[int, list[BookmarkRecord]] = {}
         if parent_source_ids:
             with get_session() as session:
+                from sqlalchemy import or_
+                from audiobench.storage.models import TranscriptionRecord
+
+                tx_rows = (
+                    session.query(TranscriptionRecord.id, TranscriptionRecord.audio_file_id)
+                    .filter(TranscriptionRecord.id.in_(parent_source_ids))
+                    .all()
+                )
+                tx_to_af = {tx_id: af_id for tx_id, af_id in tx_rows if af_id is not None}
+                all_af_ids = list(set(tx_to_af.values()))
+
                 bm_records = (
                     session.query(BookmarkRecord)
-                    .filter(BookmarkRecord.audio_file_id.in_(parent_source_ids))
+                    .filter(
+                        or_(
+                            BookmarkRecord.transcription_id.in_(parent_source_ids),
+                            BookmarkRecord.audio_file_id.in_(all_af_ids) if all_af_ids else False,
+                        )
+                    )
                     .all()
                 )
                 for bm in bm_records:
                     session.expunge(bm)
-                    bookmark_map.setdefault(bm.audio_file_id, []).append(bm)
+                    if bm.transcription_id in parent_source_ids:
+                        bookmark_map.setdefault(bm.transcription_id, []).append(bm)
+                    for tx_id, af_id in tx_to_af.items():
+                        if bm.audio_file_id == af_id:
+                            existing = bookmark_map.setdefault(tx_id, [])
+                            if bm not in existing:
+                                existing.append(bm)
 
         context_blocks: list[str] = []
         sources: list[dict[str, Any]] = []
@@ -955,7 +979,7 @@ class ResearchEngine:
             "  1. A direct 1-2 sentence answer to the query.\n"
             "  2. Analysis — develop your thinking in clearly titled sections using **bold headers**.\n"
             "  3. Close with exactly two sections:\n"
-            "       **✨ What the fragments illuminate** — the key insight the sources collectively reveal.\n"
+            "       **What the fragments illuminate** — the key insight the sources collectively reveal.\n"
             "       **○ What the fragments leave open** — genuine gaps, unresolved angles, or worth pursuing further.\n\n"
             "CITATION RULES (strictly follow):\n"
             "  • Cite inline with bracketed numbers immediately after the claim: [1] or [3][5].\n"

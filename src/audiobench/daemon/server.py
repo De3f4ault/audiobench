@@ -853,6 +853,35 @@ def _handle_playback_context(args: dict[str, Any]) -> dict[str, Any]:
     return svc.get_context_window(position=pos, window=window)
 
 
+def _handle_playback_loop_segment(args: dict[str, Any]) -> dict[str, Any]:
+    svc = _get_playback_service()
+    return svc.loop_segment(float(args.get("start", 0.0)), float(args.get("end", 0.0)))
+
+
+def _handle_playback_clear_loop(args: dict[str, Any]) -> dict[str, Any]:
+    svc = _get_playback_service()
+    return svc.clear_loop()
+
+
+def _handle_playback_set_filter(args: dict[str, Any]) -> dict[str, Any]:
+    svc = _get_playback_service()
+    return svc.set_filter(str(args.get("filter_str", "")))
+
+
+def _handle_playback_chapter_telemetry(args: dict[str, Any]) -> dict[str, Any]:
+    """Map segment IDs from search results to chapter metadata.
+
+    Accepts segment_ids as a list of ints. Returns a dict keyed by segment_id
+    (as string) mapping to chapter metadata dicts. get_chapter_telemetry()
+    returns str keys canonically, so no per-path conversion is needed here.
+    """
+    from audiobench.playback.service import PlaybackService
+
+    raw_ids = args.get("segment_ids") or []
+    segment_ids = [int(sid) for sid in raw_ids if sid is not None]
+    return PlaybackService.get_chapter_telemetry(segment_ids)
+
+
 _stt_sessions: dict[str, str] = {}  # session_id -> model_name
 _warm_whisper_model: Any | None = None
 _warm_whisper_key: str | None = None
@@ -980,6 +1009,10 @@ _HANDLERS: dict[str, Any] = {
     "playback_stop": _handle_playback_stop,
     "playback_status": _handle_playback_status,
     "playback_context": _handle_playback_context,
+    "playback_loop_segment": _handle_playback_loop_segment,
+    "playback_clear_loop": _handle_playback_clear_loop,
+    "playback_set_filter": _handle_playback_set_filter,
+    "playback_chapter_telemetry": _handle_playback_chapter_telemetry,
     "whisper_acquire": _handle_whisper_acquire,
     "whisper_release": _handle_whisper_release,
     "whisper_transcribe": _handle_whisper_transcribe,
@@ -1072,8 +1105,11 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
     except Exception:
         logger.exception("Unexpected error for connection from %s", peer)
     finally:
-        writer.close()
-        await writer.wait_closed()
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            pass
 
 
 # ---------------------------------------------------------------------------

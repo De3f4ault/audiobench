@@ -36,6 +36,7 @@ class DaemonClient:
         import time
 
         logger.info("Spawning background daemon...")
+        settings = get_settings()
         log_dir = Path(settings.data_dir) / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = open(log_dir / "daemon_autostart.log", "w")
@@ -57,11 +58,11 @@ class DaemonClient:
 
         raise RuntimeError("Failed to auto-start daemon: timed out waiting for ping.")
 
-    def _raw_ping(self) -> bool:
+    def _raw_ping(self, timeout: float = 2.0) -> bool:
         """Internal ping that doesn't trigger auto-start."""
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(0.5)
+            sock.settimeout(timeout)
             try:
                 sock.connect(str(self._socket_path))
                 request_id = str(uuid.uuid4())
@@ -147,14 +148,14 @@ class DaemonClient:
     # RetrievalClient interface
     # ------------------------------------------------------------------
 
-    def daemon_is_healthy(self) -> dict[str, Any] | None:
+    def daemon_is_healthy(self, timeout: float = 5.0) -> dict[str, Any] | None:
         """Ping daemon and return the full health response dict.
         
         Returns None if daemon is not running or unreachable.
         """
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(0.5)
+            sock.settimeout(timeout)
             try:
                 sock.connect(str(self._socket_path))
                 request_id = str(uuid.uuid4())
@@ -565,6 +566,22 @@ class DaemonClient:
         if position is not None:
             args["position"] = position
         return self._send("playback_context", args)
+
+    def playback_loop_segment(self, start: float, end: float) -> dict[str, Any]:
+        """Engage A-B loop between start and end seconds."""
+        return self._send("playback_loop_segment", {"start": float(start), "end": float(end)})
+
+    def playback_clear_loop(self) -> dict[str, Any]:
+        """Cancel active A-B loop."""
+        return self._send("playback_clear_loop", {})
+
+    def playback_set_filter(self, filter_str: str) -> dict[str, Any]:
+        """Set live DSP audio filter (empty string to clear)."""
+        return self._send("playback_set_filter", {"filter_str": str(filter_str)})
+
+    def playback_chapter_telemetry(self, segment_ids: list[int]) -> dict[str, dict]:
+        """Map segment IDs to chapter metadata. Returns str-keyed dict."""
+        return self._send("playback_chapter_telemetry", {"segment_ids": list(segment_ids)})
 
     def whisper_acquire(self, session_id: str, model: str = "base") -> dict[str, Any]:
         """Register a session requiring the Whisper model to keep it warm."""
