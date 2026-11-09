@@ -71,7 +71,7 @@ CREATED_BY = "step5_triadic_extraction"
 # the idempotency check correctly re-runs all pairs under the new prompt.
 # Format: v<major>.<minor> — increment minor for wording tweaks, major for
 # schema or option-set changes.
-PROMPT_VERSION = "v1.0"
+PROMPT_VERSION = "v1.1"
 
 VALID_RELATIONS = {"ELABORATES", "CONTRADICTS", "INSPIRED_BY", "INDEPENDENT"}
 
@@ -308,6 +308,8 @@ For each pair, output one of these relation types:
   CONTRADICTS  — the passages make mutually incompatible empirical or normative claims
   INSPIRED_BY  — one passage explicitly cites, attributes ideas to, or was clearly influenced by the other
   INDEPENDENT  — the passages converge thematically but show no direct influence or opposition
+
+Critical rule: if a passage cites or references another work primarily to argue against or refute its claims, classify the pair as CONTRADICTS — not ELABORATES or INSPIRED_BY.
 
 For ELABORATES and INSPIRED_BY, you must also identify the 'subject': which passage (A, B, or C) is doing the elaborating or citing. The 'subject' points FROM the derivative/citing work TO the foundational/cited work.
 
@@ -565,7 +567,7 @@ def persist_winners(winners: list[dict], dry_run: bool) -> dict[str, int]:
 
     with get_session() as session:
         for w in to_persist:
-            # Upsert by idempotency key: check if row exists under same prompt_version
+            # Idempotency: check if row already exists under CURRENT prompt_version
             existing_row = session.execute(
                 _sql("""
                     SELECT id FROM expression_relations
@@ -583,7 +585,7 @@ def persist_winners(winners: list[dict], dry_run: bool) -> dict[str, int]:
             ).fetchone()
 
             if existing_row:
-                # Update if this winner has a stronger triangle
+                # Same version already exists — update weight/relation in-place
                 session.execute(
                     _sql("""
                         UPDATE expression_relations
@@ -600,25 +602,67 @@ def persist_winners(winners: list[dict], dry_run: bool) -> dict[str, int]:
                     },
                 )
             else:
-                session.execute(
+                # Check for a prior-version row with same (from, to, relation_type).
+                # If found, UPDATE it to current version rather than INSERT (which
+                # would violate the UNIQUE(from, to, relation_type) constraint).
+                prior_same_rel = session.execute(
                     _sql("""
-                        INSERT INTO expression_relations
-                            (from_expression_id, to_expression_id, relation_type,
-                             weight, created_by, created_at, prompt_version)
-                        VALUES
-                            (:from_id, :to_id, :rel,
-                             :weight, :created_by, :now, :pv)
+                        SELECT id FROM expression_relations
+                        WHERE from_expression_id = :from_id
+                          AND to_expression_id = :to_id
+                          AND relation_type = :rel
+                          AND created_by = :created_by
                     """),
                     {
                         "from_id": w["from_id"],
                         "to_id": w["to_id"],
                         "rel": w["relation"].lower(),
-                        "weight": w["min_edge"],
                         "created_by": CREATED_BY,
-                        "now": now,
-                        "pv": PROMPT_VERSION,
                     },
-                )
+                ).fetchone()
+
+                if prior_same_rel:
+                    # Existing row has same label under old version — bump to new version
+                    session.execute(
+                        _sql("""
+                            UPDATE expression_relations
+                            SET prompt_version = :pv,
+                                weight = :weight,
+                                created_at = :now
+                            WHERE id = :row_id
+                        """),
+                        {
+                            "pv": PROMPT_VERSION,
+                            "weight": w["min_edge"],
+                            "now": now,
+                            "row_id": prior_same_rel[0],
+                        },
+                    )
+                else:
+                    # Genuinely new (from, to, relation_type) — INSERT.
+                    # May replace an old row with a different relation_type (e.g.
+                    # INSPIRED_BY → CONTRADICTS across prompt versions). In that case
+                    # the old row remains in the DB under its old prompt_version;
+                    # consumers should filter by prompt_version to get the current view.
+                    session.execute(
+                        _sql("""
+                            INSERT INTO expression_relations
+                                (from_expression_id, to_expression_id, relation_type,
+                                 weight, created_by, created_at, prompt_version)
+                            VALUES
+                                (:from_id, :to_id, :rel,
+                                 :weight, :created_by, :now, :pv)
+                        """),
+                        {
+                            "from_id": w["from_id"],
+                            "to_id": w["to_id"],
+                            "rel": w["relation"].lower(),
+                            "weight": w["min_edge"],
+                            "created_by": CREATED_BY,
+                            "now": now,
+                            "pv": PROMPT_VERSION,
+                        },
+                    )
             counts[w["relation"]] += 1
 
         session.commit()

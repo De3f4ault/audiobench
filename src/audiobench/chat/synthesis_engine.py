@@ -21,6 +21,7 @@ import time
 from typing import Any
 
 from audiobench.chat.providers.ollama_provider import OllamaClient
+from audiobench.core.db_session import get_session
 from audiobench.core.settings import get_settings
 from audiobench.memory.query_engine import _call_llm, Ok, Err
 from audiobench.memory.synthesis_retriever import (
@@ -95,12 +96,81 @@ def format_synthesis_prompt(query: str, fragments: list[SynthesisFragment]) -> s
     return "\n".join(lines)
 
 
+def fetch_typed_edge_hints(fragments: list[SynthesisFragment]) -> str:
+    """Query typed-edge graph for co-retrieved pairs; return pre-registered hint block.
+
+    For each pair (i, j) where both expression_ids appear in the retrieved set
+    and a typed edge exists (created_by='step5_triadic_extraction'), emit a hint
+    line in the pre-registered format:
+        fragments [{i}, {j}] — {RELATION_TYPE} (prompt_v={version}, weight={w:.3f})
+
+    Returns empty string if no co-retrieved typed pairs exist.
+
+    The hint block is prefixed with a verification instruction so the LLM uses
+    it as metadata rather than as authoritative fact — important given the 1.4%
+    residual error rate in v1.0/v1.1 classifications.
+    """
+    if not fragments:
+        return ""
+
+    # Build expression_id -> fragment-index mapping (1-based, matching prompt)
+    eid_to_idx: dict[int, int] = {f.expression_id: i for i, f in enumerate(fragments, 1)}
+    retrieved_ids = list(eid_to_idx.keys())
+    if len(retrieved_ids) < 2:
+        return ""
+
+    id_list = ",".join(str(i) for i in retrieved_ids)
+    try:
+        from sqlalchemy import text as sa_text
+        with get_session() as session:
+            rows = session.execute(sa_text(f"""
+                SELECT from_expression_id, to_expression_id,
+                       relation_type, weight, prompt_version
+                FROM expression_relations
+                WHERE created_by = 'step5_triadic_extraction'
+                  AND relation_type IN ('contradicts', 'elaborates', 'inspired_by')
+                  AND from_expression_id IN ({id_list})
+                  AND to_expression_id IN ({id_list})
+                ORDER BY weight DESC
+            """)).fetchall()
+    except Exception:
+        logger.debug("fetch_typed_edge_hints: DB query failed, skipping hints", exc_info=True)
+        return ""
+
+    if not rows:
+        return ""
+
+    hint_lines = []
+    seen_pairs: set[tuple[int, int]] = set()
+    for from_id, to_id, rel_type, weight, prompt_ver in rows:
+        pair_key = (min(from_id, to_id), max(from_id, to_id))
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
+        i = eid_to_idx[from_id]
+        j = eid_to_idx[to_id]
+        hint_lines.append(
+            f"  fragments [{i}, {j}] — {rel_type.upper()}"
+            f" (prompt_v={prompt_ver or 'unknown'}, weight={weight:.3f})"
+        )
+
+    if not hint_lines:
+        return ""
+
+    header = (
+        "\nLibrary graph hints (verify against passage text before citing — "
+        f"{len(hint_lines)} typed relation(s) detected among retrieved sources):"
+    )
+    return header + "\n" + "\n".join(hint_lines) + "\n"
+
+
 def generate_synthesis(
     query: str,
-    top_k: int = 4,
+    top_k: int = 20,
     temperature: float = 0.3,
     llm: OllamaClient | None = None,
     community_id: int | None = None,
+    use_typed_edges: bool = False,
 ) -> SynthesisResponse:
     """Generate a grounded cross-disciplinary synthesis for the given query.
 
@@ -129,6 +199,16 @@ def generate_synthesis(
     }
 
     prompt = format_synthesis_prompt(query, fragments)
+
+    # Option 2: inject typed-edge metadata for co-retrieved pairs.
+    # Pre-registered format: "verify against passage text" to avoid hallucinated
+    # edge labels. No-op when use_typed_edges=False (baseline A/B condition)
+    # or when no co-retrieved typed pairs exist (Q1 abstract queries).
+    typed_hints = fetch_typed_edge_hints(fragments) if use_typed_edges else ""
+    if typed_hints:
+        logger.debug("Injecting %d typed-edge hint(s) into synthesis prompt", typed_hints.count("fragments ["))
+        prompt = prompt + typed_hints
+
     full_prompt = f"{_SYNTHESIS_SYSTEM_PROMPT}\n\n{prompt}"
 
     settings = get_settings()
