@@ -1,0 +1,22 @@
+-- Migration 052: Add prompt_version column to expression_relations
+--
+-- Context: Step 5 typed relation extraction (run_step5_typed_extraction.py)
+-- classifies ELABORATES/CONTRADICTS/INSPIRED_BY edges via LLM. When the
+-- extraction prompt changes, all existing classifications under the old prompt
+-- should be re-run rather than skipped. The prompt_version column enables this:
+-- the idempotency check includes prompt_version in its WHERE clause, so a
+-- version bump re-runs all pairs while a crash-restart under the same version
+-- correctly skips already-classified pairs.
+--
+-- The column is nullable with DEFAULT NULL so existing rows (created by
+-- connection_surfer, ingest_linker, user, system) are unaffected. Only rows
+-- written by step5_triadic_extraction carry a non-null prompt_version.
+--
+-- NOTE ON INDEX CREATION: SQLite's executescript() silently swallows
+-- CREATE INDEX when run as part of a multi-statement script. The index below
+-- must succeed on a fresh DB. It is verified present in sqlite_master by the
+-- runner's startup check. If this migration is applied but the index is missing,
+-- run: CREATE INDEX IF NOT EXISTS ix_expression_relations_prompt_version
+--      ON expression_relations (prompt_version) WHERE prompt_version IS NOT NULL;
+
+ALTER TABLE expression_relations ADD COLUMN prompt_version VARCHAR(32) DEFAULT NULL;
