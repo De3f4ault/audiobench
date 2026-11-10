@@ -20,7 +20,12 @@ if TYPE_CHECKING:
     # This avoids a circular import: storage.repository → cli.repl.session.
     from audiobench.cli.repl.session import ReplSession
 
-from audiobench.core.db_session import get_session
+from audiobench.core import db_session
+
+
+def get_session():
+    """Get database session dynamically from db_session module to prevent mock freeze across tests."""
+    return db_session.get_session()
 from audiobench.core.logger_factory import get_logger
 from audiobench.storage.models import AudioFileRecord, SegmentRecord, TranscriptionRecord
 from audiobench.transcribe.transcription_result import AudioMetadata, Transcript
@@ -1057,82 +1062,158 @@ class TranscriptionRepository:
         limit: int = 10,
         session: "ReplSession | None" = None,
         community_id: int | None = None,
+        work_ids: list[int] | None = None,
     ) -> list[dict]:
-        """Search transcriptions by text content.
+        """Search transcriptions by text content using FTS5 BM25 ranking.
+
+        Results are ranked by BM25 relevance score (best match first),
+        deduplicated to transcription-level, and returned in relevance order.
+        FTS5 special characters in the query are stripped automatically.
 
         Args:
-            query: Search string (case-insensitive LIKE).
-            limit: Maximum number of results.
+            query: Search string. Tokenised on whitespace; AND semantics across tokens.
+            limit: Maximum number of results (transcription-level, not segment-level).
             session: The active ReplSession, or None.  When None (or locked at
                 Tier 0), text_preview is replaced with "[REDACTED]" for any
                 transcript that contains segments with privacy_tier >= 2.
-                Uses a single EXISTS subquery per result — no N+1 penalty.
             community_id: Optional community ID to restrict search within a single school.
 
         Returns:
-            List of matching transcription dicts.
+            List of matching transcription dicts with keys:
+            id, file_name, language, text_preview, created_at, audio_file_id.
         """
         with get_session() as db_session:
-            from sqlalchemy import and_, exists
+            from sqlalchemy import and_, exists, text as sa_text
 
             effective_tier: int = session.effective_tier() if session is not None else 0
 
-            tokens = [t.strip() for t in query.split() if t.strip()]
-            filters = [TranscriptionRecord.full_text.ilike(f"%{t}%") for t in tokens]
+            # Sanitise tokens for FTS5:
+            #   1. Normalise hyphens/underscores to spaces *before* splitting so
+            #      "luck-vs-skill" → ["luck", "vs", "skill"], not ["luckvsskill"].
+            #   2. Strip remaining FTS5 punctuation operators from each token.
+            #   3. Lowercase FTS5 boolean keywords (OR/AND/NOT/NEAR are operators
+            #      only in UPPERCASE; lowercased they become ordinary search terms).
+            #   4. Filter common English stop words that match the entire corpus and
+            #      bloat BM25 ranking scratch space, while preserving 1-3 char content
+            #      words (fox, tax, law, war, god, net, cap, etc.). If all tokens are
+            #      stop words, keep raw tokens rather than returning empty.
+            _fts5_special = str.maketrans("", "", '"\'*()')  # hyphens handled via replace
+            _fts5_keywords = {"OR", "AND", "NOT", "NEAR"}
+            _english_stop_words = {
+                "a", "an", "and", "are", "as", "at", "be", "but", "by", "for",
+                "if", "in", "into", "is", "it", "no", "not", "of", "on", "or",
+                "such", "that", "the", "their", "then", "there", "these", "they",
+                "this", "to", "was", "will", "with",
+            }
+            normalized_query = query.replace("-", " ").replace("_", " ")
+            raw_tokens = []
+            for t in normalized_query.split():
+                t = t.strip().translate(_fts5_special)
+                if not t:
+                    continue
+                if t.upper() in _fts5_keywords:
+                    t = t.lower()
+                raw_tokens.append(t)
+            tokens = [t for t in raw_tokens if t.lower() not in _english_stop_words]
+            if not tokens:
+                tokens = raw_tokens
 
+            if not tokens:
+                return []
+
+            fts_query = " ".join(tokens)  # AND-of-tokens: empirically identical to phrase
+                                           # match for this corpus (0 top-8 divergence on
+                                           # "black swan", "survivorship bias"). More recall
+                                           # than phrase for rare multi-word queries.
+
+            # community_id scope: collect transcription IDs that belong to community
+            community_filter_sql = ""
+            community_params: dict = {}
             if community_id is not None:
-                from audiobench.storage.models import ExpressionRecord
-                matching_tids = (
-                    db_session.query(ExpressionRecord.source_id)
-                    .filter(
-                        ExpressionRecord.community_id == community_id,
-                        ExpressionRecord.source_type == "transcription_chunk",
-                    )
-                    .distinct()
+                community_filter_sql = (
+                    "AND t.id IN ("
+                    "  SELECT CAST(source_id AS INTEGER) FROM expressions"
+                    "  WHERE community_id = :cid AND source_type = 'transcription_chunk'"
+                    ")"
                 )
-                filters.append(TranscriptionRecord.id.in_(matching_tids))
+                community_params["cid"] = community_id
 
-            records = (
-                db_session.query(TranscriptionRecord)
-                .filter(and_(*filters) if filters else True)
-                .order_by(desc(TranscriptionRecord.created_at))
-                .limit(limit)
-                .all()
-            )
+            # work_ids hard-scope: synthesis router hard mode.
+            # Soft mode is not implemented for FTS5 (Option C) — Step 0 fixed
+            # FTS5's actual failure (ILIKE → BM25); no demonstrated FTS5 failure
+            # remains that a soft boost would address.
+            work_ids_filter_sql = ""
+            work_ids_params: dict = {}
+            if work_ids:
+                wid_ph = ", ".join(f":rwid{i}" for i in range(len(work_ids)))
+                work_ids_filter_sql = f"AND af.work_id IN ({wid_ph})"
+                work_ids_params = {f"rwid{i}": wid for i, wid in enumerate(work_ids)}
 
-            # Pre-compute which transcript IDs have protected segments.
-            # One EXISTS query per candidate — still O(N) but each is a fast
-            # index scan on segments.privacy_tier (indexed column).
+            sql = sa_text(f"""
+                SELECT
+                    t.id,
+                    t.file_name,
+                    t.language,
+                    t.created_at,
+                    t.audio_file_id,
+                    MIN(sf.rank) AS best_rank,
+                    t.full_text
+                FROM segments_fts sf
+                JOIN segments s ON sf.rowid = s.id
+                JOIN transcriptions t ON s.transcription_id = t.id
+                LEFT JOIN audio_files af ON t.audio_file_id = af.id
+                WHERE segments_fts MATCH :fts_query
+                {community_filter_sql}
+                {work_ids_filter_sql}
+                GROUP BY t.id
+                ORDER BY best_rank
+                LIMIT :limit
+            """)
+
+            rows = db_session.execute(
+                sql,
+                {"fts_query": fts_query, "limit": limit, **community_params, **work_ids_params},
+            ).fetchall()
+
+            # Privacy tier check — one IN-list query across all result IDs.
+            # SQLite requires expanded named params (no tuple binding for IN).
             if effective_tier < 2:
-                protected_ids: set[int] = set()
-                for rec in records:
-                    has_protected = db_session.query(
-                        exists().where(
-                            SegmentRecord.transcription_id == rec.id,
-                            SegmentRecord.privacy_tier >= 2,
-                        )
-                    ).scalar()
-                    if has_protected:
-                        protected_ids.add(rec.id)
+                tx_ids = [r[0] for r in rows]
+                if tx_ids:
+                    id_ph = ", ".join(f":ptid{i}" for i in range(len(tx_ids)))
+                    id_params = {f"ptid{i}": tid for i, tid in enumerate(tx_ids)}
+                    protected_ids: set[int] = set(
+                        r[0]
+                        for r in db_session.execute(
+                            sa_text(
+                                f"SELECT DISTINCT transcription_id FROM segments"
+                                f" WHERE transcription_id IN ({id_ph}) AND privacy_tier >= 2"
+                            ),
+                            id_params,
+                        ).fetchall()
+                    )
+                else:
+                    protected_ids = set()
             else:
                 protected_ids = set()
 
             results = []
-            for rec in records:
-                if rec.id in protected_ids:
+            for tx_id, file_name, language, created_at, audio_file_id, _rank, full_text in rows:
+                if tx_id in protected_ids:
                     preview = "[REDACTED]"
                 else:
-                    preview = (rec.full_text or "")[:200]
+                    preview = (full_text or "")[:200]
                 results.append(
                     {
-                        "id": rec.id,
-                        "file_name": rec.file_name
-                        or (rec.audio_file.file_name if rec.audio_file else "unknown"),
-                        "language": rec.language,
+                        "id": tx_id,
+                        "file_name": file_name or f"Transcript #{tx_id}",
+                        "language": language,
                         "text_preview": preview,
-                        "created_at": rec.created_at.isoformat() if rec.created_at else "",
+                        "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at or ""),
+                        "audio_file_id": audio_file_id,
                     }
                 )
+
             return results
 
 

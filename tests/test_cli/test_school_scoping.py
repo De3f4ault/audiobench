@@ -464,7 +464,7 @@ def test_cmd_search_school_scoped(repl_session):
          patch("builtins.input", return_value="q"):
         cmd_search(repl_session, "realization")
 
-    mock_repo.search.assert_called_once_with("realization", limit=10, session=repl_session, community_id=12)
+    mock_repo.search.assert_called_once_with("realization", limit=10, session=repl_session, community_id=12, work_ids=None)
     out = test_console.export_text()
     assert "‹Scoped to School #12: Interpersonal Dynamics›" in out
     assert "watts_lecture.mp3" in out
