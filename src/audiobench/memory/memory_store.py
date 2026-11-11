@@ -21,6 +21,21 @@ from audiobench.memory.embedding_engine import EmbeddingEngine
 
 logger = get_logger("memory.memory_store")
 
+EMBEDDABLE_SOURCE_TYPES: frozenset[str] = frozenset({
+    "audio_transcript",
+    "transcript_segment",
+    "chapter_summary",
+    "search_query",
+    "search_synthesis",
+    "search_session_summary",
+    "session_summary",
+    "journal_entry",
+    "chat_message",
+    "ask_query",
+    "ask_answer",
+    "bookmark_note",
+})
+
 
 class ExpressionNode(LanceModel):
     """LanceDB schema for stored semantic expressions."""
@@ -79,21 +94,14 @@ class MemoryStore:
         if self.table_name not in self.db.table_names():
             logger.info("Creating LanceDB table '%s'", self.table_name)
             self.db.create_table(self.table_name, schema=ExpressionNode)
-            # NOTE: No FTS index created. The FTS (inverted) index triggered a
-            # Rust panic in lance-index 7.0.0 (builder.rs out-of-bounds) when
-            # optimize() ran on a fragmented table, causing silent data loss.
-            # All retrieval uses vector similarity search — FTS is not needed.
 
-        # Scalar index on expression_id is required for merge_insert performance.
-        # Without it merge_insert does a full table scan and runs ~1.7x slower
-        # than the old delete+add (measured: 22.7ms vs 12.9ms on 10k rows).
-        # NOTE: In lance-0.38.2, create_scalar_index is NOT idempotent — it always
-        # submits a CreateIndex transaction and bumps table version. Calling it
-        # unconditionally races concurrent Rewrite transactions (e.g. optimizer)
-        # leading to "Retryable commit conflict". We check existing indices first.
+        # Ensure indices exist (scalar on expression_id, FTS on content).
+        # In lance-0.38.2, index creation methods submit transactions that bump
+        # table version, so we check existing indices first to remain idempotent.
         try:
             tbl = self.db.open_table(self.table_name)
             existing_indices = tbl.list_indices()
+
             has_expr_idx = any(
                 getattr(idx, "name", "") == "expression_id_idx"
                 or "expression_id" in getattr(idx, "columns", [])
@@ -101,9 +109,16 @@ class MemoryStore:
             )
             if not has_expr_idx:
                 tbl.create_scalar_index("expression_id")
+
+            has_fts_idx = any(
+                getattr(idx, "index_type", "") == "FTS"
+                or "content" in getattr(idx, "columns", [])
+                for idx in existing_indices
+            )
+            if not has_fts_idx:
+                tbl.create_fts_index("content")
         except Exception as _idx_exc:
-            # Non-fatal: merge_insert still works without the index, just slower.
-            logger.warning("Could not create scalar index on expression_id: %s", _idx_exc)
+            logger.warning("Could not verify/create indices on '%s': %s", self.table_name, _idx_exc)
 
     @property
     def table(self) -> Any:
@@ -118,6 +133,7 @@ class MemoryStore:
         inference_status: str | None = None,  # accepted for compat; stored in SQLite if column exists
         source_id: int | None = None,
         speaker: str | None = None,
+        calibration_key: str | None = None,
     ) -> None:
         """Register a new expression in SQLite and immediately embed it into LanceDB.
 
@@ -134,6 +150,7 @@ class MemoryStore:
                               the ExpressionRecord has an inference_status column.
             source_id:        Optional FK to the originating row.
             speaker:          Optional speaker label.
+            calibration_key:  Subsystem label (e.g. 'tracker_stats', 'seen_pairs').
         """
         from audiobench.storage.expression_repository import ExpressionRepository
 
@@ -143,6 +160,7 @@ class MemoryStore:
             source_type=source_type,
             source_id=source_id,
             speaker=speaker,
+            calibration_key=calibration_key,
         )
 
         # Persist the inference_status flag if the column exists on the model
@@ -161,16 +179,24 @@ class MemoryStore:
                 # Column may not exist in older migrations — non-fatal
                 logger.debug("add_expression: could not set inference_status: %s", exc)
 
-        # Write vector to LanceDB so the expression is immediately searchable
-        try:
-            self.write_node(
-                expression_id=record.id,
-                content=content,
-                source_type=source_type,
-                speaker=speaker,
+        # Write vector to LanceDB only for embeddable source types
+        st = source_type.value if hasattr(source_type, "value") else str(source_type)
+        if st in EMBEDDABLE_SOURCE_TYPES:
+            try:
+                self.write_node(
+                    expression_id=record.id,
+                    content=content,
+                    source_type=st,
+                    speaker=speaker,
+                )
+            except Exception as exc:
+                logger.error("add_expression: LanceDB write failed for expression #%d: %s", record.id, exc)
+        else:
+            logger.debug(
+                "add_expression: skipping LanceDB vector embedding for non-embeddable source_type '%s' (expression #%d)",
+                st,
+                record.id,
             )
-        except Exception as exc:
-            logger.error("add_expression: LanceDB write failed for expression #%d: %s", record.id, exc)
 
     def write_node(
         self,
@@ -191,6 +217,15 @@ class MemoryStore:
         optimize() call could compact-out the deleted row before the add() commit,
         permanently losing the expression.
         """
+        st = source_type.value if hasattr(source_type, "value") else str(source_type)
+        if st not in EMBEDDABLE_SOURCE_TYPES:
+            logger.warning(
+                "write_node: refusing to embed non-embeddable source_type '%s' (expression #%d)",
+                st,
+                expression_id,
+            )
+            return
+
         vector = self._engine.embed_for_storage(content).tolist()
         now_str = datetime.datetime.now(datetime.UTC).isoformat()
 
@@ -200,7 +235,7 @@ class MemoryStore:
             content=content,
             embedding_model_version=self.model_version,
             embedded_at=now_str,
-            source_type=source_type,
+            source_type=st,
             speaker=speaker,
             chapter_id=chapter_id,
             chapter_title=chapter_title,
@@ -219,6 +254,13 @@ class MemoryStore:
             .when_matched_update_all() \
             .when_not_matched_insert_all() \
             .execute(data)
+
+        # Ingest-time hook: update process-wide in-core HNSW index
+        try:
+            from audiobench.daemon.index import get_shared_hnsw_index
+            get_shared_hnsw_index().add(expression_id, vector)
+        except Exception as _hnsw_exc:
+            logger.debug("write_node: could not update shared HNSW index: %s", _hnsw_exc)
 
     def batch_write_nodes(
         self,
@@ -298,6 +340,14 @@ class MemoryStore:
 
         logger.info("batch_write_nodes: wrote %d expressions to LanceDB", len(records))
 
+        # Ingest-time hook: update process-wide in-core HNSW index
+        try:
+            from audiobench.daemon.index import get_shared_hnsw_index
+            hnsw_rows = [(int(r.expression_id), r.vector) for r in records]
+            get_shared_hnsw_index().add_batch(hnsw_rows)
+        except Exception as _hnsw_exc:
+            logger.debug("batch_write_nodes: could not update shared HNSW index: %s", _hnsw_exc)
+
     def update_expression_work_id(self, expression_id: int, work_id: int) -> None:
         """Update the work_id of an existing expression in LanceDB."""
         try:
@@ -332,21 +382,6 @@ class MemoryStore:
 
             query_vector = ((np.array(query_vector) + np.array(hyde_vector)) / 2.0).tolist()
 
-        # Determine base search strategy
-        if use_bm25 and use_dense:
-            # LanceDB native RRF handles the hybrid merge
-            search_query = (
-                self.table.search(query_type="hybrid", fts_columns="content")
-                .vector(query_vector)
-                .text(query)
-            )
-        elif use_bm25:
-            search_query = self.table.search(query, query_type="fts")
-        else:
-            search_query = self.table.search(query_vector, query_type="vector")
-
-        search_query = search_query.limit(top_k * 3)
-
         where_clauses = []
         if speaker_filter:
             where_clauses.append(f"speaker = '{speaker_filter}'")
@@ -360,27 +395,59 @@ class MemoryStore:
             where_clauses.append(f"author = '{author_filter}'")
 
         prefilter = " AND ".join(where_clauses) if where_clauses else None
-        if prefilter:
-            search_query = search_query.where(prefilter)
 
-        # Apply ColBERT reranking if enabled
-        if use_colbert:
-            from audiobench.memory.singletons import get_colbert_reranker
-
-            reranker = get_colbert_reranker()
-            from lancedb.query import LanceHybridQueryBuilder
-
-            if isinstance(search_query, LanceHybridQueryBuilder):
-                search_query = search_query.rerank(reranker=reranker)
+        def _build_and_execute_search(enable_fts: bool) -> list[dict]:
+            # Determine base search strategy
+            if enable_fts and use_dense:
+                # LanceDB native RRF handles the hybrid merge
+                sq = (
+                    self.table.search(query_type="hybrid", fts_columns="content")
+                    .vector(query_vector)
+                    .text(query)
+                )
+            elif enable_fts:
+                sq = self.table.search(query, query_type="fts")
             else:
-                search_query = search_query.rerank(reranker=reranker, query_string=query)
-        elif use_bm25 and use_dense:
-            # Explicitly use RRF if ColBERT is off but Hybrid is on
-            from lancedb.rerankers import RRFReranker
+                sq = self.table.search(query_vector, query_type="vector")
 
-            search_query = search_query.rerank(reranker=RRFReranker())
+            sq = sq.limit(top_k * 3)
+            if prefilter:
+                sq = sq.where(prefilter)
 
-        results = search_query.to_list()
+            # Apply ColBERT reranking if enabled
+            if use_colbert:
+                from audiobench.memory.singletons import get_colbert_reranker
+
+                reranker = get_colbert_reranker()
+                from lancedb.query import LanceHybridQueryBuilder
+
+                if isinstance(sq, LanceHybridQueryBuilder):
+                    sq = sq.rerank(reranker=reranker)
+                else:
+                    sq = sq.rerank(reranker=reranker, query_string=query)
+            elif enable_fts and use_dense:
+                # Explicitly use RRF if ColBERT is off but Hybrid is on
+                from lancedb.rerankers import RRFReranker
+
+                sq = sq.rerank(reranker=RRFReranker())
+
+            return sq.to_list()
+
+        try:
+            results = _build_and_execute_search(enable_fts=use_bm25)
+        except Exception as exc:
+            err_msg = str(exc).lower()
+            if use_bm25 and ("inverted index" in err_msg or "fts" in err_msg or "no inverted index" in err_msg):
+                logger.warning(
+                    "FTS index missing on expressions.content — running dense-only (hybrid disabled). "
+                    "Fix: call table.create_fts_index('content') once to enable true hybrid search. "
+                    "Raw error: %s",
+                    exc,
+                )
+                results = _build_and_execute_search(enable_fts=False)
+            else:
+                raise
+
 
         final_results = []
         for r in results:
@@ -406,6 +473,11 @@ class MemoryStore:
     def delete_node(self, expression_id: int) -> None:
         """Delete an expression node from LanceDB."""
         self.table.delete(f"expression_id = {expression_id}")
+        try:
+            from audiobench.daemon.index import get_shared_hnsw_index
+            get_shared_hnsw_index().mark_deleted(int(expression_id))
+        except Exception:
+            pass
 
     def delete_node_batch(self, expression_ids: list[int]) -> None:
         """Delete multiple expression nodes from LanceDB in a single operation."""
@@ -413,6 +485,13 @@ class MemoryStore:
             return
         ids_str = ", ".join(str(int(i)) for i in expression_ids)
         self.table.delete(f"expression_id IN ({ids_str})")
+        try:
+            from audiobench.daemon.index import get_shared_hnsw_index
+            idx = get_shared_hnsw_index()
+            for eid in expression_ids:
+                idx.mark_deleted(int(eid))
+        except Exception:
+            pass
 
     def get_vectors(self, expression_ids: list[int]) -> dict[int, list[float]]:
         """Retrieve vectors for a list of expression IDs."""
@@ -709,6 +788,20 @@ class SegmentVectorStore:
         ]
         self.table.add(records)
         logger.info("Batch upserted %d segments into segment_vectors", len(records))
+
+    def delete_segments(self, segment_ids: list[int]) -> int:
+        """Delete multiple segments by ID from LanceDB in chunks."""
+        if not segment_ids:
+            return 0
+        chunk_size = 500
+        for i in range(0, len(segment_ids), chunk_size):
+            chunk = segment_ids[i : i + chunk_size]
+            id_list = ", ".join(str(int(cid)) for cid in chunk)
+            try:
+                self.table.delete(f"segment_id IN ({id_list})")
+            except Exception as exc:
+                logger.debug("Failed deleting segment batch from LanceDB: %s", exc)
+        return len(segment_ids)
 
     # ------------------------------------------------------------------
     # Read

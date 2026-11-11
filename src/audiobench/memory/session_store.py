@@ -532,3 +532,112 @@ def resume_session_state(session_id: int) -> dict | None:
         "preset": detail.preset,
     }
 
+
+def get_query_text(query_id: int) -> str | None:
+    """Return the query_text for a search query by its primary key ID."""
+    try:
+        conn = _get_conn()
+        row = conn.execute("SELECT query_text FROM search_queries WHERE id = ?", (query_id,)).fetchone()
+        conn.close()
+        if row:
+            return row["query_text"]
+    except sqlite3.Error as e:
+        logger.warning("Failed to get query text for query %s: %s", query_id, e)
+    return None
+
+
+def get_query_id_by_sequence(session_id: int, sequence_num: int) -> int | None:
+    """Find a search query ID by its session ID and sequence number."""
+    try:
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT id FROM search_queries WHERE session_id = ? AND sequence_num = ?",
+            (session_id, sequence_num),
+        ).fetchone()
+        conn.close()
+        if row:
+            return row["id"]
+    except sqlite3.Error as e:
+        logger.warning(
+            "Failed to get query ID for session %s sequence %s: %s", session_id, sequence_num, e
+        )
+    return None
+
+
+def resolve_query_id_for_session(
+    session_id: int, sequence_num: int | None = None, title: str | None = None
+) -> int | None:
+    """Attempt to resolve a search query ID from session ID, sequence num, or title."""
+    try:
+        conn = _get_conn()
+        if sequence_num is not None:
+            row = conn.execute(
+                "SELECT id FROM search_queries WHERE session_id = ? AND sequence_num = ?",
+                (session_id, sequence_num),
+            ).fetchone()
+            if row:
+                conn.close()
+                return row["id"]
+
+        rows = conn.execute(
+            "SELECT id, sequence_num, query_text FROM search_queries WHERE session_id = ? ORDER BY sequence_num",
+            (session_id,),
+        ).fetchall()
+        conn.close()
+
+        if not rows:
+            return None
+        if len(rows) == 1:
+            return rows[0]["id"]
+
+        if title:
+            norm_title = title.lower()
+            for r in rows:
+                q_text = (r["query_text"] or "").lower()
+                if q_text and (q_text in norm_title or norm_title in q_text):
+                    return r["id"]
+    except sqlite3.Error as e:
+        logger.warning("Failed to resolve query ID for session %s: %s", session_id, e)
+    return None
+
+
+def get_query_fragments(query_id: int) -> list[dict]:
+    """Retrieve fragments persisted for a search query, ordered by rank.
+
+    Returns a list of dicts with keys:
+        source_file, transcription_id, start_time, end_time, score, text, rank, segment_id
+    """
+    try:
+        conn = _get_conn()
+        rows = conn.execute(
+            """
+            SELECT sqf.segment_id, sqf.source_file, sqf.rank, sqf.rrf_score,
+                   sqf.start_time, sqf.end_time, sqf.fragment_text,
+                   seg.transcription_id
+            FROM search_query_fragments sqf
+            LEFT JOIN segments seg ON sqf.segment_id = seg.id
+            WHERE sqf.query_id = ?
+            ORDER BY sqf.rank ASC
+            """,
+            (query_id,),
+        ).fetchall()
+        conn.close()
+
+        fragments = []
+        for r in rows:
+            fragments.append({
+                "segment_id": r["segment_id"],
+                "source_file": r["source_file"] or (f"Transcript #{r['transcription_id']}" if r["transcription_id"] else "Unknown"),
+                "transcription_id": r["transcription_id"],
+                "rank": r["rank"],
+                "score": r["rrf_score"] or 0.0,
+                "start_time": r["start_time"] or 0.0,
+                "end_time": r["end_time"] or 0.0,
+                "text": (r["fragment_text"] or "").strip(),
+            })
+        return fragments
+    except sqlite3.Error as e:
+        logger.warning("Failed to get fragments for query %s: %s", query_id, e)
+        return []
+
+

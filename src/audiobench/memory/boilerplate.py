@@ -186,6 +186,15 @@ _PREAMBLE_PATTERNS: list[re.Pattern[str]] = [
         r"^(?:" + "|".join(_PUBLIC_DOMAIN_PLATFORMS) + r")\b[^.]{0,250}\.\s*",
         re.IGNORECASE | re.DOTALL,
     ),
+    # Project Gutenberg license / notice preamble
+    re.compile(
+        r"^.{0,250}?(?:project\s+gutenberg|gutenberg\.org)\b[^.]{0,250}\.\s*",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        r"^this\s+ebook\s+is\s+for\s+the\s+use\s+of\s+anyone\b.*?(?:gutenberg|public\s+domain)[^.]{0,250}\.\s*",
+        re.IGNORECASE | re.DOTALL,
+    ),
     # "A [Producer] production" / "A [Producer] audiobook"
     re.compile(
         r"^a\s+" + _PRODUCER_FRAGMENT + r"\s+(?:production|audiobook|recording|unabridged)\b[^.]{0,250}\.\s*",
@@ -268,6 +277,17 @@ _OUTRO_PATTERNS: list[re.Pattern[str]] = [
         r"(?:don'?t\s+forget\s+to\s+(?:like|subscribe)|if\s+you\s+enjoyed\s+this\s+(?:video|episode))\b.*$",
         re.IGNORECASE | re.DOTALL,
     ),
+    # Spoken video / podcast outro sign-offs:
+    # 1. Multi-sentence spoken outro starting with 'Alright guys, ... shut/turn this one off / hope this video was'
+    re.compile(
+        r"(?:alright\s+guys|all\s+right\s+guys),?\s*(?:i\s+guess\s+)?(?:we'?ll\s+)?(?:go\s+ahead\s+and\s+)?(?:shut|turn\s+this\s+(?:one\s+)?off|(?:i\s+)?hope\s+this\s+video\s+was|thanks?\s+for\s+watching)\b.*$",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    # 2. Terminal conversational sign-offs bounded to end of utterance/chunk
+    re.compile(
+        r"(?:thanks?\s+(?:you\s+)?for\s+watching|until\s+next\s+time|that'?s\s+about\s+it\s+for\s+today|i\s+hope\s+this\s+video\s+was\s+(?:somewhat\s+)?(?:informative|helpful|useful))(?:,?\s*(?:bye|see\s+ya|take\s+care))?[\.\!\s]*$",
+        re.IGNORECASE,
+    ),
     # "Copyright [Year] [entity]. All rights reserved."
     re.compile(
         r"copyright\s+(?:\(c\)\s*)?\d{4}\b[^.]{0,200}all\s+rights\s+reserved[^.]*\.$",
@@ -276,6 +296,23 @@ _OUTRO_PATTERNS: list[re.Pattern[str]] = [
     # "All rights reserved." as a terminal line
     re.compile(
         r"all\s+rights\s+reserved\s*\.?\s*$",
+        re.IGNORECASE,
+    ),
+    # Media transition notices ("This book is continued on disc 5", "End of side A", "Please turn over the tape")
+    re.compile(
+        r"(?:this\s+book\s+is\s+)?continued\s+on\s+(?:disc|cd|tape|cassette|track)\s+\w+[\.\!\s]*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"end\s+of\s+(?:disc|cd|tape|cassette|track|side\s+[ab])[\.\!\s]*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:please\s+)?(?:turn|flip)\s+(?:the\s+)?(?:tape|cassette)(?:\s+over)?[\.\!\s]*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:please\s+)?(?:turn|flip)\s+(?:over\s+to\s+|to\s+)?side\s+[ab][\.\!\s]*$",
         re.IGNORECASE,
     ),
 ]
@@ -290,6 +327,10 @@ _PURE_DISCLAIMER_FAST_CHECKS = [
     "library vox",
     "this is audible",
     "public domain",
+    "project gutenberg",
+    "gutenberg.org",
+    "internet archive",
+    "archive.org",
     "all rights reserved",
     "sounds true presents",
     "tantor audio",
@@ -297,6 +338,25 @@ _PURE_DISCLAIMER_FAST_CHECKS = [
     "blackstone audio",
     "recorded books",
     "storytel",
+    "hope this video was",
+    "shut this one off",
+    "turn this one off",
+    "that's about it for today",
+    "thats about it for today",
+    "thanks for watching",
+    "thank you for watching",
+    "until next time",
+    "like and subscribe",
+    # Audio media boundary transitions (scoped multi-word phrases)
+    "continued on disc",
+    "continued on cd",
+    "continued on tape",
+    "end of disc",
+    "end of side a",
+    "end of side b",
+    "turn over to side",
+    "flip to side",
+    "turn the tape over",
 ]
 
 # Minimum substantive word count after stripping — below this is pure boilerplate.
@@ -379,5 +439,8 @@ def is_pure_boilerplate(text: str) -> bool:
         return False
 
     cleaned = clean_audio_disclaimers(text)
+    if cleaned == text.strip():
+        # No disclaimers or outros were stripped — cannot be pure boilerplate
+        return False
     return len(cleaned.split()) < _MIN_SUBSTANTIVE_WORDS
 

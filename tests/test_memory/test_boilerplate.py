@@ -234,3 +234,90 @@ class TestIsPureBoilerplate:
             "witness that dmitri fyodorovitch was not the murderer and smerdyakov alone committed the crime."
         )
         assert is_pure_boilerplate(text) is False
+
+    def test_conversational_video_outro(self) -> None:
+        """Spoken YouTube sign-off outro must be flagged as pure boilerplate."""
+        text = "Alright guys, I guess we'll go ahead and shut this one off. But I hope this video was somewhat informative. And that's about it for today."
+        assert is_pure_boilerplate(text) is True
+
+    def test_conversational_video_outro_with_content(self) -> None:
+        """Substantive content followed by a short outro should strip outro without flagging entire text."""
+        text = (
+            "Understanding the why behind human decisions is the ultimate foundation of behavioral influence. "
+            "When you explain your reasons clearly, people comply far more readily because reason-respecting "
+            "tendency is deeply ingrained in human psychology. "
+            "Alright guys, I hope this video was somewhat informative. And that's about it for today."
+        )
+        assert is_pure_boilerplate(text) is False
+        cleaned = clean_audio_disclaimers(text)
+        assert "Alright guys" not in cleaned
+        assert "Understanding the why behind human decisions" in cleaned
+
+    def test_mid_sentence_conversational_phrases_not_flagged(self) -> None:
+        """Legitimate narrative containing conversational phrases mid-sentence must not be stripped or flagged."""
+        # 1. 'thanks for watching' mid-sentence
+        text1 = "I owe many thanks for watching over my mother while I was away at war across the ocean."
+        assert is_pure_boilerplate(text1) is False
+        assert clean_audio_disclaimers(text1) == text1
+
+        # 2. 'until next time' mid-sentence
+        text2 = "He said until next time, my friend, and rode away into the sunset with twenty bags of gold."
+        assert is_pure_boilerplate(text2) is False
+        assert clean_audio_disclaimers(text2) == text2
+
+        # 3. 'shut this one off' mid-sentence
+        text3 = "He ordered the technician to shut this one off immediately before the reactor overloaded."
+        assert is_pure_boilerplate(text3) is False
+        assert clean_audio_disclaimers(text3) == text3
+
+
+class TestMediaTransitions:
+    def test_continued_on_disc_outro_stripping(self) -> None:
+        text = "This book is continued on disc 5."
+        assert strip_outro(text) == ""
+        assert is_pure_boilerplate(text) is True
+
+    def test_end_of_side_outro_stripping(self) -> None:
+        text = "End of side A."
+        assert strip_outro(text) == ""
+        assert is_pure_boilerplate(text) is True
+
+    def test_turn_over_side_outro_stripping(self) -> None:
+        text = "Please turn over to side B."
+        assert strip_outro(text) == ""
+        assert is_pure_boilerplate(text) is True
+
+    def test_turn_the_tape_over_outro_stripping(self) -> None:
+        text = "Please turn the tape over."
+        assert strip_outro(text) == ""
+        assert is_pure_boilerplate(text) is True
+
+    def test_literal_production_snippet_is_pure_boilerplate(self) -> None:
+        # Literal text from production expression #66198
+        text = "You must be hot. This book is continued on disc 5"
+        assert is_pure_boilerplate(text) is True
+
+    def test_substantive_passage_with_media_outro_preserves_content(self) -> None:
+        passage = (
+            "The concept of absurdity emerges when the human need for meaning encounters "
+            "the unreasonable silence of the universe. We must imagine Sisyphus happy, "
+            "affirming life even in the face of futile struggle. "
+            "This book is continued on disc 2."
+        )
+        assert is_pure_boilerplate(passage) is False
+        cleaned = clean_audio_disclaimers(passage)
+        assert "continued on disc 2" not in cleaned
+        assert "concept of absurdity" in cleaned
+
+    def test_negative_control_narrative_side_a_not_flagged_or_stripped(self) -> None:
+        # Narrative discussing sides of an argument or physical layout must not be modified
+        text1 = "On side A of the argument, Aristotle claims that substances are primary."
+        assert is_pure_boilerplate(text1) is False
+        assert clean_audio_disclaimers(text1) == text1
+
+        text2 = "The musician stood on side B of the stage holding an acoustic guitar."
+        assert is_pure_boilerplate(text2) is False
+        assert clean_audio_disclaimers(text2) == text2
+
+
+

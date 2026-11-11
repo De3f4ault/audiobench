@@ -139,6 +139,13 @@ SEARCH_COMMAND_REGISTRY: list[CommandMeta] = [
         example="/forget",
     ),
     CommandMeta(
+        name="/similar",
+        aliases=["/neighbors"],
+        summary="Surface semantically similar expressions via in-core HNSW",
+        synopsis="<#id | query text>",
+        example="/similar #1042",
+    ),
+    CommandMeta(
         name="/voice",
         aliases=["/v"],
         summary="Prompt one-shot voice input for search query",
