@@ -134,8 +134,45 @@ def cmd_stack(session: ReplSession, args: str) -> None:
 # ── Focus ────────────────────────────────────────────────────
 
 
+def _check_bridge_staleness(session: ReplSession, bridge: Any, b_idx: int) -> None:
+    """Emit a staleness warning if bridge b_idx no longer matches current synthesis citations.
+
+    Uses citation-EID comparison only — no snapshot timestamps, which were shown to produce
+    false positives when cite 1 coincidentally pointed to the same expression across syntheses.
+
+    A stale bridge occurs when:
+    - ``session.last_synthesis_citations[for_cite] != bridge.target_expression_id``: the
+      citation the bookmark was built from now points to a different expression, meaning a
+      ``\\synthesize`` ran between ``\\bookmark`` and ``\\play``/``\\focus``.
+    - Fallback: ``bridge.target_expression_id`` not in any current citation's EID set, and
+      ``for_cite`` is unknown.
+    """
+    bridge_eid = getattr(bridge, "target_expression_id", None)
+    citations: dict[int, int] = getattr(session, "last_synthesis_citations", {})
+    for_cite: int | None = getattr(session, "last_bookmark_bridges_for_cite", None)
+
+    is_stale = False
+    if citations and for_cite and for_cite in citations:
+        if citations[for_cite] != bridge_eid:
+            is_stale = True
+    elif citations and bridge_eid and bridge_eid not in citations.values():
+        is_stale = True
+
+    if is_stale and bridge_eid:
+        if for_cite:
+            refresh_hint = f"\\bookmark cite {for_cite}"
+        elif citations:
+            refresh_hint = f"\\bookmark cite {max(citations.keys())}"
+        else:
+            refresh_hint = f"\\bookmark {bridge_eid}"
+        console.print(
+            f"  [{WARNING}]⚠ Bridge b{b_idx} is stale — built from expression #{bridge_eid}. "
+            f"Run [{ACCENT}]{refresh_hint}[/] to refresh.[/]"
+        )
+
+
 def _focus_bridge(session: ReplSession, bridge: Any, idx: int) -> None:
-    """Switch focus to the work or audio file represented by a dialectic bridge."""
+    """Switch focus to the work or audio file represented by a semantic bridge."""
     from audiobench.cli.repl.dispatch import print_context_summary
     from audiobench.core.db_session import get_session
     from audiobench.core.focused_entity import FocusedEntity
@@ -182,7 +219,7 @@ def _focus_bridge(session: ReplSession, bridge: Any, idx: int) -> None:
             )
 
     console.print(
-        f"  [{SUCCESS}]Focus switched to dialectic bridge [B{idx}]:[/] [{ACCENT}]{bridge.author} — {bridge.work_title}[/] "
+        f"  [{SUCCESS}]Focus switched to semantic bridge [B{idx}]:[/] [{ACCENT}]{bridge.author} — {bridge.work_title}[/] "
         f"[{DIM}](Expression #{bridge.target_expression_id})[/]"
     )
     print_context_summary(session)
@@ -213,7 +250,7 @@ def cmd_focus(session: ReplSession, args: str) -> None:
 
     init_db()
 
-    # Support \focus b1, \focus b2, \focus bridge 1 (Dialectic Bridges from Bookmark card)
+    # Support \focus b1, \focus b2, \focus bridge 1 (Semantic Bridges from Bookmark card)
     lower_arg = arg.lower()
     b_num: int | None = None
     if lower_arg.startswith("b") and lower_arg[1:].isdigit():
@@ -224,9 +261,10 @@ def cmd_focus(session: ReplSession, args: str) -> None:
     if b_num is not None:
         bridges = getattr(session, "last_bookmark_bridges", {})
         if b_num not in bridges:
-            console.print(f"  [{WARNING}]Dialectic bridge [B{b_num}] not found. Run \\bookmark to view bridges.[/]")
+            console.print(f"  [{WARNING}]Semantic bridge [B{b_num}] not found. Run \\bookmark to view bridges.[/]")
             return
         bridge = bridges[b_num]
+        _check_bridge_staleness(session, bridge, b_num)
         _focus_bridge(session, bridge, b_num)
         return
 
@@ -320,6 +358,7 @@ def cmd_focus(session: ReplSession, args: str) -> None:
             return
         elif getattr(session, "last_bookmark_bridges", None) and idx in session.last_bookmark_bridges:
             bridge = session.last_bookmark_bridges[idx]
+            _check_bridge_staleness(session, bridge, idx)
             _focus_bridge(session, bridge, idx)
             return
 
@@ -541,7 +580,26 @@ def cmd_search(session: ReplSession, args: str) -> None:
     init_db()
     repo = TranscriptionRepository()
     cid = session.focus.id if (session.focus and session.focus.type == "school") else None
-    results = repo.search(query, limit=limit, session=session, community_id=cid)
+
+    # Synthesis router: hard-filter only for FTS5 (Option C — no soft boost).
+    # Rationale: Step 0 fixed FTS5's actual failure (ILIKE → BM25). There is
+    # no demonstrated FTS5 failure that soft-scope would address.
+    from audiobench.cli.repl.synthesis_router import get_synthesis_scope
+    router = get_synthesis_scope(session)
+    fts_work_ids = router.work_ids if router.mode == "hard" else None
+
+    results = repo.search(query, limit=limit, session=session, community_id=cid, work_ids=fts_work_ids)
+
+    # EC-13: Zero-results fallback for hard mode (FTS5).
+    # Same invariant as ANN path: unambiguous empty → expand, deferred for 1-3.
+    if not results and router.mode == "hard":
+        import logging as _logging
+        _logging.getLogger("audiobench.synthesis_router").info(
+            "EC-13 FTS5: hard-scope zero-results fallback for query=%r work_ids=%s",
+            query, router.work_ids,
+        )
+        console.print(f"  [{DIM}]No results in synthesis scope — expanding to full library.[/]")
+        results = repo.search(query, limit=limit, session=session, community_id=cid)
 
     if not results:
         scope_note = f" in {session.focus.label}" if cid else ""
@@ -550,7 +608,8 @@ def cmd_search(session: ReplSession, args: str) -> None:
         return
 
     # Display results
-    scope_badge = f"  [{ACCENT}]‹Scoped to {session.focus.label}›[/]" if cid else ""
+    router_badge = f"  [{ACCENT}]‹Scoped: {len(router.work_ids)} works›[/]" if router.mode == "hard" else ""
+    scope_badge = (f"  [{ACCENT}]‹Scoped to {session.focus.label}›[/]" if cid else "") + router_badge
     console.print(f"\n  [{BOLD}]Text Search — SQLite FTS5[/]  [{DIM}]\"{query}\"[/]{scope_badge}")
     console.print(f"  [{DIM}]{'─' * 50}[/]")
     for i, r in enumerate(results, 1):
@@ -903,7 +962,7 @@ _COMMAND_DOCS: dict[str, dict[str, Any]] = {
         "title": "Smart Contextual Bookmarking",
         "aliases": ["bm"],
         "syntax": "\\bookmark [id | cite <n> | list]",
-        "summary": "Two-tiered smart contextual bookmark cards (Narrative Arc + Dialectic Bridges).",
+        "summary": "Two-tiered smart contextual bookmark cards (Narrative Arc + Semantic Bridges).",
         "description": (
             "Generates rich two-tiered contextual bookmark cards:\n"
             "  • Tier 1 (The Narrative Arc): Local premise and resolution (|t1 - t2| ≥ 90s) within the same work.\n"
@@ -984,6 +1043,77 @@ _COMMAND_DOCS: dict[str, dict[str, Any]] = {
             "\\play pause              (Pause playback)",
         ],
         "flywheel": "While listening, type \\bookmark to save a smart card for this passage.",
+    },
+    "loop": {
+        "title": "A-B Loop Control",
+        "aliases": [],
+        "syntax": "\\loop [<start> <end> | clear]",
+        "summary": "Set or clear an A-B repeat loop on the current audio.",
+        "description": (
+            "Loops the audio between two timestamps indefinitely until cleared:\\n"
+            "  • \\loop 1:30 2:45  — Loop from 1m30s to 2m45s\\n"
+            "  • \\loop 90 165     — Same in raw seconds\\n"
+            "  • \\loop            — Show current loop bounds\\n"
+            "  • \\loop clear      — Cancel active loop"
+        ),
+        "examples": [
+            "\\loop 1:30 2:45         (Loop a 75-second passage)",
+            "\\loop clear             (Cancel loop)",
+        ],
+        "flywheel": "Combine with \\read to navigate chapters while a passage loops.",
+    },
+    "filter": {
+        "title": "Live DSP Audio Filter",
+        "aliases": [],
+        "syntax": "\\filter [<ffmpeg_filter> | clear]",
+        "summary": "Apply or remove a live audio filter (equalizer, bass boost, etc.).",
+        "description": (
+            "Applies an FFmpeg-style audio filter to the live playback stream:\\n"
+            "  • \\filter bass=g=5              — Boost bass +5dB\\n"
+            "  • \\filter treble=g=-3            — Cut treble -3dB\\n"
+            "  • \\filter equalizer=f=1k:g=-6   — Notch filter at 1kHz\\n"
+            "  • \\filter clear                  — Remove active filter"
+        ),
+        "examples": [
+            "\\filter bass=g=5                (Boost bass by 5dB)",
+            "\\filter clear                   (Remove filter)",
+        ],
+        "flywheel": "Useful when listening in noisy environments or on poor speakers.",
+    },
+    "chapters": {
+        "title": "Chapter Navigation",
+        "aliases": [],
+        "syntax": "\\chapters [<n>]",
+        "summary": "List chapters for the current file, or jump to chapter n.",
+        "description": (
+            "Shows all indexed chapters for the currently playing audio file.\\n"
+            "  • \\chapters       — List all chapters with timestamps\\n"
+            "  • \\chapters 3     — Jump to chapter 3 immediately\\n"
+            "Chapters are auto-seeded from the file's metadata on first play."
+        ),
+        "examples": [
+            "\\chapters               (Show chapter list)",
+            "\\chapters 3             (Jump to chapter 3)",
+        ],
+        "flywheel": "Use with \\read to navigate the synchronized transcript by chapter.",
+    },
+    "read": {
+        "title": "Chapter Reader TUI",
+        "aliases": [],
+        "syntax": "\\read [<transcript_id>]",
+        "summary": "Open the interactive chapter reader for the currently playing file.",
+        "description": (
+            "Launches the full-screen chapter reader with synchronized transcript,\\n"
+            "A-B loop, bookmarking, and visual selection. Local playback mode only\\n"
+            "(daemon attach — Phase 3b — not yet implemented).\\n"
+            "  • \\read              — Open reader for the current track\\n"
+            "  • \\read 592          — Open reader for transcript #592 (file must be playing)"
+        ),
+        "examples": [
+            "\\read                   (Open reader for current track)",
+            "\\read 592               (Open reader for transcript #592)",
+        ],
+        "flywheel": "Press b to bookmark, B to mark a region, s to toggle scroll lock.",
     },
     "workflow": {
         "title": "Command Workflows",
@@ -1295,7 +1425,7 @@ def _workflow_show(name: str) -> None:
 # ── Intelligence ──────────────────────────────────────────────
 
 def _resolve_thought_segment(
-    session_db: Any, expr_id: int, transcription_id: int, expr_content: str
+    session_db: Any, expr_id: int, transcription_id: int | None, expr_content: str
 ) -> tuple[float, float, str | None]:
     """Find start_time, end_time, and speaker for an expression."""
     from audiobench.storage.models import ExpressionSegmentMap, SegmentRecord
@@ -1308,12 +1438,14 @@ def _resolve_thought_segment(
             return float(seg.start_time), float(seg.end_time), seg.speaker
 
     # 2. Match against segments of the transcription
-    segs = (
-        session_db.query(SegmentRecord)
-        .filter_by(transcription_id=transcription_id)
-        .order_by(SegmentRecord.segment_index)
-        .all()
-    )
+    segs = []
+    if transcription_id:
+        segs = (
+            session_db.query(SegmentRecord)
+            .filter_by(transcription_id=transcription_id)
+            .order_by(SegmentRecord.segment_index)
+            .all()
+        )
     if not segs:
         try:
             from audiobench.storage.models import ExpressionRecord, ChapterRecord
@@ -1329,7 +1461,10 @@ def _resolve_thought_segment(
         return 0.0, 0.0, None
 
     content_clean = expr_content.strip()
-    words = [w for w in content_clean.split() if len(w) > 3]
+    from audiobench.core.constants import ENGLISH_STOP_WORDS
+    words = [w for w in content_clean.split() if len(w) >= 2 and w.lower() not in ENGLISH_STOP_WORDS]
+    if not words:
+        words = content_clean.split()
     prefix_words = " ".join(words[:4]) if len(words) >= 4 else content_clean[:30]
 
     for s in segs:
@@ -1432,9 +1567,9 @@ def _show_school_related(session: ReplSession, cid: int, args: str) -> None:
         console.print(f"    [{DIM}](No external school connections found above threshold)[/]")
     console.print()
 
-    # 2. Micro Dialectic Bridge Pairs (Two-Column Book Mode)
+    # 2. Micro Semantic Bridge Pairs (Two-Column Book Mode)
     console.print(
-        f"  [{BOLD}]Dialectic Bridge Passages[/] "
+        f"  [{BOLD}]Semantic Bridge Passages[/] "
         f"[{DIM}]({len(bridge_pairs)} cross-school bridge pairs · {'2-column book mode' if use_book else 'single column'})[/]"
     )
     console.print(f"  [{DIM}]{'─' * border_w}[/]\n")
@@ -2052,6 +2187,10 @@ def _render_smart_bookmark_card(
     session.last_bookmark_bridges = {
         i: b for i, b in enumerate(bridges[:3], 1)
     }
+    # Stamp which expression and citation this bridge set was built from, so
+    # cmd_play / cmd_focus can detect staleness via citation-EID comparison.
+    session.last_bookmark_bridges_for_eid = getattr(card, "expression_id", None)
+    session.last_bookmark_bridges_for_cite = cite_num
 
     term_width = (console.size.width if hasattr(console, "size") and console.size else None) or console.width or 80
     avail_w = max(40, term_width - 4)
@@ -2123,7 +2262,7 @@ def _render_smart_bookmark_card(
             left_lines.append(f"  [{DIM}](Concluding or open-ended chapter segment)[/]")
 
         right_lines: list[str] = []
-        right_lines.append(f"[{BOLD} {ACCENT}]Tier 2: Dialectic Bridges[/]")
+        right_lines.append(f"[{BOLD} {ACCENT}]Tier 2: Semantic Bridges[/]")
         right_lines.append(f"[{DIM}]Cross-library conceptual connections[/]")
         right_lines.append("")
         if bridges:
@@ -2143,7 +2282,7 @@ def _render_smart_bookmark_card(
                     right_lines.append(f"  [{DIM}]{w}[/]")
                 right_lines.append("")
         else:
-            right_lines.append(f"  [{DIM}](No cross-library dialectic bridges detected)[/]")
+            right_lines.append(f"  [{DIM}](No cross-library semantic bridges detected)[/]")
 
         max_rows = max(len(left_lines), len(right_lines))
         for r_i in range(max_rows):
@@ -2174,7 +2313,7 @@ def _render_smart_bookmark_card(
             tbl.add_row(f"  [{DIM}](Concluding or open-ended chapter segment)[/]")
         tbl.add_row("")
         tbl.add_row(Rule(style=DIM))
-        tbl.add_row(f"[{BOLD} {ACCENT}]Tier 2: Dialectic Bridges[/] [{DIM}](Cross-library conceptual connections)[/]")
+        tbl.add_row(f"[{BOLD} {ACCENT}]Tier 2: Semantic Bridges[/] [{DIM}](Cross-library conceptual connections)[/]")
         if bridges:
             for idx, b in enumerate(bridges[:3], 1):
                 clique_flag = f" [{ACCENT}][Consensus Partner][/]" if b.is_clique_partner else ""
@@ -2187,7 +2326,7 @@ def _render_smart_bookmark_card(
                     tbl.add_row(f"  [{DIM}]{w}[/]")
                 tbl.add_row("")
         else:
-            tbl.add_row(f"  [{DIM}](No cross-library dialectic bridges detected)[/]")
+            tbl.add_row(f"  [{DIM}](No cross-library semantic bridges detected)[/]")
         group_items.append(tbl)
 
     # Docked Quick Actions Toolbar
@@ -2283,6 +2422,55 @@ def cmd_bookmark(session: ReplSession, args: str) -> None:
         console.print(f"  [{WARNING}]Could not generate bookmark card for #{expr_id}: {e}[/]")
 
 
+
+def render_synthesis_footer(resp: "SynthesisResponse") -> None:  # type: ignore[name-defined]
+    """Render the synthesis diagnostics footer below the main synthesis output.
+
+    Surfaces three signals that help the user understand retrieval behaviour:
+      1. Total sources and elapsed time + model used
+      2. Per-author cap signal — which authors were capped, so the user knows
+         why the result has fewer than top_k fragments for a single-author query
+      3. LLM fallback signal — when Ollama failed and Gemini was the actual model
+
+    This is a named helper rather than inline code so any future display path
+    can call ``render_synthesis_footer(resp)`` and get the same contract.
+    """
+    from audiobench.memory.synthesis_retriever import RetrievalMeta  # local import avoids circularity
+
+    meta: RetrievalMeta | None = resp.retrieval_meta
+
+    n_frags = len(resp.fragments)
+    elapsed = resp.elapsed_seconds
+    model = resp.model_used
+
+    # --- Line 1: sources + timing + model ------------------------------------
+    top_k_val = getattr(resp, "top_k", None)
+    top_k_str = f" (top_k={top_k_val})" if top_k_val is not None else ""
+    console.print(f"  [{DIM}]{n_frags} source{'s' if n_frags != 1 else ''}{top_k_str} · {elapsed:.2f}s · {model}[/]")
+
+    # --- Line 2: per-author cap signal (only when cap actually fired) --------
+    if meta and meta.capped_authors:
+        cap_lines = []
+        for a in sorted(meta.capped_authors):
+            pool_n = meta.author_counts_pool.get(a, "?")
+            cap_lines.append(f"{a} ({pool_n} in pool, capped at 6)")
+        console.print(
+            f"  [{ACCENT}]ⓘ Per-author cap fired:[/] [{DIM}]{' · '.join(cap_lines)}[/]"
+        )
+
+    # --- Line 3: LLM fallback signal (only when Ollama failed) ---------------
+    if resp.fallback_from == "ollama" and resp.fallback_reason:
+        reason_short = str(resp.fallback_reason)[:80]
+        console.print(
+            f"  [{WARNING}]ⓘ Ollama unavailable ({reason_short}) — used {model} as fallback.[/]"
+        )
+    elif resp.model_used == "digest_fallback":
+        fb_reason = str(resp.fallback_reason or "")[:80]
+        console.print(
+            f"  [{WARNING}]ⓘ Both LLM providers failed ({fb_reason}) — showing grounded digest.[/]"
+        )
+
+
 @register_backslash("synthesize")
 @register_backslash("synth")
 def cmd_synthesize(session: ReplSession, args: str) -> None:
@@ -2308,15 +2496,16 @@ def cmd_synthesize(session: ReplSession, args: str) -> None:
         from rich.markdown import Markdown
 
         resp = generate_synthesis(query, community_id=scoped_cid)
-        # Populate interactive flywheel citation map
+        # Populate interactive flywheel citation map.
+        # Unconditional overwrite — newest synthesis always wins (EC-11).
         session.last_synthesis_citations = resp.citations
+        session._synthesis_command_snapshot = max(1, session._command_count)
 
         console.print("")
         console.print(Markdown(resp.synthesis_text))
         console.print("")
 
         if resp.fragments:
-            console.print(f"  [{DIM}]Sources ({resp.elapsed_seconds:.2f}s | {resp.model_used}):[/]")
             playable_indices = [idx for idx, f in enumerate(resp.fragments, 1) if getattr(f, "is_playable", True)]
             text_indices = [idx for idx, f in enumerate(resp.fragments, 1) if not getattr(f, "is_playable", True)]
 
@@ -2328,6 +2517,9 @@ def cmd_synthesize(session: ReplSession, args: str) -> None:
                     f"    [{ACCENT}][{idx}][/] [{author_style}]{f.author}[/] — [{DIM}]{f.work_title}[/] "
                     f"(EffRel: {f.effective_rel:.3f}){clique_flag}"
                 )
+
+            # Footer: sources count, timing, model, cap signal, fallback signal
+            render_synthesis_footer(resp)
 
             # Build clean, differentiated Flywheel prompt
             if playable_indices and text_indices:
@@ -3325,7 +3517,7 @@ def _play_school(session: ReplSession, cid: int, client: Any) -> None:
             e_id, tx_id, w_id, content, af_id, file_name, file_path, work_title, work_author, chap_start_time = res
             if not file_path:
                 continue
-            start_time, end_time, speaker = _resolve_thought_segment(sdb, e_id, tx_id or 0, content)
+            start_time, end_time, speaker = _resolve_thought_segment(sdb, e_id, tx_id, content)
             if start_time == 0.0 and chap_start_time > 0.0:
                 start_time = float(chap_start_time)
             playable_items.append({
@@ -3382,7 +3574,7 @@ def _play_school(session: ReplSession, cid: int, client: Any) -> None:
 
 def _resolve_expression_playback_info(
     session_db: Any, expr_id: int
-) -> tuple[int, int, int | None, str, int | None, str | None, str | None, str | None, str | None, float]:
+) -> tuple[int, int | None, int | None, str, int | None, str | None, str | None, str | None, str | None, float]:
     """Retrieve playback metadata for any expression, coalescing transcriptions and chapters.
 
     Returns:
@@ -3393,7 +3585,19 @@ def _resolve_expression_playback_info(
     row = session_db.execute(
         _sql("""
             SELECT e.id,
-                   COALESCE(t.id, 0) as transcription_id,
+                   COALESCE(
+                       t.id,
+                       c.transcription_id,
+                       c2.transcription_id,
+                       (SELECT t_sub.id FROM transcriptions t_sub 
+                        WHERE t_sub.audio_file_id = COALESCE(c.audio_file_id, c2.audio_file_id) 
+                        ORDER BY (CASE WHEN t_sub.status IN ('complete', 'completed') THEN 2
+                                       WHEN t_sub.segment_count > 0 THEN 1
+                                       ELSE 0 END) DESC, 
+                                 t_sub.segment_count DESC, 
+                                 t_sub.id DESC 
+                        LIMIT 1)
+                   ) as transcription_id,
                    e.work_id,
                    e.content,
                    COALESCE(t.audio_file_id, c.audio_file_id, c2.audio_file_id) as audio_file_id,
@@ -3415,9 +3619,9 @@ def _resolve_expression_playback_info(
         {"eid": expr_id},
     ).fetchone()
     if not row:
-        return (expr_id, 0, None, "", None, None, None, None, None, 0.0)
+        return (expr_id, None, None, "", None, None, None, None, None, 0.0)
     eid = row[0]
-    tx_id = row[1]
+    tx_id = int(row[1]) if row[1] is not None else None
     wid = row[2]
     content = row[3]
     af_id = row[4]
@@ -3480,7 +3684,7 @@ def _play_expression(
             console.print(f"  [{WARNING}]Could not locate audio file{tag} (Expression #{expr_id}).[/]")
             return False
 
-        start_time, end_time, speaker = _resolve_thought_segment(sdb, eid, tx_id or 0, content)
+        start_time, end_time, speaker = _resolve_thought_segment(sdb, eid, tx_id, content)
         if start_time == 0.0 and chap_start_time > 0.0:
             start_time = float(chap_start_time)
 
@@ -3554,7 +3758,7 @@ def cmd_play(session: ReplSession, args: str) -> None:
         _play_expression(session, client, expr_id, label=f"citation [{cite_num}]")
         return
 
-    # Dialectic bridge playback from bookmark: \play b1, \play b2, \play b3 (or \play bridge 1)
+    # Semantic bridge playback from bookmark: \play b1, \play b2, \play b3 (or \play bridge 1)
     b_idx: int | None = None
     if lower_play.startswith("b") and lower_play[1:].isdigit():
         b_idx = int(lower_play[1:])
@@ -3564,9 +3768,10 @@ def cmd_play(session: ReplSession, args: str) -> None:
     if b_idx is not None:
         bridges = getattr(session, "last_bookmark_bridges", {})
         if b_idx not in bridges:
-            console.print(f"  [{WARNING}]Dialectic bridge [B{b_idx}] not found. Run \\bookmark to view bridges.[/]")
+            console.print(f"  [{WARNING}]Semantic bridge [B{b_idx}] not found. Run \\bookmark to view bridges.[/]")
             return
         bridge = bridges[b_idx]
+        _check_bridge_staleness(session, bridge, b_idx)
         _play_expression(session, client, bridge.target_expression_id, label=f"bridge [B{b_idx}]")
         return
 
@@ -3602,6 +3807,7 @@ def cmd_play(session: ReplSession, args: str) -> None:
                 return
         elif getattr(session, "last_bookmark_bridges", None) and idx in session.last_bookmark_bridges:
             bridge = session.last_bookmark_bridges[idx]
+            _check_bridge_staleness(session, bridge, idx)
             _play_expression(session, client, bridge.target_expression_id, label=f"bridge [B{idx}]")
             return
 
@@ -3750,6 +3956,585 @@ def cmd_karaoke(session: ReplSession, args: str) -> None:
 @_playback_backslash("/follow")
 def cmd_follow(session: ReplSession, args: str) -> None:
     """Launch interactive live lyrics / karaoke follow HUD (alias for \\lyrics)."""
+
+
+# ── Phase 5: loop / filter / chapters / read ─────────────────
+
+
+@register_backslash("loop")
+def cmd_loop(session: ReplSession, args: str) -> None:
+    """Set or clear an A-B loop on the current audio.
+
+    Usage:
+      \\loop <start> <end>   Engage A-B loop between two timestamps
+      \\loop clear           Cancel active loop
+      \\loop off             Cancel active loop (alias)
+
+    Timestamps can be seconds (90) or MM:SS (1:30).
+    """
+    from audiobench.daemon.factory import get_daemon_client
+    from audiobench.playback.controls import fmt_timestamp
+
+    client = get_daemon_client()
+
+    arg = args.strip().lower()
+
+    if arg in ("clear", "off", ""):
+        if arg == "":
+            # Bare \loop → show current loop state
+            st = client.playback_status()
+            loop_a = st.get("loop_a")
+            loop_b = st.get("loop_b")
+            if loop_a is not None and loop_b is not None:
+                console.print(
+                    f"  [{SUCCESS}]A-B loop:[/] {fmt_timestamp(loop_a)} → {fmt_timestamp(loop_b)}"
+                )
+            else:
+                console.print(f"  [{DIM}]No active loop. Usage: \\loop <start> <end>[/]")
+            return
+        # clear / off
+        try:
+            result = client.playback_clear_loop()
+            if result.get("error"):
+                console.print(f"  [{WARNING}]Could not clear loop: {result.get('error')}[/]")
+            else:
+                console.print(f"  [{SUCCESS}]Loop cleared.[/]")
+        except Exception as exc:
+            console.print(f"  [{WARNING}]Could not clear loop: {exc}[/]")
+        return
+
+    # Parse "start end" — accept seconds or MM:SS
+    def _parse_ts(s: str) -> float | None:
+        s = s.strip()
+        if ":" in s:
+            parts = s.split(":")
+            try:
+                if len(parts) == 2:
+                    return int(parts[0]) * 60 + float(parts[1])
+                if len(parts) == 3:
+                    return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+            except ValueError:
+                return None
+        try:
+            return float(s)
+        except ValueError:
+            return None
+
+    parts = arg.split()
+    if len(parts) != 2:
+        console.print(
+            f"  [{WARNING}]Usage: \\loop <start> <end>  or  \\loop clear[/]\n"
+            f"  [{DIM}]Example: \\loop 1:30 2:45[/]"
+        )
+        return
+
+    start = _parse_ts(parts[0])
+    end = _parse_ts(parts[1])
+    if start is None or end is None:
+        console.print(f"  [{WARNING}]Could not parse timestamps: {args!r}[/]")
+        return
+    if end <= start:
+        console.print(f"  [{WARNING}]End ({fmt_timestamp(end)}) must be after start ({fmt_timestamp(start)}).[/]")
+        return
+
+    try:
+        result = client.playback_loop_segment(start, end)
+        if result.get("error"):
+            console.print(f"  [{WARNING}]Could not set loop: {result.get('error')}[/]")
+        else:
+            console.print(
+                f"  [{SUCCESS}]Loop requested:[/] {fmt_timestamp(start)} → {fmt_timestamp(end)}"
+            )
+    except Exception as exc:
+        console.print(f"  [{WARNING}]Could not set loop: {exc}[/]")
+
+
+@register_backslash("filter")
+def cmd_filter(session: ReplSession, args: str) -> None:
+    """Apply or clear a live DSP audio filter.
+
+    Usage:
+      \\filter <filter_string>    Apply ffmpeg-style audio filter
+      \\filter clear              Remove active filter
+      \\filter off                Remove active filter (alias)
+      \\filter                    Show current filter
+
+    Example filters:
+      equalizer=f=1000:width_type=o:width=2:g=-6   Notch 1kHz
+      bass=g=5                                       Boost bass +5dB
+      treble=g=-3                                    Cut treble -3dB
+    """
+    from audiobench.daemon.factory import get_daemon_client
+
+    client = get_daemon_client()
+    arg = args.strip()
+
+    if arg.lower() in ("clear", "off"):
+        try:
+            result = client.playback_set_filter("")
+            if result.get("error"):
+                console.print(f"  [{WARNING}]Could not clear filter: {result.get('error')}[/]")
+            else:
+                console.print(f"  [{SUCCESS}]Filter cleared.[/]")
+        except Exception as exc:
+            console.print(f"  [{WARNING}]Could not clear filter: {exc}[/]")
+        return
+
+    if not arg:
+        st = client.playback_status()
+        flt = st.get("filter")
+        if flt:
+            console.print(f"  [{SUCCESS}]Active filter:[/] [{DIM}]{flt}[/]")
+        else:
+            console.print(f"  [{DIM}]No active filter. Usage: \\filter <ffmpeg_filter_string>[/]")
+        return
+
+    try:
+        result = client.playback_set_filter(arg)
+        if result.get("error"):
+            console.print(f"  [{WARNING}]Could not apply filter: {result.get('error')}[/]")
+        else:
+            console.print(f"  [{SUCCESS}]Filter applied:[/] [{DIM}]{arg}[/]")
+    except Exception as exc:
+        console.print(f"  [{WARNING}]Could not apply filter: {exc}[/]")
+
+
+
+
+def _render_chapters_table(console, st: dict, chapters: list) -> None:  # noqa: ANN001
+    """Render full chapter list table."""
+    from audiobench.playback.controls import fmt_timestamp
+
+    pos = float(st.get("position", 0.0))
+    console.print(f"\n  [{BOLD}]Chapters ({len(chapters)})[/]")
+    console.print(f"  [{DIM}]{'─' * 48}[/]")
+    for ch in chapters:
+        active = (
+            ch.start_time <= pos
+            and (
+                ch == chapters[-1]
+                or pos < chapters[chapters.index(ch) + 1].start_time
+            )
+        )
+        marker = f"[{ACCENT}]▶[/] " if active else "  "
+        title_str = ch.title or f"Chapter {ch.index}"
+        console.print(
+            f"  {marker}[{DIM}]{ch.index:>2}[/]  "
+            f"[{ACCENT}]{fmt_timestamp(ch.start_time):<9}[/] {title_str}"
+        )
+    console.print()
+
+
+def _render_chapters_hud(console, st: dict, chapters: list, client) -> None:  # noqa: ANN001
+    """Render the rich chapters HUD: timeline bar, 3-node runway, 3-tone transcript.
+
+    Args:
+        console: Rich Console instance.
+        st:       Current playback status dict.
+        chapters: Ordered list of ChapterInfo objects for the playing file.
+        client:   Daemon client (for playback_context).
+    """
+    from audiobench.playback.controls import fmt_timestamp
+
+    pos = float(st.get("position", 0.0))
+    total = float(st.get("duration") or 0.0)
+    if total <= 0.0 and chapters:
+        total = max(float(chapters[-1].end_time), pos)
+    n_chapters = len(chapters)
+
+    # ── 1. Identify active / prev / next chapters ─────────────────────────
+    active_idx: int = 0
+    for i, ch in enumerate(chapters):
+        ch_end = chapters[i + 1].start_time if i + 1 < n_chapters else float("inf")
+        if ch.start_time <= pos < ch_end:
+            active_idx = i
+            break
+    else:
+        active_idx = max(0, n_chapters - 1)
+
+    act_ch = chapters[active_idx]
+    prev_ch = chapters[active_idx - 1] if active_idx > 0 else None
+    next_ch = chapters[active_idx + 1] if active_idx + 1 < n_chapters else None
+
+    # ── 2. Book-level progress header ────────────────────────────────────
+    chapter_label = f"Chapter {act_ch.index} of {n_chapters}"
+    console.print(
+        f"\n  [{BOLD}]Book Progress:[/] "
+        f"[bold cyan]{fmt_timestamp(pos)}[/bold cyan] "
+        f"[{DIM}]/ {fmt_timestamp(total)}[/]"
+        f"  [{DIM}][{chapter_label}][/]"
+    )
+
+    # ── 3. Proportional timeline bar ─────────────────────────────────────
+    try:
+        term_w = int(console.size.width)
+    except Exception:
+        term_w = 80
+    term_w = max(40, term_w)
+    bar_w = min(term_w - 4, 80)
+
+    # Chapter progress stats
+    act_start = act_ch.start_time
+    act_end = next_ch.start_time if next_ch else total
+    act_dur = max(act_end - act_start, 1.0)
+    act_elapsed = max(0.0, pos - act_start)
+    act_pct = min(1.0, act_elapsed / act_dur)
+    act_pct_int = int(act_pct * 100)
+    act_remaining = max(0.0, act_dur - act_elapsed)
+
+    if total > 0 and bar_w >= 10 and n_chapters * 3 <= bar_w:
+        raw: list[float] = []
+        for i, ch in enumerate(chapters):
+            ch_end = chapters[i + 1].start_time if i + 1 < n_chapters else total
+            dur = max(ch_end - ch.start_time, 0.0)
+            raw.append(dur / total * bar_w)
+
+        allocated = [max(2, int(r)) for r in raw]
+        excess = sum(allocated) - bar_w
+        if excess > 0:
+            order = sorted(range(n_chapters), key=lambda x: -allocated[x])
+            for idx in order:
+                if excess <= 0:
+                    break
+                trim = min(excess, allocated[idx] - 2)
+                allocated[idx] -= trim
+                excess -= trim
+        elif excess < 0:
+            deficit = -excess
+            order = sorted(range(n_chapters), key=lambda x: -allocated[x])
+            for idx in order:
+                if deficit <= 0:
+                    break
+                allocated[idx] += 1
+                deficit -= 1
+
+        top = "┌" + "┬".join("─" * s_w for s_w in allocated) + "┐"
+
+        mid_cells: list[str] = []
+        for ch, s_w in zip(chapters, allocated):
+            lbl = str(ch.index).zfill(2) if ch.index < 10 else str(ch.index)
+            if s_w < len(lbl):
+                lbl = lbl[:s_w]
+            mid_cells.append(lbl.center(s_w))
+        mid = "│" + "│".join(mid_cells) + "│"
+
+        bot_segments: list[str] = []
+        cursor_abs_col = 1
+        arrow_col = 1
+        for i, (ch, s_w) in enumerate(zip(chapters, allocated)):
+            if i == active_idx:
+                off = int(act_pct * s_w)
+                off = max(0, min(off, s_w - 1))
+                seg_chars = list("─" * s_w)
+                seg_chars[off] = "▲"
+                bot_segments.append("".join(seg_chars))
+                arrow_col = cursor_abs_col + off
+            else:
+                bot_segments.append("─" * s_w)
+            cursor_abs_col += s_w + 1
+
+        bot = "└" + "┴".join(bot_segments) + "┘"
+        arrow_line = " " * (arrow_col + 2) + f"└─ ▶ Ch {act_ch.index}: {act_ch.title or 'Untitled'}"
+
+        console.print(f"  [{DIM}]{top}[/]")
+        console.print(f"  [{DIM}]{mid}[/]")
+        console.print(f"  [{DIM}]{bot}[/]")
+        console.print(f"  [bold cyan]{arrow_line}[/bold cyan]")
+    else:
+        console.print(
+            f"  [{DIM}]▶ Chapter {act_ch.index}: {act_ch.title or 'Untitled'}[/]"
+        )
+
+    console.print()
+
+    # ── 4. 3-Node Runway ─────────────────────────────────────────────────
+    col1_w = max(26, int(term_w * 0.30))
+    col2_w = max(36, int(term_w * 0.42))
+
+    BAR_LEN = 14
+    filled = int(act_pct * BAR_LEN)
+    filled = max(0, min(filled, BAR_LEN))
+    bar_filled = "━" * filled
+    bar_empty = "─" * (BAR_LEN - filled)
+    nib = "╸" if filled < BAR_LEN else ""
+    act_bar = f"[{bar_filled}{nib}{bar_empty}]"
+
+    prev_title = (prev_ch.title or f"Ch {prev_ch.index}") if prev_ch else "—"
+    next_title = (next_ch.title or f"Ch {next_ch.index}") if next_ch else "—"
+    act_title = act_ch.title or f"Ch {act_ch.index}"
+
+    # Header row
+    prev_hdr = "◀ PREVIOUS" if prev_ch else ""
+    act_hdr = f"◈ ACTIVE ({act_pct_int}% • {fmt_timestamp(act_remaining)} left)"
+    next_hdr = "▶ NEXT" if next_ch else ""
+
+    console.print(
+        f"  [{DIM}]{prev_hdr:<{col1_w}}[/]"
+        f"  [bold cyan]{act_hdr:^{col2_w}}[/bold cyan]"
+        f"  [{DIM}]{next_hdr}[/]"
+    )
+
+    # Title row
+    prev_t = f"Ch {prev_ch.index}: {prev_title}" if prev_ch else ""
+    act_t = f"Ch {act_ch.index}: {act_title}"
+    next_t = f"Ch {next_ch.index}: {next_title}" if next_ch else ""
+
+    def _trunc(s: str, w: int) -> str:
+        return s[:w - 1] + "…" if len(s) > w else s
+
+    console.print(
+        f"  [{DIM}]{_trunc(prev_t, col1_w):<{col1_w}}[/]"
+        f"  [bold cyan]{_trunc(act_t, col2_w):^{col2_w}}[/bold cyan]"
+        f"  [{DIM}]{next_t}[/]"
+    )
+
+    # Timestamps + progress bar row
+    prev_dur = (prev_ch.end_time - prev_ch.start_time) if prev_ch else 0.0
+    prev_ts = (
+        f"{fmt_timestamp(prev_ch.start_time)} ({fmt_timestamp(prev_dur)})  ✓ Finished"
+        if prev_ch else ""
+    )
+    act_ts = (
+        f"{fmt_timestamp(act_ch.start_time)} → "
+        f"{fmt_timestamp(act_end)} {act_bar}"
+    )
+    next_dur = (next_ch.end_time - next_ch.start_time) if next_ch else 0.0
+    next_ts = (
+        f"{fmt_timestamp(next_ch.start_time)} ({fmt_timestamp(next_dur)})"
+        if next_ch else ""
+    )
+
+    console.print(
+        f"  [{DIM}]{_trunc(prev_ts, col1_w):<{col1_w}}[/]"
+        f"  [bold cyan]{_trunc(act_ts, col2_w):^{col2_w}}[/bold cyan]"
+        f"  [{DIM}]{next_ts}[/]"
+    )
+    console.print()
+
+    # ── 5. 3-Tone Transcript Segment Flow ────────────────────────────────
+    try:
+        ctx = client.playback_context(position=pos, window=2)
+        if isinstance(ctx, dict):
+            segments = ctx.get("segments") or []
+            cur_i = ctx.get("current_idx", -1)
+
+            if isinstance(segments, list) and isinstance(cur_i, int) and cur_i >= 0:
+                ch_seg_start = act_ch.start_time
+                ch_seg_end = act_end
+
+                before: list[dict] = []
+                active_seg: dict | None = None
+                after: list[dict] = []
+
+                for i, seg in enumerate(segments):
+                    if not isinstance(seg, dict):
+                        continue
+                    seg_start = float(seg.get("norm_start", seg.get("start", 0)))
+                    if seg_start < ch_seg_start or seg_start >= ch_seg_end:
+                        continue
+                    if i < cur_i:
+                        before.append(seg)
+                    elif i == cur_i:
+                        active_seg = seg
+                    else:
+                        after.append(seg)
+
+                prev_seg = before[-1] if before else None
+                next_seg = after[0] if after else None
+
+                def _seg_line(seg: dict, indent: str = "    ") -> str:
+                    ts = fmt_timestamp(float(seg.get("norm_start", seg.get("start", 0))))
+                    text = seg.get("text", "").strip()
+                    return f"{indent}{ts}  {text}"
+
+                if prev_seg:
+                    console.print(f"[{DIM}]{_seg_line(prev_seg)}[/]")
+
+                if active_seg:
+                    ts = fmt_timestamp(float(active_seg.get("norm_start", active_seg.get("start", 0))))
+                    text = active_seg.get("text", "").strip()
+                    console.print(f"  [bold cyan]▶ {ts}  {text}[/bold cyan]")
+
+                if next_seg:
+                    console.print(f"[{DIM}][italic]{_seg_line(next_seg)}[/italic][/]")
+                console.print()
+    except Exception:
+        pass  # Transcript unavailable — render gracefully without it
+
+    # ── 6. Footer hint ───────────────────────────────────────────────────
+    console.print(
+        f"  [{DIM}]Tip: \\chapters <n> to jump"
+        f"  •  \\chapters all for full table"
+        f"  •  \\read for interactive reader[/]\n"
+    )
+
+
+@register_backslash("chapters")
+def cmd_chapters(session: ReplSession, args: str) -> None:
+    """Show chapter list for the currently playing file.
+
+    Usage:
+      \\chapters              List chapters with HUD runway and progress
+      \\chapters all          List all chapters in full table format
+      \\chapters <n>          Jump to chapter n
+    """
+    from audiobench.daemon.factory import get_daemon_client
+    from audiobench.playback.controls import fmt_timestamp
+    from audiobench.storage.chapter_repository import get_chapter_repo
+
+    client = get_daemon_client()
+    arg = args.strip()
+
+    # Resolve current audio_file_id from playback status
+    st = client.playback_status()
+    if not st.get("playing"):
+        console.print(f"  [{DIM}]Nothing is playing. Start playback first.[/]")
+        return
+
+    audio_file_id = st.get("audio_file_id")
+    if not audio_file_id:
+        console.print(f"  [{DIM}]No audio file ID available for current track.[/]")
+        return
+
+    ch_repo = get_chapter_repo()
+    chapters = ch_repo.get_chapters_for_file(audio_file_id)
+
+    if not chapters:
+        console.print(f"  [{DIM}]No chapters indexed for this file. Chapters auto-seed on first play.[/]")
+        return
+
+    # Jump to chapter n
+    if arg.isdigit():
+        n = int(arg)
+        match = next((c for c in chapters if c.index == n), None)
+        if match is None:
+            console.print(f"  [{WARNING}]Chapter {n} not found (file has {len(chapters)} chapters).[/]")
+            return
+        client.playback_seek(match.start_time)
+        title_str = f" — {match.title}" if match.title else ""
+        console.print(
+            f"  [{SUCCESS}]Jumped to Chapter {n}{title_str}[/] "
+            f"[{DIM}]({fmt_timestamp(match.start_time)})[/]"
+        )
+        return
+
+    # Full table format
+    if arg.lower() == "all":
+        _render_chapters_table(console, st, chapters)
+        return
+
+    # ── Rich chapter display ─────────────────────────────────────────────
+    _render_chapters_hud(console, st, chapters, client)
+
+
+
+@register_backslash("read")
+def cmd_read(session: ReplSession, args: str) -> None:
+    """Open the chapter reader TUI for the currently playing file.
+
+    Displays synchronized transcript with A-B loop, bookmark, and
+    visual-selection controls. Local playback only for now — daemon
+    mode (Phase 3b) not yet implemented.
+
+    Usage:
+      \\read                  Open reader for currently playing track
+      \\read <transcript_id>  Open reader for a specific transcript
+    """
+    from audiobench.daemon.factory import get_daemon_client
+    from audiobench.daemon.client import DaemonClient
+
+    client = get_daemon_client()
+
+    # ── Acquire service adapter: daemon proxy vs local service ──
+    if isinstance(client, DaemonClient):
+        from audiobench.playback.daemon_proxy import DaemonPlaybackProxy
+        service = DaemonPlaybackProxy(client)
+    else:
+        from audiobench.playback.service import get_playback_service
+        service = get_playback_service()
+
+    st = service.status()
+
+    arg = args.strip()
+
+    # If a transcript ID is given, load it explicitly
+    if arg.isdigit():
+        transcription_id = int(arg)
+        audio_file_id = None
+        title = None
+    elif st.get("playing") or arg == "":
+        # Use currently playing track
+        transcription_id = st.get("transcription_id")
+        audio_file_id = st.get("audio_file_id")
+        title = None
+        if not (transcription_id or audio_file_id):
+            console.print(
+                f"  [{WARNING}]Nothing is playing and no transcript ID given.[/]\n"
+                f"  [{DIM}]Usage: \\read  or  \\read <transcript_id>[/]"
+            )
+            return
+    else:
+        console.print(
+            f"  [{WARNING}]Nothing is playing. Start playback first, or specify a transcript ID.[/]\n"
+            f"  [{DIM}]Usage: \\read  or  \\read <transcript_id>[/]"
+        )
+        return
+
+    # ── Load segments from DB ─────────────────────────────────
+    from audiobench.storage.repository import TranscriptionRepository
+
+    repo = TranscriptionRepository()
+    record = None
+
+    if transcription_id:
+        record = repo.get_by_id(int(transcription_id), session=None)
+    elif audio_file_id:
+        best_id = None
+        try:
+            from audiobench.cli.commands.play import _find_best_transcript_for_file
+            from audiobench.storage.models import AudioFileRecord
+            from audiobench.core.db_session import get_session
+            from sqlalchemy import text as _sql
+
+            with get_session() as sdb:
+                row = sdb.execute(
+                    _sql("SELECT file_path FROM audio_files WHERE id = :id"),
+                    {"id": audio_file_id},
+                ).fetchone()
+                if row:
+                    best_id = _find_best_transcript_for_file(repo, row[0])
+        except Exception:
+            pass
+        if best_id:
+            record = repo.get_by_id(best_id, session=None)
+
+    segments: list[dict] = []
+    if record:
+        segments = record.get("segments", []) or []
+        transcription_id = transcription_id or record.get("id")
+        audio_file_id = audio_file_id or record.get("audio_file_id")
+        title = record.get("file_name")
+
+    if not segments:
+        console.print(
+            f"  [{WARNING}]No transcript segments found for this track.[/]\n"
+            f"  [{DIM}]Transcribe the file first: audiobench transcribe <file>[/]"
+        )
+        return
+
+    if not st.get("playing"):
+        console.print(f"  [{DIM}]Note: nothing is playing — reader will open in paused state.[/]")
+
+    # ── Launch reader ─────────────────────────────────────────
+    from audiobench.cli.tui.chapter_reader import open_reader
+
+    open_reader(
+        service,
+        title=title or f"Transcript #{transcription_id}",
+        transcription_id=transcription_id,
+        audio_file_id=audio_file_id,
+        raw_segments=segments,
+    )
 
 
 @register_backslash("info")

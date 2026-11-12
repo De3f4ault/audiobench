@@ -175,15 +175,26 @@ def _load_segments_for_playback(
 
     from audiobench.storage.models import SegmentRecord, TranscriptionRecord
     from audiobench.core.db_session import get_session
+    from sqlalchemy import case
+
+    status_priority = case(
+        (TranscriptionRecord.pipeline_phase.in_(["complete", "completed"]), 2),
+        (TranscriptionRecord.segment_count > 0, 1),
+        else_=0,
+    )
 
     # 1. Try finding transcription_id if missing
-    if tid is None and af_id is not None:
+    if not tid and af_id is not None:
         try:
             with get_session() as session:
                 rec = (
                     session.query(TranscriptionRecord)
                     .filter_by(audio_file_id=af_id)
-                    .order_by(TranscriptionRecord.id.desc())
+                    .order_by(
+                        status_priority.desc(),
+                        TranscriptionRecord.segment_count.desc(),
+                        TranscriptionRecord.id.desc(),
+                    )
                     .first()
                 )
                 if rec:
@@ -193,7 +204,7 @@ def _load_segments_for_playback(
         except Exception:
             pass
 
-    if tid is None and file_p:
+    if not tid and file_p:
         try:
             from audiobench.storage.models import AudioFileRecord
 
@@ -207,7 +218,11 @@ def _load_segments_for_playback(
                     rec = (
                         session.query(TranscriptionRecord)
                         .filter_by(audio_file_id=af.id)
-                        .order_by(TranscriptionRecord.id.desc())
+                        .order_by(
+                            status_priority.desc(),
+                            TranscriptionRecord.segment_count.desc(),
+                            TranscriptionRecord.id.desc(),
+                        )
                         .first()
                     )
                     if rec:
@@ -219,7 +234,7 @@ def _load_segments_for_playback(
 
     # 2. Load segments if tid is found
     raw_segments: list[dict] = []
-    if tid is not None:
+    if tid:
         try:
             with get_session() as session:
                 rows = (
