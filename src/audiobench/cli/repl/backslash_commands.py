@@ -949,17 +949,29 @@ _COMMAND_DOCS: dict[str, dict[str, Any]] = {
     "synthesize": {
         "title": "Synthesize (Dialectic Graph MMR)",
         "aliases": ["synth"],
-        "syntax": "\\synthesize <thematic query or philosophical question>",
+        "syntax": "\\synthesize [--focused[=NAME]] [--author NAME] <thematic query>",
         "summary": "Synthesize cross-library perspectives using Graph-Augmented MMR and local LLM.",
         "description": (
             "Executes Blended-Relevance Graph MMR (α=0.60, λ=0.55) to surface non-redundant, "
             "author-diverse perspectives from across your library. Traverses cross-work semantic "
             "bridges (w ≥ 0.78) and detects Triadic Cliques (+0.10 boost). Generates structured "
-            "Points of Convergence vs Divergence with inline bracketed citations [1], [2], [3]."
+            "Points of Convergence vs Divergence with inline bracketed citations [1], [2], [3].\n\n"
+            "Options & Flags:\n"
+            "  --focused             Bypass per-author cap (6) for all authors in retrieval pool\n"
+            "  --focused=NAME        Filter to author NAME and uncap within that author\n"
+            "  --author NAME, -a     Filter to author NAME (per-author cap still applies at 6)\n"
+            "  --focused --author N  Combine flags to filter to author N and uncap\n\n"
+            "Author Matching & MMR Semantics:\n"
+            "  • Author Matching: --author matches full words only (e.g. 'Nick' matches 'Nick Bostrom' "
+            "but not 'Nicholas Taleb'). Ambiguous multi-matches prompt for clarification.\n"
+            "  • Diversity Dynamics: Focused mode bypasses the per-author cap (default 6) for the "
+            "focused author while MMR diversity terms continue to apply across non-focused authors."
         ),
         "examples": [
             "\\synthesize How does guilt lead to self-deception and breakdown?",
-            "\\synth What is the relationship between suffering and spiritual growth?",
+            "\\synth --focused \"what is Taleb's central argument in Antifragile\"",
+            "\\synthesize --author Taleb \"risk and fragility\"",
+            "\\synthesize --focused --author \"Nassim Nicholas Taleb\" \"skin in the game\"",
         ],
         "flywheel": "After synthesis, run \\play cite 1 to listen, or \\bookmark cite 1 to view the smart card.",
     },
@@ -2456,9 +2468,14 @@ def parse_synthesize_args(args_str: str) -> tuple[str, bool, str | None]:
       --author NAME, -a NAME  Filter to author NAME (cap still applies at 6)
       --author=NAME           Filter to author NAME (cap still applies at 6)
 
-    Note: Any bare token following `--focused` (e.g. `--focused Taleb query`) is
-    treated as part of the query, not as an author filter. To specify an author,
-    use --author NAME or --focused=NAME.
+    Notes:
+      • Author Matching: --author matches full words only (e.g. 'Nick' matches 'Nick Bostrom'
+        but not 'Nicholas Taleb').
+      • Diversity Dynamics: Focused mode bypasses the per-author cap for the focused author while
+        MMR diversity terms continue to apply across non-focused authors.
+      • Bare Tokens: Any bare token following `--focused` (e.g. `--focused Taleb query`) is
+        treated as part of the query, not as an author filter. To specify an author,
+        use --author NAME or --focused=NAME.
     """
     import shlex
 
@@ -2535,7 +2552,7 @@ def render_synthesis_footer(resp: "SynthesisResponse") -> None:  # type: ignore[
             pool_n = meta.author_counts_pool.get(fa, n_frags)
             sel_n = meta.author_counts_selected.get(fa, n_frags)
             console.print(
-                f"  [{ACCENT}]ⓘ Focused mode:[/] [{DIM}]{fa} ({pool_n} in pool, focused: {sel_n} selected, cap bypassed; k_ann={k_ann})[/]"
+                f"  [{ACCENT}]ⓘ Focused mode:[/] [{DIM}]{fa} ({sel_n}/{pool_n} selected, cap bypassed; k_ann={k_ann})[/]"
             )
         else:
             # General focused mode across all authors
@@ -2543,11 +2560,11 @@ def render_synthesis_footer(resp: "SynthesisResponse") -> None:  # type: ignore[
                 a for a, p_n in meta.author_counts_pool.items()
                 if a not in ("[Prior Synthesis]", "[Past Session]", "[Chat Reflection]", "[Cognitive Note]")
                 and a is not None
-                and p_n > DEFAULT_MAX_PER_AUTHOR
+                and meta.author_counts_selected.get(a, 0) > DEFAULT_MAX_PER_AUTHOR
             ]
             if uncapped_authors:
                 f_lines = [
-                    f"{a} ({meta.author_counts_pool.get(a, '?')} in pool, focused: {meta.author_counts_selected.get(a, 0)} selected, cap bypassed)"
+                    f"{a} ({meta.author_counts_selected.get(a, 0)}/{meta.author_counts_pool.get(a, '?')} selected, cap bypassed)"
                     for a in sorted(uncapped_authors)
                 ]
                 console.print(
@@ -2555,7 +2572,7 @@ def render_synthesis_footer(resp: "SynthesisResponse") -> None:  # type: ignore[
                 )
             else:
                 console.print(
-                    f"  [{ACCENT}]ⓘ Focused mode:[/] [{DIM}]{n_frags} selected across pool (cap bypassed; k_ann={k_ann})[/]"
+                    f"  [{ACCENT}]ⓘ Focused mode:[/] [{DIM}]{n_frags} selected across pool (k_ann={k_ann})[/]"
                 )
     elif meta and meta.capped_authors:
         cap_lines = []
@@ -2564,7 +2581,7 @@ def render_synthesis_footer(resp: "SynthesisResponse") -> None:  # type: ignore[
             cap_lines.append(f"{a} ({pool_n} in pool, capped at 6)")
         if meta.focused_author:
             console.print(
-                f"  [{ACCENT}]ⓘ Author filter fired:[/] [{DIM}]{' · '.join(cap_lines)}[/] — [{DIM}]add --focused to uncap[/]"
+                f"  [{ACCENT}]ⓘ Author filter active:[/] [{DIM}]{' · '.join(cap_lines)}[/] — [{DIM}]add --focused to uncap[/]"
             )
         else:
             console.print(
@@ -2602,9 +2619,14 @@ def cmd_synthesize(session: ReplSession, args: str) -> None:
       --author NAME, -a     Filter to author NAME (per-author cap still applies at 6)
                             Use --focused=NAME or --focused --author NAME to uncap.
 
-    Note: --focused with a bare token after it (e.g. `\\synthesize --focused Taleb query`)
-    treats "Taleb" as part of the query, not as an author filter. To specify
-    an author, use --author NAME or --focused=NAME.
+    Notes:
+      • Author Matching: --author matches full words only (e.g. 'Nick' matches 'Nick Bostrom'
+        but not 'Nicholas Taleb').
+      • Diversity Dynamics: Focused mode bypasses the per-author cap (default 6) for the focused
+        author while MMR diversity terms continue to apply across non-focused authors.
+      • Bare Tokens: --focused with a bare token after it (e.g. `\\synthesize --focused Taleb query`)
+        treats "Taleb" as part of the query, not as an author filter. To specify
+        an author, use --author NAME or --focused=NAME.
     """
     query, focused, author = parse_synthesize_args(args)
     if not query:

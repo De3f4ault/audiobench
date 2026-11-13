@@ -595,8 +595,80 @@ class TestFooterDiagnostics:
 
         printed = " ".join(str(c) for c in mock_print.call_args_list)
         assert "Focused mode" in printed
-        assert "Nassim Taleb (10 in pool, focused: 10 selected, cap bypassed; k_ann=40)" in printed
+        assert "Nassim Taleb (10/10 selected, cap bypassed; k_ann=40)" in printed
         assert "capped at 6" not in printed
+
+    def test_footer_general_focused_mode_with_cap_bypassed(self) -> None:
+        """General focused mode surfaces authors that genuinely exceeded the cap."""
+        from audiobench.cli.repl.backslash_commands import render_synthesis_footer
+        from audiobench.memory.synthesis_retriever import RetrievalMeta
+
+        meta = RetrievalMeta(
+            pool_size=20,
+            k_ann=40,
+            author_counts_pool={"Nassim Taleb": 15, "David Grim": 5},
+            author_counts_selected={"Nassim Taleb": 10, "David Grim": 3},
+            capped_authors=set(),
+            prior_count=0,
+            unknown_count=0,
+            focused=True,
+            focused_author=None,
+            author_match_status="resolved",
+        )
+        resp = SynthesisResponse(
+            query="complexity",
+            synthesis_text="Text",
+            fragments=[MagicMock() for _ in range(13)],
+            elapsed_seconds=1.1,
+            model_used="gemini-2.5-flash",
+            retrieval_meta=meta,
+            top_k=20,
+        )
+
+        with patch("audiobench.cli.repl.backslash_commands.console.print") as mock_print:
+            render_synthesis_footer(resp)
+
+        printed = " ".join(str(c) for c in mock_print.call_args_list)
+        assert "Focused mode" in printed
+        assert "Nassim Taleb (10/15 selected, cap bypassed)" in printed
+        # David Grim had 3 selected (<= 6) so Grim is not reported as cap bypassed
+        assert "David Grim" not in printed
+        assert "k_ann=40" in printed
+
+    def test_footer_general_focused_mode_below_cap(self) -> None:
+        """When general focused mode selects <= 6 for all authors, 'cap bypassed' is not falsely claimed."""
+        from audiobench.cli.repl.backslash_commands import render_synthesis_footer
+        from audiobench.memory.synthesis_retriever import RetrievalMeta
+
+        meta = RetrievalMeta(
+            pool_size=17,
+            k_ann=40,
+            author_counts_pool={"Nassim Taleb": 8, "David Grim": 9},
+            author_counts_selected={"Nassim Taleb": 2, "David Grim": 1},
+            capped_authors=set(),
+            prior_count=0,
+            unknown_count=0,
+            focused=True,
+            focused_author=None,
+            author_match_status="resolved",
+        )
+        resp = SynthesisResponse(
+            query="fragility",
+            synthesis_text="Text",
+            fragments=[MagicMock() for _ in range(3)],
+            elapsed_seconds=0.8,
+            model_used="gemini-2.5-flash",
+            retrieval_meta=meta,
+            top_k=20,
+        )
+
+        with patch("audiobench.cli.repl.backslash_commands.console.print") as mock_print:
+            render_synthesis_footer(resp)
+
+        printed = " ".join(str(c) for c in mock_print.call_args_list)
+        assert "Focused mode" in printed
+        assert "3 selected across pool (k_ann=40)" in printed
+        assert "cap bypassed" not in printed
 
     def test_author_filter_without_focused_cap_hint_shown(self) -> None:
         """When --author filter hits cap without --focused, hint suggests adding --focused."""
@@ -629,7 +701,7 @@ class TestFooterDiagnostics:
             render_synthesis_footer(resp)
 
         printed = " ".join(str(c) for c in mock_print.call_args_list)
-        assert "Author filter fired:" in printed
+        assert "Author filter active:" in printed
         assert "Nassim Taleb (10 in pool, capped at 6)" in printed
         assert "add --focused to uncap" in printed
 
