@@ -8,6 +8,7 @@ import pytest
 
 from audiobench.chat.synthesis_engine import (
     SynthesisResponse,
+    _SYNTHESIS_SYSTEM_PROMPT,
     format_synthesis_prompt,
     generate_synthesis,
 )
@@ -17,6 +18,23 @@ from audiobench.memory.synthesis_retriever import (
     retrieve_synthesis_context,
 )
 from conftest import empty_meta
+
+
+def make_fragment(eid: int, author: str, source_type: str = "audio_transcript") -> SynthesisFragment:
+    return SynthesisFragment(
+        expression_id=eid,
+        work_id=eid,
+        work_title=f"Work {eid}",
+        author=author,
+        content=f"Content {eid}",
+        q_sim=0.75,
+        edge_weight=0.8,
+        effective_rel=0.75,
+        mmr_score=0.75,
+        source_mode="ANN",
+        is_clique_partner=False,
+        source_type=source_type,
+    )
 
 
 class TestFormatSynthesisPrompt:
@@ -53,6 +71,42 @@ class TestFormatSynthesisPrompt:
         assert "Source [2]: Author B — Book B (Consensus Triad Partner)" in prompt
         assert "Passage from author A on guilt." in prompt
         assert "[1], [2], [3]" in prompt
+
+    def test_format_prompt_tags_prior_synthesis_sources(self) -> None:
+        """Prior synthesis sources must be tagged with [source_type: search_synthesis]."""
+        frags = [
+            make_fragment(1, author="Nassim Nicholas Taleb", source_type="audio_transcript"),
+            make_fragment(2, author="[Prior Synthesis]", source_type="search_synthesis"),
+        ]
+        prompt = format_synthesis_prompt("what did we conclude", frags)
+        assert "[source_type: search_synthesis]" in prompt
+        assert "[source_type: audio_transcript]" not in prompt
+
+    def test_format_prompt_includes_prior_synthesis_directive(self) -> None:
+        """Presence of prior synthesis sources triggers the epistemic framing directive."""
+        frags = [
+            make_fragment(1, author="Taleb", source_type="audio_transcript"),
+            make_fragment(2, author="[Prior Synthesis]", source_type="search_synthesis"),
+        ]
+        prompt = format_synthesis_prompt("what did we conclude", frags)
+        assert "In previous sessions you concluded" in prompt
+        assert "CRITICAL" in prompt
+
+    def test_format_prompt_omits_prior_directive_without_prior_sources(self) -> None:
+        """Pure primary-author queries must not include spurious prior synthesis warnings."""
+        frags = [
+            make_fragment(1, author="Taleb", source_type="audio_transcript"),
+            make_fragment(2, author="Munger", source_type="audio_transcript"),
+        ]
+        prompt = format_synthesis_prompt("what is Taleb's view", frags)
+        assert "CRITICAL" not in prompt
+        assert "In previous sessions you concluded" not in prompt
+        assert "source_type" not in prompt
+
+    def test_synthesis_system_prompt_has_epistemic_rule(self) -> None:
+        """Rule 4 must be present in the system prompt."""
+        assert "Epistemic Distinction" in _SYNTHESIS_SYSTEM_PROMPT
+        assert "prior user conclusion" in _SYNTHESIS_SYSTEM_PROMPT.lower()
 
 
 class TestRetrieveSynthesisContextMocked:

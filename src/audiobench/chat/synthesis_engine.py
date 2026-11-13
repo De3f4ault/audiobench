@@ -70,6 +70,7 @@ Strict Rules:
 1. Ground every claim using inline bracketed citation numbers: [1], [2], [3], etc. Use strictly plain integers (e.g. [1], [2]). Never append line numbers, daggers (†), or pipes (e.g. do not write [1†L1-L5] or [1|L1-L5]).
 2. Do not invent facts or extrapolate beyond what is supported by the excerpts.
 3. Keep your tone intellectual, concise, and direct. Avoid conversational filler or introductory/concluding preambles. Start directly with the first section header (### 1. Foundational Convergence).
+4. Epistemic Distinction for Prior Syntheses: Sources whose author is "[Prior Synthesis]" or "[Past Session]" (or whose source_type is search_synthesis / search_session_summary) represent prior user conclusions and syntheses from earlier sessions, NOT external primary authors. When citing such a source, frame it explicitly as a prior user conclusion (e.g. "In previous sessions, you concluded that [1]...", "Your earlier analysis established [1]..."). Distinguish it from primary audio evidence, and when relevant, contrast or integrate how new primary authors support, deepen, or challenge these earlier conclusions.
 """
 
 
@@ -83,23 +84,49 @@ def _clean_synthesis_citations(text: str) -> str:
     return re.sub(r"\[\s*(\d+)\s*\]", r"[\1]", cleaned)
 
 
+PRIOR_SOURCE_TYPES = frozenset({"search_synthesis", "search_session_summary"})
+PRIOR_AUTHOR_LABELS = frozenset({"[Prior Synthesis]", "[Past Session]"})
+
+
+def _is_prior_source(f: SynthesisFragment) -> bool:
+    """A source is prior-synthesis if it's an LLM-generated artifact from an earlier session."""
+    st = getattr(f, "source_type", None) or ""
+    author = getattr(f, "author", "") or ""
+    return st in PRIOR_SOURCE_TYPES or author in PRIOR_AUTHOR_LABELS
+
+
 def format_synthesis_prompt(query: str, fragments: list[SynthesisFragment]) -> str:
     """Build the dialectic prompt incorporating numbered source excerpts."""
     lines = [
         f"Core Question: \"{query}\"\n",
         "Retrieved Library Excerpts:",
     ]
+    has_prior = False
     for idx, f in enumerate(fragments, 1):
         clique_note = " (Consensus Triad Partner)" if f.is_clique_partner else ""
+        type_tag = ""
+        if _is_prior_source(f):
+            has_prior = True
+            st = getattr(f, "source_type", "search_synthesis") or "search_synthesis"
+            type_tag = f" [source_type: {st}]"
         lines.append(
-            f"\nSource [{idx}]: {f.author} — {f.work_title}{clique_note}\n"
+            f"\nSource [{idx}]: {f.author} — {f.work_title}{clique_note}{type_tag}\n"
             f"\"{f.content}\""
         )
 
-    lines.append(
+    task_instructions = [
         "\nTask: Synthesize these perspectives across the three required phases. "
         "Explicitly cite your sources using [1], [2], [3] throughout every section of your response."
-    )
+    ]
+    if has_prior:
+        task_instructions.append(
+            "\nCRITICAL: Sources tagged with [source_type: search_synthesis] or authored by "
+            "[Prior Synthesis] represent conclusions from previous sessions. Frame them as "
+            "'In previous sessions you concluded...' rather than treating them as external "
+            "evidence or published works."
+        )
+
+    lines.append("\n".join(task_instructions))
     return "\n".join(lines)
 
 
