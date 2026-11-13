@@ -896,7 +896,7 @@ class TestFocusedAndAuthorSynthesis:
 
         mock_index = MagicMock()
         mock_index.has_item.return_value = True
-        mock_index.query.return_value = [(100 + i, 0.05 * i) for i in range(1, 11)]
+        mock_index.query.return_value = [(100 + i, 0.02 * i) for i in range(1, 11)]
         mock_index.get_items.side_effect = lambda ids: np.array([[1.0, 0.0] for _ in ids], dtype=np.float32)
 
         sample_ann_rows = [
@@ -985,7 +985,7 @@ class TestFocusedAndAuthorSynthesis:
 
         mock_index = MagicMock()
         mock_index.has_item.return_value = True
-        mock_index.query.return_value = [(100 + i, 0.05 * i) for i in range(1, 11)]
+        mock_index.query.return_value = [(100 + i, 0.02 * i) for i in range(1, 11)]
         mock_index.get_items.side_effect = lambda ids: np.array([[1.0, 0.0] for _ in ids], dtype=np.float32)
 
         sample_ann_rows = [
@@ -1130,6 +1130,59 @@ class TestFocusedAndAuthorSynthesis:
                 focused=True,
                 author="Taleb",
             )
+
+    def test_mmr_relevance_floor_drops_weak_candidates_despite_diversity_bonus(self) -> None:
+        """MMR relevance floor (0.68) rejects weak candidates (e.g. 0.632) even if eligible for +0.30 work diversity bonus."""
+        from audiobench.memory.synthesis_retriever import retrieve_synthesis_context, DEFAULT_RELEVANCE_FLOOR
+
+        assert DEFAULT_RELEVANCE_FLOOR == 0.68
+
+        mock_index = MagicMock()
+        mock_index.has_item.return_value = True
+        # Candidate 101: Taleb (Work 1), q_sim = 1.0 - 0.15 = 0.85
+        # Candidate 102: Aurelius (Work 2), q_sim = 1.0 - 0.368 = 0.632 (weak candidate from new work)
+        # Candidate 103: Taleb (Work 1), q_sim = 1.0 - 0.25 = 0.75 (strong candidate from same work)
+        mock_index.query.return_value = [(101, 0.15), (102, 0.368), (103, 0.25)]
+        mock_index.get_items.side_effect = lambda ids: np.array([[1.0, 0.0] for _ in ids], dtype=np.float32)
+
+        sample_ann_rows = [
+            (101, 1, "Passage from Antifragile about convex payoffs and volatility.", "Antifragile", "Nassim Taleb", "audio_transcript", None, None),
+            (102, 2, "Passage from Meditations about acceptance of fate and virtue.", "Meditations", "Marcus Aurelius", "audio_transcript", None, None),
+            (103, 1, "Second passage from Antifragile about the difference between fragile and robust.", "Antifragile", "Nassim Taleb", "audio_transcript", None, None),
+        ]
+
+        with patch("audiobench.memory.synthesis_retriever.get_session") as mock_session_ctx, \
+             patch("audiobench.memory.synthesis_retriever.embed_query") as mock_embed:
+            mock_session = MagicMock()
+            mock_session_ctx.return_value.__enter__.return_value = mock_session
+            mock_embed.return_value = np.array([1.0, 0.0], dtype=np.float32)
+
+            mock_session.execute.side_effect = [
+                MagicMock(fetchall=lambda: sample_ann_rows),
+                MagicMock(fetchall=lambda: []),
+                MagicMock(fetchall=lambda: []),
+                # Second call for floor=0.0 test
+                MagicMock(fetchall=lambda: sample_ann_rows),
+                MagicMock(fetchall=lambda: []),
+                MagicMock(fetchall=lambda: []),
+            ]
+
+            # 1. With default relevance_floor (0.68): Aurelius (0.632) is dropped despite +0.30 diversity bonus
+            results, meta = retrieve_synthesis_context("antifragile systems", top_k=2, index=mock_index)
+            assert len(results) == 2
+            assert results[0].expression_id == 101
+            assert results[1].expression_id == 103
+            assert all(f.author == "Nassim Taleb" for f in results)
+            assert meta.author_counts_pool["Marcus Aurelius"] == 1
+            assert "Marcus Aurelius" not in meta.author_counts_selected
+
+            # 2. With relevance_floor disabled (0.0): Aurelius gets the +0.30 work diversity bonus and displaces candidate 103
+            results_nofloor, _ = retrieve_synthesis_context("antifragile systems", top_k=2, index=mock_index, relevance_floor=0.0)
+            assert len(results_nofloor) == 2
+            assert results_nofloor[0].expression_id == 101
+            assert results_nofloor[1].expression_id == 102
+            assert results_nofloor[1].author == "Marcus Aurelius"
+
 
 
 

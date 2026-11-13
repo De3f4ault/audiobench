@@ -33,7 +33,8 @@ logger = logging.getLogger("audiobench.memory.synthesis_retriever")
 DEFAULT_ALPHA: float = 0.60          # Query vs Edge blend (0.60 * Q + 0.40 * Edge)
 DEFAULT_LAMBDA: float = 0.55         # MMR Relevance vs Redundancy (0.55 * Rel - 0.45 * Red)
 DEFAULT_EDGE_THRESHOLD: float = 0.78 # Minimum edge weight for semantic bridges
-DEFAULT_RELEVANCE_FLOOR: float = 0.48# Minimum query similarity for graph neighbors
+DEFAULT_GRAPH_RELEVANCE_FLOOR: float = 0.48  # Minimum query similarity for 1-hop graph neighbors
+DEFAULT_RELEVANCE_FLOOR: float = 0.68        # Minimum effective relevance for MMR selection
 DEFAULT_CLIQUE_BOOST: float = 0.10   # Empirically validated via sweep_clique_boost.py over [0.00-0.25]
 
 # Per-author MMR cap — prevents single-author monopolisation of synthesis results.
@@ -193,7 +194,7 @@ def retrieve_synthesis_context(
         alpha: Dual-signal blend ratio (default 0.60).
         clique_boost: Confidence boost for 3-clique consensus (untuned initial value: 0.10).
         edge_threshold: Minimum semantic edge weight to follow (default 0.78).
-        relevance_floor: Relevance floor to reject pure tangents (default 0.48).
+        relevance_floor: Minimum effective relevance for candidate selection in MMR (default 0.68).
         index: Optional InCoreHNSWIndex instance.
         community_id: Optional community ID to restrict retrieval within a single school of thought.
         focused: When True, bypasses the per-author diversity cap across named authors.
@@ -352,8 +353,8 @@ def retrieve_synthesis_context(
                 continue
 
             q_sim = float(np.dot(q_vec, v))
-            # Relevance floor: reject pure tangents
-            if q_sim < relevance_floor:
+            # Relevance floor: reject pure tangents from 1-hop graph expansion
+            if q_sim < DEFAULT_GRAPH_RELEVANCE_FLOOR:
                 continue
 
             # Dual-Signal Effective Relevance
@@ -501,6 +502,10 @@ def retrieve_synthesis_context(
         best_score = float("-inf")
 
         for idx, item in enumerate(remaining):
+            # Relevance floor: reject candidates whose effective relevance is too weak
+            if relevance_floor > 0.0 and item["effective_rel"] < relevance_floor:
+                continue
+
             a = item["author"]
 
             # PRIOR and UNKNOWN caps fire regardless of focused mode. `--focused`
