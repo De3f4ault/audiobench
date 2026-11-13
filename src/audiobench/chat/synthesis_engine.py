@@ -25,6 +25,8 @@ from audiobench.core.db_session import get_session
 from audiobench.core.settings import get_settings
 from audiobench.memory.query_engine import _call_llm, Ok, Err
 from audiobench.memory.synthesis_retriever import (
+    AmbiguousAuthorError,
+    RetrievalMeta,
     SynthesisFragment,
     retrieve_synthesis_context,
 )
@@ -41,6 +43,11 @@ class SynthesisResponse:
     fragments: list[SynthesisFragment] = field(default_factory=list)
     elapsed_seconds: float = 0.0
     model_used: str = "digest_fallback"
+    # Footer fields — populated by generate_synthesis when LLM fallback fires or cap fires.
+    fallback_from: str | None = None       # "ollama" if primary failed and secondary succeeded
+    fallback_reason: str | None = None     # primary error string on fallback success
+    retrieval_meta: RetrievalMeta | None = None
+    top_k: int = 20                        # requested top_k for query context in footer
 
 
 # Provisional adoption (Structure 2: Dialectic Triad):
@@ -171,27 +178,70 @@ def generate_synthesis(
     llm: OllamaClient | None = None,
     community_id: int | None = None,
     use_typed_edges: bool = False,
+    focused: bool = False,
+    author: str | None = None,
 ) -> SynthesisResponse:
     """Generate a grounded cross-disciplinary synthesis for the given query.
 
     Args:
         query: Conceptual or thematic question.
-        top_k: Number of diverse fragments to retrieve (default 4).
+        top_k: Number of diverse fragments to retrieve (default 20).
         temperature: LLM sampling temperature (default 0.3).
         llm: Optional OllamaClient instance.
         community_id: Optional community ID to restrict synthesis to a single school.
+        use_typed_edges: Whether to inject library graph hints for co-retrieved pairs.
+        focused: When True, bypasses the per-author diversity cap across named authors.
+        author: Optional author name to filter candidate pool before MMR selection.
 
     Returns:
         SynthesisResponse with text and citation mapping.
     """
     t0 = time.perf_counter()
-    fragments = retrieve_synthesis_context(query, top_k=top_k, community_id=community_id)
-
-    if not fragments:
+    # Unpack happens before _call_llm so digest fallback has access to fragments
+    # regardless of LLM outcome (user's watch-point from code review).
+    try:
+        fragments, retrieval_meta = retrieve_synthesis_context(
+            query,
+            top_k=top_k,
+            community_id=community_id,
+            focused=focused,
+            author=author,
+        )
+    except AmbiguousAuthorError as e:
+        meta = RetrievalMeta(
+            pool_size=0,
+            k_ann=40,
+            author_counts_pool={},
+            author_counts_selected={},
+            capped_authors=set(),
+            prior_count=0,
+            unknown_count=0,
+            focused=focused,
+            focused_author=e.requested,
+            author_match_status="multi_match",
+        )
         return SynthesisResponse(
             query=query,
-            synthesis_text="No relevant or linkable passages found across the library for this theme.",
+            synthesis_text=f"⚠ Author '{e.requested}' matches multiple in pool: {', '.join(e.candidates)}. Be more specific.",
+            citations={},
+            fragments=[],
             elapsed_seconds=round(time.perf_counter() - t0, 3),
+            model_used="none",
+            top_k=top_k,
+            retrieval_meta=meta,
+        )
+
+    if not fragments:
+        if author and retrieval_meta.author_match_status == "zero_match":
+            msg = f"No passages by author '{author}' found in candidate pool for this query."
+        else:
+            msg = "No relevant or linkable passages found across the library for this theme."
+        return SynthesisResponse(
+            query=query,
+            synthesis_text=msg,
+            elapsed_seconds=round(time.perf_counter() - t0, 3),
+            top_k=top_k,
+            retrieval_meta=retrieval_meta,
         )
 
     citation_map: dict[int, int] = {
@@ -217,14 +267,25 @@ def generate_synthesis(
 
     llm_res = _call_llm(full_prompt, temperature, client, api_key)
 
-    model_used = "digest_fallback"
+    fallback_from: str | None = None
+    fallback_reason: str | None = None
+
     if isinstance(llm_res, Ok):
         answer = _clean_synthesis_citations(llm_res.value)
-        res_model = getattr(llm_res, "model", None)
-        model_used = res_model if res_model and res_model != "unknown" else getattr(client, "_model", "gemma4:31b-cloud")
+        # Sentinel-aware: Ok.model defaults to "unknown" (truthy) so bare `or` is a no-op.
+        # Compare against sentinel explicitly and fall back to client model name.
+        model_used = (
+            llm_res.model if llm_res.model and llm_res.model != "unknown"
+            else getattr(client, "_model", "gemma4:31b-cloud")
+        )
+        # Carry primary-failure info when secondary (Gemini) succeeded — set by _call_llm.
+        fallback_from = getattr(llm_res, "fallback_from", None)
+        fallback_reason = getattr(llm_res, "fallback_reason", None)
     else:
         logger.warning("LLM call failed in synthesis engine: %s; falling back to digest.", llm_res.error)
         model_used = "digest_fallback"
+        fallback_from = "all_providers"
+        fallback_reason = llm_res.error
         # Structured fallback if local model and cloud are unreachable
         digest_lines = [
             f"### Dialectic Digest: {query}",
@@ -247,4 +308,8 @@ def generate_synthesis(
         fragments=fragments,
         elapsed_seconds=elapsed,
         model_used=model_used,
+        fallback_from=fallback_from,
+        fallback_reason=fallback_reason,
+        retrieval_meta=retrieval_meta,
+        top_k=top_k,
     )

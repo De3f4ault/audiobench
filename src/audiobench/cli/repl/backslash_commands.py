@@ -2423,19 +2423,69 @@ def cmd_bookmark(session: ReplSession, args: str) -> None:
 
 
 
+def parse_synthesize_args(args_str: str) -> tuple[str, bool, str | None]:
+    """Parse synthesize arguments with --focused and --author flags.
+
+    Supported patterns:
+      --focused               General focused mode (bypasses cap for all authors)
+      --focused=NAME          Focused mode on author NAME (bypasses cap for NAME)
+      --author NAME, -a NAME  Filter to author NAME (cap still applies at 6)
+      --author=NAME           Filter to author NAME (cap still applies at 6)
+
+    Note: Any bare token following `--focused` (e.g. `--focused Taleb query`) is
+    treated as part of the query, not as an author filter. To specify an author,
+    use --author NAME or --focused=NAME.
+    """
+    import shlex
+
+    try:
+        tokens = shlex.split(args_str)
+    except ValueError:
+        tokens = args_str.split()
+
+    focused = False
+    author: str | None = None
+    remaining: list[str] = []
+
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t.startswith("--focused="):
+            focused = True
+            author = t.split("=", 1)[1].strip() or None
+            i += 1
+        elif t == "--focused":
+            focused = True
+            i += 1
+        elif t in ("--author", "-a") and i + 1 < len(tokens):
+            author = tokens[i + 1].strip() or None
+            i += 2
+        elif t.startswith("--author="):
+            author = t.split("=", 1)[1].strip() or None
+            i += 1
+        else:
+            remaining.append(t)
+            i += 1
+
+    query = " ".join(remaining).strip().strip("\"").strip("'")
+    return query, focused, author
+
+
 def render_synthesis_footer(resp: "SynthesisResponse") -> None:  # type: ignore[name-defined]
     """Render the synthesis diagnostics footer below the main synthesis output.
 
     Surfaces three signals that help the user understand retrieval behaviour:
       1. Total sources and elapsed time + model used
-      2. Per-author cap signal — which authors were capped, so the user knows
-         why the result has fewer than top_k fragments for a single-author query
+      2. Per-author cap signal or focused mode signal
       3. LLM fallback signal — when Ollama failed and Gemini was the actual model
 
     This is a named helper rather than inline code so any future display path
     can call ``render_synthesis_footer(resp)`` and get the same contract.
     """
-    from audiobench.memory.synthesis_retriever import RetrievalMeta  # local import avoids circularity
+    from audiobench.memory.synthesis_retriever import (  # local import avoids circularity
+        RetrievalMeta,
+        DEFAULT_MAX_PER_AUTHOR,
+    )
 
     meta: RetrievalMeta | None = resp.retrieval_meta
 
@@ -2448,15 +2498,54 @@ def render_synthesis_footer(resp: "SynthesisResponse") -> None:  # type: ignore[
     top_k_str = f" (top_k={top_k_val})" if top_k_val is not None else ""
     console.print(f"  [{DIM}]{n_frags} source{'s' if n_frags != 1 else ''}{top_k_str} · {elapsed:.2f}s · {model}[/]")
 
-    # --- Line 2: per-author cap signal (only when cap actually fired) --------
-    if meta and meta.capped_authors:
+    # --- Line 2: per-author cap signal / focused mode signal -----------------
+    if meta and meta.focused:
+        k_ann = meta.k_ann
+        if meta.author_match_status == "zero_match" and meta.focused_author:
+            console.print(
+                f"  [{ACCENT}]ⓘ Focused mode (author '{meta.focused_author}' not found in pool; applied broadly):[/] "
+                f"[{DIM}]{n_frags} selected (k_ann={k_ann})[/]"
+            )
+        elif meta.focused_author:
+            fa = meta.focused_author
+            pool_n = meta.author_counts_pool.get(fa, n_frags)
+            sel_n = meta.author_counts_selected.get(fa, n_frags)
+            console.print(
+                f"  [{ACCENT}]ⓘ Focused mode:[/] [{DIM}]{fa} ({pool_n} in pool, focused: {sel_n} selected, cap bypassed; k_ann={k_ann})[/]"
+            )
+        else:
+            # General focused mode across all authors
+            uncapped_authors = [
+                a for a, p_n in meta.author_counts_pool.items()
+                if a not in ("[Prior Synthesis]", "[Past Session]", "[Chat Reflection]", "[Cognitive Note]")
+                and a is not None
+                and p_n > DEFAULT_MAX_PER_AUTHOR
+            ]
+            if uncapped_authors:
+                f_lines = [
+                    f"{a} ({meta.author_counts_pool.get(a, '?')} in pool, focused: {meta.author_counts_selected.get(a, 0)} selected, cap bypassed)"
+                    for a in sorted(uncapped_authors)
+                ]
+                console.print(
+                    f"  [{ACCENT}]ⓘ Focused mode:[/] [{DIM}]{' · '.join(f_lines)}; k_ann={k_ann}[/]"
+                )
+            else:
+                console.print(
+                    f"  [{ACCENT}]ⓘ Focused mode:[/] [{DIM}]{n_frags} selected across pool (cap bypassed; k_ann={k_ann})[/]"
+                )
+    elif meta and meta.capped_authors:
         cap_lines = []
         for a in sorted(meta.capped_authors):
             pool_n = meta.author_counts_pool.get(a, "?")
             cap_lines.append(f"{a} ({pool_n} in pool, capped at 6)")
-        console.print(
-            f"  [{ACCENT}]ⓘ Per-author cap fired:[/] [{DIM}]{' · '.join(cap_lines)}[/]"
-        )
+        if meta.focused_author:
+            console.print(
+                f"  [{ACCENT}]ⓘ Author filter fired:[/] [{DIM}]{' · '.join(cap_lines)}[/] — [{DIM}]add --focused to uncap[/]"
+            )
+        else:
+            console.print(
+                f"  [{ACCENT}]ⓘ Per-author cap fired:[/] [{DIM}]{' · '.join(cap_lines)}[/] — [{DIM}]\\synthesize --focused for depth[/]"
+            )
 
     # --- Line 3: LLM fallback signal (only when Ollama failed) ---------------
     if resp.fallback_from == "ollama" and resp.fallback_reason:
@@ -2478,8 +2567,22 @@ def cmd_synthesize(session: ReplSession, args: str) -> None:
 
     Usage:
       \\synthesize <theme or query>
+      \\synthesize --focused <query>
+      \\synthesize --focused=NAME <query>
+      \\synthesize --author NAME <query>
+      \\synthesize --focused --author NAME <query>
+
+    Options:
+      --focused             Bypass per-author cap (6) for all authors in pool
+      --focused=NAME        Same, but filter to author NAME and uncap within that author
+      --author NAME, -a     Filter to author NAME (per-author cap still applies at 6)
+                            Use --focused=NAME or --focused --author NAME to uncap.
+
+    Note: --focused with a bare token after it (e.g. `\\synthesize --focused Taleb query`)
+    treats "Taleb" as part of the query, not as an author filter. To specify
+    an author, use --author NAME or --focused=NAME.
     """
-    query = args.strip().strip('"').strip("'")
+    query, focused, author = parse_synthesize_args(args)
     if not query:
         console.print("  [{DIM}]Usage: \\synthesize <thematic question or query>[/]")
         return
@@ -2490,12 +2593,31 @@ def cmd_synthesize(session: ReplSession, args: str) -> None:
         scoped_cid = session.focus.id
         scoped_badge = f"  [{ACCENT}]‹Scoped to {session.focus.label}›[/]"
 
-    console.print(f"  [{BOLD}]Synthesizing perspectives for:[/] \"{query}\"{scoped_badge}...")
+    if focused and author:
+        banner_prefix = f"Synthesizing perspectives (focused on {author}) for"
+    elif focused:
+        banner_prefix = "Synthesizing perspectives (focused, all authors) for"
+    elif author:
+        banner_prefix = f"Synthesizing perspectives (author: {author}) for"
+    else:
+        banner_prefix = "Synthesizing perspectives for"
+
+    console.print(f"  [{BOLD}]{banner_prefix}:[/] \"{query}\"{scoped_badge}...")
     try:
         from audiobench.chat.synthesis_engine import generate_synthesis
         from rich.markdown import Markdown
 
-        resp = generate_synthesis(query, community_id=scoped_cid)
+        synth_kwargs = {}
+        if focused:
+            synth_kwargs["focused"] = focused
+        if author is not None:
+            synth_kwargs["author"] = author
+
+        resp = generate_synthesis(
+            query,
+            community_id=scoped_cid,
+            **synth_kwargs,
+        )
         # Populate interactive flywheel citation map.
         # Unconditional overwrite — newest synthesis always wins (EC-11).
         session.last_synthesis_citations = resp.citations
