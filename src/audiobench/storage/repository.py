@@ -134,6 +134,8 @@ class TranscriptionRepository:
             audio_file_id: The ID of the audio file.
             session: Active SQLAlchemy session.
             explicit_chapter_id: Optional explicit chapter ID if transcribing a single chapter.
+                Note: 0 or None indicates no explicit chapter was specified, falling through to
+                interval matching to discover chapters dynamically.
 
         Returns:
             List of ChapterRecord.id (or None) corresponding 1:1 with input segments.

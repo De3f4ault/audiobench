@@ -418,6 +418,9 @@ def _handle_autocomplete(args: dict[str, Any]) -> dict[str, Any]:
         repo = ExpressionRepository()
         expr_map = repo.get_by_ids(expression_ids, session=None)
 
+        # Only query WorkRecords for expressions with an assigned, valid work_id.
+        # Expressions with work_id None (loose recordings, unassigned works) or 0
+        # are intentionally omitted from the work title/author join.
         work_ids = [expr.work_id for expr in expr_map.values() if expr.work_id]
         work_map: dict[int, tuple[str | None, str | None]] = {}
         if work_ids:

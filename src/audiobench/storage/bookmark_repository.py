@@ -586,6 +586,7 @@ class BookmarkRepository:
             eff_pos = 0.0
 
         if not transcription_id:
+            logger.debug("save_resume_position: skipping null transcription_id")
             return eff_pos
 
         with get_session() as session:
