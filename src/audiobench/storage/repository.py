@@ -141,7 +141,7 @@ class TranscriptionRepository:
         if not segments:
             return []
 
-        if explicit_chapter_id is not None:
+        if explicit_chapter_id:
             return [explicit_chapter_id] * len(segments)
 
         if not audio_file_id:
@@ -1099,12 +1099,7 @@ class TranscriptionRepository:
             #      stop words, keep raw tokens rather than returning empty.
             _fts5_special = str.maketrans("", "", '"\'*()')  # hyphens handled via replace
             _fts5_keywords = {"OR", "AND", "NOT", "NEAR"}
-            _english_stop_words = {
-                "a", "an", "and", "are", "as", "at", "be", "but", "by", "for",
-                "if", "in", "into", "is", "it", "no", "not", "of", "on", "or",
-                "such", "that", "the", "their", "then", "there", "these", "they",
-                "this", "to", "was", "will", "with",
-            }
+            from audiobench.core.constants import ENGLISH_STOP_WORDS
             normalized_query = query.replace("-", " ").replace("_", " ")
             raw_tokens = []
             for t in normalized_query.split():
@@ -1114,7 +1109,7 @@ class TranscriptionRepository:
                 if t.upper() in _fts5_keywords:
                     t = t.lower()
                 raw_tokens.append(t)
-            tokens = [t for t in raw_tokens if t.lower() not in _english_stop_words]
+            tokens = [t for t in raw_tokens if t.lower() not in ENGLISH_STOP_WORDS]
             if not tokens:
                 tokens = raw_tokens
 

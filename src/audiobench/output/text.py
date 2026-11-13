@@ -33,10 +33,10 @@ class TextFormatter(OutputFormatter):
 
         for seg in transcript.segments:
             # ── Check for chapter change ──
-            if seg.chapter_id != current_chapter_id and seg.chapter_id is not None:
+            if seg.chapter_id != current_chapter_id and seg.chapter_id:
                 if lines and lines[-1] != "":
                     lines.append("")
-                if current_chapter_id is not None:
+                if current_chapter_id:
                     lines.append("\n---\n")  # Separator between chapters
 
                 title = chapter_map.get(seg.chapter_id, f"Chapter {seg.chapter_id}")

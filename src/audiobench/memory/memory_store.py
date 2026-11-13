@@ -385,11 +385,11 @@ class MemoryStore:
         where_clauses = []
         if speaker_filter:
             where_clauses.append(f"speaker = '{speaker_filter}'")
-        if audio_file_id is not None:
+        if audio_file_id:
             where_clauses.append(f"audio_file_id = {audio_file_id}")
-        if work_id is not None:
+        if work_id:
             where_clauses.append(f"work_id = {work_id}")
-        if chapter_id is not None:
+        if chapter_id:
             where_clauses.append(f"chapter_id = {chapter_id}")
         if author_filter:
             where_clauses.append(f"author = '{author_filter}'")

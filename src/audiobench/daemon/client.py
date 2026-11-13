@@ -497,9 +497,9 @@ class DaemonClient:
             "start_pos": float(start_pos or 0.0),
             "speed": float(speed or 1.0),
         }
-        if audio_file_id is not None:
+        if audio_file_id:
             args["audio_file_id"] = audio_file_id
-        if transcription_id is not None:
+        if transcription_id:
             args["transcription_id"] = transcription_id
         if segments is not None:
             args["segments"] = segments
@@ -520,9 +520,9 @@ class DaemonClient:
             "file_path": file_path,
             "position": float(position or 0.0),
         }
-        if transcription_id is not None:
+        if transcription_id:
             args["transcription_id"] = transcription_id
-        if audio_file_id is not None:
+        if audio_file_id:
             args["audio_file_id"] = audio_file_id
         return self._send("playback_sync_session", args)
 

@@ -26,7 +26,12 @@ from typing import TYPE_CHECKING, Literal
 from sqlalchemy import asc
 from sqlalchemy.orm import Session
 
-from audiobench.core.db_session import get_session
+from audiobench.core import db_session
+
+
+def get_session():
+    """Get database session dynamically from db_session module to prevent mock freeze across tests."""
+    return db_session.get_session()
 from audiobench.core.logger_factory import get_logger
 from audiobench.memory.enums import RelationType
 from audiobench.storage.models import ExpressionRecord, ExpressionRelation, ExpressionSegmentMap
@@ -109,14 +114,14 @@ class ExpressionRepository:
                         "Upgraded expression #%d privacy_tier to %d",
                         existing.id, privacy_tier,
                     )
-                if existing.chapter_id is None and chapter_id is not None:
+                if not existing.chapter_id and chapter_id:
                     existing.chapter_id = chapter_id
                     mutated = True
                     logger.debug(
                         "Linked expression #%d to chapter %d",
                         existing.id, chapter_id,
                     )
-                if existing.work_id is None and work_id is not None:
+                if not existing.work_id and work_id:
                     existing.work_id = work_id
                     mutated = True
                     logger.debug(
@@ -158,7 +163,7 @@ class ExpressionRepository:
 
     def _resolve_pending_relations(self, session, record: ExpressionRecord) -> None:
         """Resolve any pending forward references to this newly created expression."""
-        if record.source_id is None:
+        if not record.source_id:
             return
 
         from audiobench.storage.models import PendingRelation
@@ -583,6 +588,8 @@ class ExpressionRepository:
 
         Returns the number of expressions deleted.
         """
+        if not source_id:
+            return 0
         if session is not None:
             return self._delete_by_source_impl(session, source_type, source_id, should_commit=False)
         else:

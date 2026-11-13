@@ -121,9 +121,19 @@ class ReplSession:
 
         # Cited expressions from last synthesis session {1: expr_id1, 2: expr_id2, ...}
         self.last_synthesis_citations: dict[int, int] = {}
+        # _command_count snapshot at the time last_synthesis_citations was set.
+        # Diff against current _command_count to detect staleness (threshold: 6 cmds).
+        # 0 means no synthesis has run this session yet.
+        self._synthesis_command_snapshot: int = 0
 
         # Bridges from last bookmark card inspection {1: DialecticBridge, 2: DialecticBridge, ...}
         self.last_bookmark_bridges: dict[int, Any] = {}
+        self.last_bookmark_bridge_sources: set[int] = set()
+        # Tracks which expression and cite number the current bridge set was built from,
+        # allowing staleness detection: if citations[for_cite] != bridge.target_expression_id,
+        # the bridge was built from a stale synthesis snapshot.
+        self.last_bookmark_bridges_for_eid: int | None = None
+        self.last_bookmark_bridges_for_cite: int | None = None
 
     def _get_repo(self):
         """Lazy-init the transcription repository."""

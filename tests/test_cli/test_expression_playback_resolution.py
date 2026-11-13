@@ -441,3 +441,35 @@ class TestExpressionPlaybackResolution:
         tid, title, segs = _load_segments_for_playback(st, client=mock_client)
         assert tid == seeded_db["tx_frog"]
         assert len(segs) == 354
+
+    def test_play_bridge_text_artifact_returns_gracefully(self, seeded_db):
+        """Bridge targeting a text-only expression (search_query) must intercept cleanly with \\bookmark b<n> hint."""
+        from audiobench.core.db_session import get_session
+        from audiobench.storage.expression_repository import ExpressionRecord
+        from audiobench.cli.repl.session import ReplSession
+
+        from datetime import datetime, timezone
+        from unittest.mock import patch
+        with get_session() as sdb:
+            expr_query = ExpressionRecord(
+                content="test query content",
+                source_type="search_query",
+                created_at=datetime.now(timezone.utc),
+            )
+            sdb.add(expr_query)
+            sdb.commit()
+            query_eid = expr_query.id
+
+        mock_session = MagicMock(spec=ReplSession)
+        mock_client = MagicMock()
+
+        with patch("audiobench.cli.repl.backslash_commands.console.print") as mock_print:
+            success = _play_expression(mock_session, mock_client, query_eid, label="bridge [B3]")
+
+        assert success is False
+        mock_client.playback_play.assert_not_called()
+        printed = " ".join(str(c) for c in mock_print.call_args_list)
+        assert "Bridge [B3]" in printed
+        assert "search query artifact" in printed
+        assert "\\bookmark b3" in printed
+

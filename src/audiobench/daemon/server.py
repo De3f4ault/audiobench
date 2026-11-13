@@ -418,7 +418,7 @@ def _handle_autocomplete(args: dict[str, Any]) -> dict[str, Any]:
         repo = ExpressionRepository()
         expr_map = repo.get_by_ids(expression_ids, session=None)
 
-        work_ids = [expr.work_id for expr in expr_map.values() if expr.work_id is not None]
+        work_ids = [expr.work_id for expr in expr_map.values() if expr.work_id]
         work_map: dict[int, tuple[str | None, str | None]] = {}
         if work_ids:
             from audiobench.core.db_session import get_session
@@ -775,8 +775,8 @@ def _handle_playback_play(args: dict[str, Any]) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "start_pos": float(args.get("start_pos") or 0.0),
         "speed": float(args.get("speed") or 1.0),
-        "audio_file_id": args.get("audio_file_id"),
-        "transcription_id": args.get("transcription_id"),
+        "audio_file_id": args.get("audio_file_id") or None,
+        "transcription_id": args.get("transcription_id") or None,
     }
     if args.get("segments") is not None:
         kwargs["segments"] = args["segments"]
@@ -789,9 +789,9 @@ def _handle_playback_sync_session(args: dict[str, Any]) -> dict[str, Any]:
     svc = _get_playback_service()
     return svc.sync_session(
         args["file_path"],
-        transcription_id=args.get("transcription_id"),
+        transcription_id=args.get("transcription_id") or None,
         position=float(args.get("position") or 0.0),
-        audio_file_id=args.get("audio_file_id"),
+        audio_file_id=args.get("audio_file_id") or None,
     )
 
 
@@ -2080,6 +2080,7 @@ def run() -> None:
     os.environ.setdefault("OMP_NUM_THREADS", str(os.cpu_count() or 4))
     os.environ.setdefault("MKL_NUM_THREADS", str(os.cpu_count() or 4))
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
     settings = get_settings()
     socket_path = Path(settings.daemon_socket_path)

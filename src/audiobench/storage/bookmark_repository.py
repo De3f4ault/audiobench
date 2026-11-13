@@ -14,7 +14,12 @@ from pathlib import Path
 
 from sqlalchemy import asc, desc
 
-from audiobench.core.db_session import get_session
+from audiobench.core import db_session
+
+
+def get_session():
+    """Get database session dynamically from db_session module to prevent mock freeze across tests."""
+    return db_session.get_session()
 from audiobench.core.logger_factory import get_logger
 from audiobench.storage.models import AudioFileRecord, BookmarkRecord
 
@@ -580,9 +585,12 @@ class BookmarkRepository:
         if duration > 0.0 and (eff_pos >= duration - 3.0 or eff_pos >= duration * 0.98):
             eff_pos = 0.0
 
+        if not transcription_id:
+            return eff_pos
+
         with get_session() as session:
             af_id = audio_file_id
-            if af_id is None:
+            if not af_id and transcription_id:
                 from audiobench.storage.models import TranscriptionRecord
 
                 tx = (
@@ -593,7 +601,7 @@ class BookmarkRepository:
                 if tx and tx.audio_file_id:
                     af_id = tx.audio_file_id
 
-            if af_id is None:
+            if not af_id:
                 logger.warning(
                     "Cannot save resume position for tx #%s: missing audio_file_id",
                     transcription_id,

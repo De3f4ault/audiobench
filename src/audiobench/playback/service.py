@@ -15,7 +15,7 @@ Design decisions:
       b) Every 30 seconds via a background timer (covers crash mid-chapter)
     The 30s timer write is unconditional — if audio is playing in DECOUPLED
     reader mode the position IS advancing, so writes remain useful.
-  - load_file() (which contains a 50ms yield for start_pos seeks) is called
+  - load_file() (which applies per-file atomic demuxer start_pos) is called
     outside self._lock to avoid holding the lock during blocking I/O.
   - Segments are loaded from DB by transcription_id (not passed over the wire)
   - Every mutating method returns status() so the client always has current state
@@ -86,6 +86,9 @@ class PlaybackService:
         self._loop_b: float | None = None
         self._filter: str = ""
 
+        # Last EOF reason string ('eof', 'stop', 'error', etc.)
+        self._last_eof_reason: str | None = None
+
     # ── Database Helpers ─────────────────────────────────────
 
     @staticmethod
@@ -117,12 +120,14 @@ class PlaybackService:
 
     @staticmethod
     def _write_resume_position(
-        transcription_id: int,
+        transcription_id: int | None,
         position: float,
         audio_file_id: int | None,
         duration: float,
     ) -> None:
         """Write a resume bookmark to SQLite (best-effort; never raises)."""
+        if not transcription_id:
+            return
         try:
             from audiobench.storage.bookmark_repository import BookmarkRepository
 
@@ -370,9 +375,10 @@ class PlaybackService:
                 "loop_a": self._loop_a,
                 "loop_b": self._loop_b,
                 "filter": self._filter,
+                "last_eof_reason": self._last_eof_reason,
             }
 
-        if not self._check_mpv_alive():
+        if not self._check_mpv_alive() or self._current_file is None:
             return {
                 "playing": False,
                 "paused": False,
@@ -386,6 +392,7 @@ class PlaybackService:
                 "loop_a": None,
                 "loop_b": None,
                 "filter": "",
+                "last_eof_reason": self._last_eof_reason,
             }
 
         pos, speed, paused = self._mpv.get_playback_state()  # type: ignore[union-attr]
@@ -407,6 +414,7 @@ class PlaybackService:
             "loop_a": self._loop_a,
             "loop_b": self._loop_b,
             "filter": self._filter,
+            "last_eof_reason": self._last_eof_reason,
         }
 
     # ── Position Persistence Timer ───────────────────────────
@@ -434,7 +442,7 @@ class PlaybackService:
     def _on_pos_timer_fired(self) -> None:
         """Periodic 30s callback — write current position to SQLite."""
         with self._lock:
-            if not self._check_mpv_alive() or self._transcription_id is None:
+            if not self._check_mpv_alive() or not self._transcription_id:
                 return
             pos = self._mpv.get_position()  # type: ignore[union-attr]
             dur = self._mpv.get_duration()  # type: ignore[union-attr]
@@ -459,7 +467,13 @@ class PlaybackService:
         finished_file = None
 
         with self._lock:
+            # If playback was already stopped (current_file is None), do not allow
+            # a trailing/stale EOF event from the reader thread to overwrite state or last_eof_reason.
+            if self._current_file is None:
+                return
+
             self._cancel_pos_timer()
+            self._last_eof_reason = reason
             if reason not in ("eof",):
                 # stop/error/redirect — not a natural completion
                 return
@@ -475,7 +489,11 @@ class PlaybackService:
             interrupted = self._interrupted_playback
             self._interrupted_playback = None
 
-        if tx_id is not None:
+            # If no interrupted track is waiting to resume, mark current track ended
+            if interrupted is None:
+                self._current_file = None
+
+        if tx_id:
             self._write_resume_position(tx_id, pos, af_id, dur)
 
         if interrupted and finished_file:
@@ -518,7 +536,7 @@ class PlaybackService:
         on EOF.
 
         Lock discipline: self._lock is held only for state reads/writes.
-        All blocking I/O (DB write, load_file with its 50ms seek yield) runs
+        All blocking I/O (DB write, load_file call) runs
         outside the lock.
         """
         start_pos = float(start_pos or 0.0)
@@ -528,6 +546,7 @@ class PlaybackService:
         # ── Phase 1: capture current state under lock ─────────────────────
         with self._lock:
             self._external = False
+            self._last_eof_reason = None
             same_file = (
                 self._check_mpv_alive()
                 and self._current_file == abs_target
@@ -622,7 +641,7 @@ class PlaybackService:
 
         MUST be called with self._lock held.
         """
-        if transcription_id is not None:
+        if transcription_id:
             segs = self._load_segments_from_db(transcription_id)
             self._segments = segs
             self._segment_starts = [s["start"] for s in segs]
@@ -743,20 +762,8 @@ class PlaybackService:
             self._loop_a = None
             self._loop_b = None
             self._filter = ""
-            return {
-                "playing": False,
-                "paused": False,
-                "state": "stopped",
-                "position": 0.0,
-                "duration": 0.0,
-                "speed": 1.0,
-                "file": None,
-                "audio_file_id": None,
-                "transcription_id": None,
-                "loop_a": None,
-                "loop_b": None,
-                "filter": "",
-            }
+            self._last_eof_reason = "stop"
+            return self._status_unlocked()
 
     def status(self) -> dict[str, Any]:
         """Return current playback state (thread-safe)."""

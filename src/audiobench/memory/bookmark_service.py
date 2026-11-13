@@ -164,6 +164,9 @@ def generate_smart_bookmark_card(
     Returns:
         Populated SmartBookmarkCard with rendered markdown.
     """
+    if not expression_id:
+        raise ValueError("Invalid expression ID (must be positive non-zero integer).")
+
     with get_session() as session:
         # 1. Fetch source expression details
         row = session.execute(
@@ -280,7 +283,7 @@ def generate_smart_bookmark_card(
                     following_resolution = s_content.strip()
 
         # -------------------------------------------------------------
-        # Tier 2: Cross-Library Dialectic Bridges
+        # Tier 2: Cross-Library Semantic Bridges
         # -------------------------------------------------------------
         bridges_raw = session.execute(
             text("""
@@ -416,7 +419,7 @@ def generate_smart_bookmark_card(
     md_lines.extend([
         "",
         "---",
-        "#### Tier 2: Cross-Library Dialectic Bridges",
+        "#### Tier 2: Cross-Library Semantic Bridges",
     ])
 
     if dialectic_bridges:
@@ -427,7 +430,7 @@ def generate_smart_bookmark_card(
                 f"  > \"{b.snippet[:200]}...\""
             )
     else:
-        md_lines.append("*No cross-library dialectic bridges detected above threshold.*")
+        md_lines.append("*No cross-library semantic bridges detected above threshold.*")
 
     if consensus_triangle:
         md_lines.extend([

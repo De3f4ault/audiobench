@@ -148,6 +148,10 @@ def _check_bridge_staleness(session: ReplSession, bridge: Any, b_idx: int) -> No
       ``for_cite`` is unknown.
     """
     bridge_eid = getattr(bridge, "target_expression_id", None)
+    bridge_sources: set[int] = getattr(session, "last_bookmark_bridge_sources", set())
+    if bridge_eid and bridge_eid in bridge_sources:
+        return
+
     citations: dict[int, int] = getattr(session, "last_synthesis_citations", {})
     for_cite: int | None = getattr(session, "last_bookmark_bridges_for_cite", None)
 
@@ -165,8 +169,9 @@ def _check_bridge_staleness(session: ReplSession, bridge: Any, b_idx: int) -> No
             refresh_hint = f"\\bookmark cite {max(citations.keys())}"
         else:
             refresh_hint = f"\\bookmark {bridge_eid}"
+        built_from = getattr(session, "last_bookmark_bridges_for_eid", None) or bridge_eid
         console.print(
-            f"  [{WARNING}]⚠ Bridge b{b_idx} is stale — built from expression #{bridge_eid}. "
+            f"  [{WARNING}]⚠ Bridge b{b_idx} is stale — built from expression #{built_from}. "
             f"Run [{ACCENT}]{refresh_hint}[/] to refresh.[/]"
         )
 
@@ -2191,6 +2196,11 @@ def _render_smart_bookmark_card(
     # cmd_play / cmd_focus can detect staleness via citation-EID comparison.
     session.last_bookmark_bridges_for_eid = getattr(card, "expression_id", None)
     session.last_bookmark_bridges_for_cite = cite_num
+    session.last_bookmark_bridge_sources = {
+        getattr(b, "target_expression_id", None)
+        for b in session.last_bookmark_bridges.values()
+        if getattr(b, "target_expression_id", None) is not None
+    }
 
     term_width = (console.size.width if hasattr(console, "size") and console.size else None) or console.width or 80
     avail_w = max(40, term_width - 4)
@@ -2409,10 +2419,24 @@ def cmd_bookmark(session: ReplSession, args: str) -> None:
             )
         console.print(table)
         return
+    elif (sub.startswith("b") and sub[1:].isdigit()) or (sub.startswith("bridge") and sub[6:].strip().isdigit()):
+        b_idx = int(sub[1:]) if sub.startswith("b") else int(sub[6:].strip())
+        bridges = getattr(session, "last_bookmark_bridges", {})
+        if b_idx not in bridges:
+            console.print(f"  [{WARNING}]Semantic bridge [B{b_idx}] not found in current card. Run \\bookmark cite <n> first.[/]")
+            return
+        expr_id = getattr(bridges[b_idx], "target_expression_id", None)
+        if not expr_id:
+            console.print(f"  [{WARNING}]Semantic bridge [B{b_idx}] does not have a valid expression ID.[/]")
+            return
     elif sub.isdigit():
         expr_id = int(sub)
     else:
-        console.print(f"  [{WARNING}]Unknown argument: '{args}'. Run \\bookmark <id> or \\bookmark cite <n>[/]")
+        console.print(f"  [{WARNING}]Unknown argument: '{args}'. Run \\bookmark <id>, \\bookmark cite <n>, or \\bookmark b<n>[/]")
+        return
+
+    if not expr_id:
+        console.print(f"  [{WARNING}]Invalid expression ID.[/]")
         return
 
     try:
@@ -2622,6 +2646,7 @@ def cmd_synthesize(session: ReplSession, args: str) -> None:
         # Unconditional overwrite — newest synthesis always wins (EC-11).
         session.last_synthesis_citations = resp.citations
         session._synthesis_command_snapshot = max(1, session._command_count)
+        session.last_bookmark_bridge_sources = set()
 
         console.print("")
         console.print(Markdown(resp.synthesis_text))
@@ -2698,7 +2723,7 @@ def cmd_suggest(session: ReplSession, args: str) -> None:
                     ).fetchone()
                     if row:
                         curr_wid = row[0]
-                elif session.last_id is not None:
+                elif session.last_id:
                     row = sdb.execute(
                         _sql("""
                             SELECT COALESCE(
@@ -2711,7 +2736,7 @@ def cmd_suggest(session: ReplSession, args: str) -> None:
                     if row:
                         curr_wid = row[0]
 
-                if curr_wid is not None:
+                if curr_wid:
                     curr_work = sdb.query(WorkRecord).filter_by(id=curr_wid).first()
                     work_title = curr_work.title if curr_work else f"Work #{curr_wid}"
                     work_author = curr_work.author if curr_work and curr_work.author else ""
@@ -3762,6 +3787,9 @@ def _play_expression(
     label: str = "",
 ) -> bool:
     """Resolve and initiate playback for any semantic expression (transcript or chapter)."""
+    if not expr_id:
+        return False
+
     from audiobench.core.db_session import get_session
     from audiobench.playback.controls import fmt_timestamp
     from sqlalchemy import text as _sql
@@ -3772,14 +3800,23 @@ def _play_expression(
             {"eid": expr_id},
         ).fetchone()
         source_type = st_row[0] if st_row else ""
-        if source_type in ("search_synthesis", "search_session_summary", "chat_message", "journal_entry"):
-            target_desc = label.capitalize() if label else f"Expression #{expr_id}"
-            type_label = (
-                "prior research synthesis" if source_type == "search_synthesis"
-                else "past research session summary" if source_type == "search_session_summary"
-                else "chat reflection" if source_type == "chat_message"
-                else "cognitive journal entry"
-            )
+        text_source_labels = {
+            "search_synthesis": "prior research synthesis",
+            "search_query": "search query artifact",
+            "search_session_summary": "past research session summary",
+            "session_summary": "past research session summary",
+            "chat_message": "chat reflection",
+            "journal_entry": "cognitive journal entry",
+            "ask_query": "inquiry query",
+            "ask_answer": "inquiry response",
+            "daemon_calibration": "system calibration artifact",
+            "daemon_proposal": "system proposal",
+            "system_inference": "system inference",
+            "bookmark": "bookmark record",
+        }
+        if source_type in text_source_labels:
+            target_desc = (label[0].upper() + label[1:]) if label else f"Expression #{expr_id}"
+            type_label = text_source_labels[source_type]
             console.print(
                 f"  [{DIM}]{target_desc} (Expression #{expr_id}) is a text-based {type_label}, "
                 f"not an audio recording.[/]"

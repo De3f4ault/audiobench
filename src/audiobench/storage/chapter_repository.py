@@ -16,7 +16,12 @@ from functools import lru_cache
 from sqlalchemy import asc
 
 from audiobench.chapters.cue_parser import ChapterInfo
-from audiobench.core.db_session import get_session
+from audiobench.core import db_session
+
+
+def get_session():
+    """Get database session dynamically from db_session module to prevent mock freeze across tests."""
+    return db_session.get_session()
 from audiobench.core.logger_factory import get_logger
 from audiobench.storage.models import ChapterRecord
 
@@ -138,9 +143,9 @@ class ChapterRepository:
                 .join(AudioFileRecord, ChapterRecord.audio_file_id == AudioFileRecord.id)
                 .filter(ChapterRecord.is_ghost == 0)
             )
-            if audio_file_id is not None:
+            if audio_file_id:
                 query = query.filter(ChapterRecord.audio_file_id == audio_file_id)
-            if work_id is not None:
+            if work_id:
                 query = query.filter(AudioFileRecord.work_id == work_id)
 
             has_seq = case(
