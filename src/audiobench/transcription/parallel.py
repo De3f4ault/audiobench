@@ -1,10 +1,11 @@
-import os
-import time
 import multiprocessing
+import os
 import subprocess
+import time
 from pathlib import Path
 
-from audiobench.cli.display.theme import console, SUCCESS, DIM, BOLD, ACCENT, error_panel
+from audiobench.cli.display.theme import ACCENT, BOLD, DIM, SUCCESS, console, error_panel
+
 
 def detect_gpus() -> int:
     try:
@@ -13,7 +14,7 @@ def detect_gpus() -> int:
             return torch.cuda.device_count()
     except ImportError:
         pass
-        
+
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
@@ -22,7 +23,7 @@ def detect_gpus() -> int:
         return len([l for l in result.stdout.strip().split('\n') if l.strip()])
     except (FileNotFoundError, subprocess.CalledProcessError):
         pass
-    
+
     return 0
 
 def warm_model_cache(model_name: str):
@@ -43,11 +44,11 @@ def _worker_process(gpu_id: int, queue: multiprocessing.Queue, total_files: int,
     os.environ["AUDIOBENCH_DATA_DIR"] = db_dir
     os.environ["AUDIOBENCH_DATABASE_URL"] = f"sqlite:///{db_dir}/transcriptions.db"
 
-    from audiobench.transcribe.transcriber import TranscriptionPipeline
     from audiobench.cli.io.output_resolver import resolve_output
-    
+    from audiobench.transcribe.transcriber import TranscriptionPipeline
+
     pipeline = TranscriptionPipeline()
-    
+
     while True:
         try:
             file_idx, file_path = queue.get_nowait()
@@ -55,12 +56,12 @@ def _worker_process(gpu_id: int, queue: multiprocessing.Queue, total_files: int,
             break
         except Exception:
             break
-            
+
         input_p = Path(file_path)
         print(f"[GPU {gpu_id}] [{file_idx}/{total_files}] Processing {input_p.name} ...", flush=True)
-        
+
         start_time = time.perf_counter()
-        
+
         try:
             resolved_output, resolved_format = resolve_output(
                 str(file_path),
@@ -70,7 +71,7 @@ def _worker_process(gpu_id: int, queue: multiprocessing.Queue, total_files: int,
                 input_base_dir=opts.get("input_base_dir"),
                 collision=opts.get("collision"),
             )
-            
+
             if resolved_output is None and opts.get("collision") == "skip":
                 print(f"[GPU {gpu_id}] [{file_idx}/{total_files}] Skipped {input_p.name} (exists)", flush=True)
                 continue
@@ -105,11 +106,11 @@ def _worker_process(gpu_id: int, queue: multiprocessing.Queue, total_files: int,
                 on_phase=tracker.update,
                 on_segment=tracker.on_segment,
             )
-            
+
             elapsed = time.perf_counter() - start_time
             if transcript:
                 speed_ratio = transcript.duration_seconds / elapsed if elapsed > 0 else 0
-                
+
                 # output extra formats if any
                 extra_formats = opts.get("extra_formats", [])
                 if extra_formats:
@@ -129,33 +130,33 @@ def _worker_process(gpu_id: int, queue: multiprocessing.Queue, total_files: int,
                             Path(extra_out).parent.mkdir(parents=True, exist_ok=True)
                             Path(extra_out).write_text(content, encoding="utf-8")
 
-                print(f"[GPU {gpu_id}] [{file_idx}/{total_files}] ✅ Done {input_p.name} ({elapsed:.1f}s, {speed_ratio:.1f}x)", flush=True)
+                print(f"[GPU {gpu_id}] [{file_idx}/{total_files}] [OK] Done {input_p.name} ({elapsed:.1f}s, {speed_ratio:.1f}x)", flush=True)
             else:
-                print(f"[GPU {gpu_id}] [{file_idx}/{total_files}] ✅ Done {input_p.name} ({elapsed:.1f}s)", flush=True)
-                
+                print(f"[GPU {gpu_id}] [{file_idx}/{total_files}] [OK] Done {input_p.name} ({elapsed:.1f}s)", flush=True)
+
         except Exception as e:
-            print(f"[GPU {gpu_id}] [{file_idx}/{total_files}] ❌ ERROR {input_p.name}: {e}", flush=True)
+            print(f"[GPU {gpu_id}] [{file_idx}/{total_files}] [ERR] ERROR {input_p.name}: {e}", flush=True)
 
 class ParallelTranscriber:
     def run(self, files: list, opts: dict):
         gpu_count = detect_gpus()
-        
+
         workers = opts.get("workers", 0)
         if workers <= 0:
             workers = gpu_count
-            
+
         if workers < 1:
             console.print(error_panel("Parallel Transcription", "No GPUs detected and workers=0. Falling back to 1 worker."))
             workers = 1
-            
-        console.print(f"  [{ACCENT}]🖥️  Detected {gpu_count} GPU(s) — spawning {workers} worker(s)[/]")
-        
+
+        console.print(f"  [{ACCENT}]Detected {gpu_count} GPU(s) — spawning {workers} worker(s)[/]")
+
         if opts.get("model"):
             warm_model_cache(opts.get("model"))
-            
+
         manager = multiprocessing.Manager()
         queue = manager.Queue()
-        
+
         from audiobench.cli.io.output_resolver import resolve_output
         pending_files = []
         for f in files:
@@ -170,16 +171,16 @@ class ParallelTranscriber:
             if resolved_output is None and opts.get("collision") == "skip":
                 continue
             pending_files.append(f)
-            
+
         total_files = len(pending_files)
-        console.print(f"  [{BOLD}]📋 {total_files} files pending → dynamic queue[/]\n")
-        
+        console.print(f"  [{BOLD}][{total_files} files pending → dynamic queue][/]\n")
+
         if total_files == 0:
             return
-            
+
         for i, f in enumerate(pending_files, 1):
             queue.put((i, str(f)))
-            
+
         processes = []
         # Ensure multiprocessing context is spawn to avoid CUDA initialization issues
         ctx = multiprocessing.get_context('spawn')
@@ -188,8 +189,8 @@ class ParallelTranscriber:
             p = ctx.Process(target=_worker_process, args=(gpu_id, queue, total_files, opts))
             p.start()
             processes.append(p)
-            
+
         for p in processes:
             p.join()
-            
-        console.print(f"\n  [{SUCCESS}]🎉 All parallel workers finished![/]")
+
+        console.print(f"\n  [{SUCCESS}]All parallel workers finished![/]")

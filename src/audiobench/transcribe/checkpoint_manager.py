@@ -16,7 +16,7 @@ class CheckpointManager:
         # since we only care about resuming a specific file that failed recently.
         key = str(self.file_path.absolute()).encode("utf-8")
         self.hash_prefix = hashlib.sha256(key).hexdigest()[:12]
-        
+
         self.checkpoint_dir = get_settings().data_dir / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 

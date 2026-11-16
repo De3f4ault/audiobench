@@ -157,6 +157,7 @@ class Transcript(BaseModel):
     )
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     chapters: list[dict] = Field(default_factory=list, description="Associated chapters metadata")
+    is_cached: bool = Field(default=False, description="Whether this transcript was retrieved from cache")
 
     @computed_field  # type: ignore[prop-decorator]
     @property

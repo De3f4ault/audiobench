@@ -31,7 +31,7 @@ from audiobench.transcribe.audio_converter import AudioLoader
 from audiobench.transcribe.checkpoint_manager import CheckpointManager
 from audiobench.transcribe.engines.engine_protocol import TranscriptionEngine
 from audiobench.transcribe.engines.engine_registry import create_engine
-from audiobench.transcribe.transcription_result import AudioMetadata, Segment, Transcript
+from audiobench.transcribe.transcription_result import AudioMetadata, Segment, Transcript, Word
 
 _POST_PROCESS_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="postproc")
 
@@ -890,10 +890,41 @@ class TranscriptionPipeline:
                 logger.warning("Auto-naming failed (continuing without): %s", e)
 
     def _merge_transcripts(self, results: list[Transcript]) -> Transcript:
-        """Merge a list of chapter transcripts into a single unified Transcript."""
+        """Merge a list of chapter transcripts into a single unified Transcript.
+
+        Uses word-level LCS stitching if chapters/chunks have overlapping audio padding.
+        """
+        if not results:
+            raise ValueError("Cannot merge empty transcript list")
+
+        from audiobench.transcribe.stitcher import stitch_chunk_segments
+
         merged = results[0]
         for r in results[1:]:
-            merged.segments.extend(r.segments)
+            if not r.segments:
+                continue
+            if not merged.segments:
+                merged.segments = r.segments
+                continue
+
+            last_end = merged.segments[-1].end
+            first_start = r.segments[0].start
+
+            # If adjacent transcripts overlap by > 0.5s, stitch word-by-word
+            if first_start < last_end - 0.5:
+                merged_dicts = [s.model_dump() for s in merged.segments]
+                r_dicts = [s.model_dump() for s in r.segments]
+                stitched_dicts = stitch_chunk_segments(merged_dicts, r_dicts, overlap_start=first_start)
+
+                rebuilt_segments = []
+                for idx, sd in enumerate(stitched_dicts):
+                    words = [Word(**w) for w in sd.get("words", []) if isinstance(w, dict)]
+                    sd_copy = {k: v for k, v in sd.items() if k not in ("words", "id")}
+                    rebuilt_segments.append(Segment(**sd_copy, id=idx, words=words))
+                merged.segments = rebuilt_segments
+            else:
+                merged.segments.extend(r.segments)
+
             merged.duration_seconds = max(merged.duration_seconds, r.duration_seconds)
         return merged
 

@@ -353,16 +353,23 @@ def generate_and_apply_title(tx_id: int, force_gemini: bool = False, force_disk:
 def _add_pending_tag(tx_id: int) -> None:
     """Add the pending_auto_rename tag to the parent AudioFileRecord."""
     with get_session() as session:
-        tx_record = session.query(TranscriptionRecord).get(tx_id)
+        tx_record = session.get(TranscriptionRecord, tx_id)
         if tx_record and tx_record.audio_file_id:
-            audio_record = session.query(AudioFileRecord).get(tx_record.audio_file_id)
+            audio_record = session.get(AudioFileRecord, tx_record.audio_file_id)
             if audio_record:
                 try:
-                    tags_list = json.loads(audio_record.tags) if audio_record.tags else []
+                    data = json.loads(audio_record.tags) if audio_record.tags else []
                 except Exception:
-                    tags_list = []
-                if "pending_auto_rename" not in tags_list:
-                    tags_list.append("pending_auto_rename")
+                    data = []
+                if isinstance(data, dict):
+                    labels = data.setdefault("_labels", [])
+                    if "pending_auto_rename" not in labels:
+                        labels.append("pending_auto_rename")
+                    audio_record.tags = json.dumps(data)
+                else:
+                    tags_list = data if isinstance(data, list) else []
+                    if "pending_auto_rename" not in tags_list:
+                        tags_list.append("pending_auto_rename")
                     audio_record.tags = json.dumps(tags_list)
         session.commit()
 
@@ -370,18 +377,26 @@ def _add_pending_tag(tx_id: int) -> None:
 def _remove_pending_tag(audio_record: AudioFileRecord) -> None:
     """Remove the pending_auto_rename tag from an AudioFileRecord in-memory."""
     try:
-        tags_list = json.loads(audio_record.tags) if audio_record.tags else []
+        data = json.loads(audio_record.tags) if audio_record.tags else []
     except Exception:
-        tags_list = []
-    if "pending_auto_rename" in tags_list:
-        tags_list.remove("pending_auto_rename")
-        audio_record.tags = json.dumps(tags_list)
+        data = []
+    if isinstance(data, dict):
+        labels = data.get("_labels", [])
+        if "pending_auto_rename" in labels:
+            labels.remove("pending_auto_rename")
+            audio_record.tags = json.dumps(data)
+    elif isinstance(data, list):
+        if "pending_auto_rename" in data:
+            data.remove("pending_auto_rename")
+            audio_record.tags = json.dumps(data)
 
 
 # ─── Background spawn ─────────────────────────────────────────────────────────
 
 def spawn_auto_naming(tx_id: int) -> None:
-    """Spawn a background thread to generate a title and rename the file."""
+    """Spawn a background task to generate a title and rename the file."""
+    from audiobench.transcribe.transcriber import _POST_PROCESS_POOL
+
     def _run() -> None:
         try:
             success, msg = generate_and_apply_title(tx_id)
@@ -390,6 +405,5 @@ def spawn_auto_naming(tx_id: int) -> None:
         except Exception as e:
             logger.warning("Background auto-rename thread crashed for #%d: %s", tx_id, e)
 
-    thread = threading.Thread(target=_run, name=f"rename-{tx_id}", daemon=True)
-    thread.start()
-    logger.info("Spawned background auto-rename thread for #%d", tx_id)
+    _POST_PROCESS_POOL.submit(_run)
+    logger.info("Submitted background auto-rename task for #%d", tx_id)

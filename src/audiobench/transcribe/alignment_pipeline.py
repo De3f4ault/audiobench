@@ -34,11 +34,11 @@ Gemini and Whisper use slightly different words.
 
 import gc
 import logging
-import math
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from audiobench.transcribe.transcription_result import Transcript, Word
+from audiobench.transcribe.transcription_result import Transcript
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +90,7 @@ def align_transcript(
     audio_path: str | Path,
     model: Any,
     on_progress: Callable | None = None,
-) -> Transcript:
+) -> tuple[Transcript, bool]:
     """Align Gemini segment timestamps using faster-whisper re-transcription.
 
     Parameters
@@ -104,10 +104,18 @@ def align_transcript(
     on_progress:
         Optional callback fired for each segment after alignment.
 
-    Returns the mutated *transcript* with updated timestamps.
+    Returns
+    -------
+    tuple[Transcript, bool]
+        The mutated *transcript* with updated timestamps, and a boolean
+        ``has_clamped`` that is ``True`` if any Whisper segment had a
+        backward-jumping start time and was clamped forward.  A clamped
+        transcript has monotonic but potentially distorted timing in the
+        affected region and should be marked ``pipeline_phase='degraded'``
+        with ``failure_reason='timeline_clamped'``.
     """
     if not transcript.segments:
-        return transcript
+        return transcript, False
 
     audio_path = Path(audio_path)
 
@@ -120,11 +128,11 @@ def align_transcript(
         whisper_segments = _transcribe_for_timestamps(model, audio_path, transcript)
     except Exception as exc:
         logger.error("Alignment: faster-whisper transcription failed: %s", exc)
-        return transcript
+        return transcript, False
 
     if not whisper_segments:
         logger.warning("Alignment: faster-whisper returned no segments — keeping proportional timestamps")
-        return transcript
+        return transcript, False
 
     logger.info(
         "Alignment: faster-whisper produced %d segments covering %.0f–%.0fs",
@@ -132,6 +140,10 @@ def align_transcript(
         whisper_segments[0]["start"],
         whisper_segments[-1]["end"],
     )
+
+    # ── Step 1b: sanitize Whisper timeline (detect backward jumps) ────────────
+    tx_id = getattr(transcript, "id", None)
+    whisper_segments, has_clamped = _sanitize_whisper_segments(whisper_segments, tx_id)
 
     # ── Step 2: patch transcript duration from the whisper timeline ───────────
     if whisper_segments:
@@ -148,7 +160,7 @@ def align_transcript(
             on_progress(segment)
 
     gc.collect()
-    return transcript
+    return transcript, has_clamped
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +211,72 @@ def _transcribe_for_timestamps(
 
 
 # ---------------------------------------------------------------------------
+# Internal: Whisper timeline sanitization
+# ---------------------------------------------------------------------------
+
+def _sanitize_whisper_segments(
+    whisper_segments: list[dict],
+    tx_id: int | None = None,
+) -> tuple[list[dict], bool]:
+    """Enforce a monotonically increasing Whisper timeline.
+
+    When faster-whisper outputs a segment whose start time precedes the
+    previous segment's end time (a backward jump), this function clamps
+    the offending segment's start to the previous end.  The resulting
+    timeline is monotonic but the timing for the clamped region is
+    distorted — those Gemini segments will receive plausible-but-wrong
+    timestamps.
+
+    The caller MUST surface this distortion rather than hiding it:
+
+    * The function logs a WARNING for every clamp, including the segment
+      index and the clamp amount in seconds.
+    * It returns ``has_clamped=True`` so the alignment worker can mark
+      the transcript ``pipeline_phase='degraded'`` with
+      ``failure_reason='timeline_clamped'``.
+
+    Parameters
+    ----------
+    whisper_segments:
+        Raw segment dicts from ``_transcribe_for_timestamps``.
+    tx_id:
+        Transcription ID, included in log messages for traceability.
+
+    Returns
+    -------
+    tuple[list[dict], bool]
+        Sanitized segment list and ``has_clamped`` flag.
+    """
+    sanitized: list[dict] = []
+    last_end = 0.0
+    has_clamped = False
+
+    for idx, seg in enumerate(whisper_segments):
+        s = float(seg["start"])
+        e = float(seg["end"])
+
+        if s < last_end:
+            shift = last_end - s
+            logger.warning(
+                "Alignment: Whisper timeline backward jump on tx=%s whisper_seg_idx=%d "
+                "(start=%.3fs < last_end=%.3fs, clamping forward by %.3fs). "
+                "Timing in this region will be distorted. Transcript will be flagged degraded.",
+                tx_id, idx, s, last_end, shift,
+            )
+            s = last_end
+            has_clamped = True
+
+        if e <= s:
+            orig_dur = float(seg["end"]) - float(seg["start"])
+            e = s + max(0.1, orig_dur if orig_dur > 0 else 0.5)
+
+        sanitized.append({**seg, "start": s, "end": e})
+        last_end = e
+
+    return sanitized, has_clamped
+
+
+# ---------------------------------------------------------------------------
 # Internal: cumulative character-count interpolation
 # ---------------------------------------------------------------------------
 
@@ -210,12 +288,19 @@ def _map_timestamps(
 
     Strategy: cumulative character count as a proxy for elapsed time.
 
-    1. Build a list of (cumulative_chars, time) anchors from the Whisper
-       segments.  Cumulative chars increase monotonically; time is the
-       segment *start* time.
-    2. For each Gemini segment, compute where its cumulative character
-       position falls in that anchor list and linearly interpolate the
-       corresponding time.
+    Anchors are 4-tuples ``(c_start, c_end, t_start, t_end)`` representing
+    a single Whisper segment's character span and time span.  Interpolation
+    for a target character position is performed **inside** the containing
+    segment's own spoken interval — never across the silence gap between
+    adjacent segments.
+
+    This eliminates the cross-gap interpolation defect (line 315, commit
+    963a0b0) that produced inverted timestamps whenever ``hi_start <
+    lo_end`` (Whisper segment K+1 starts before segment K ends).  The
+    old formula ``lo_end + frac * (hi_start − lo_end)`` had a negative
+    slope under that condition; the new formula ``t_start + frac *
+    (t_end − t_start)`` is always non-decreasing because ``t_end >=
+    t_start`` is guaranteed by ``_sanitize_whisper_segments``.
 
     This works because:
     - Speech rate is roughly constant in talking-head / lecture audio.
@@ -230,13 +315,15 @@ def _map_timestamps(
     if not whisper_segments or not transcript.segments:
         return
 
-    # Build cumulative char anchors from the Whisper side.
-    # Each anchor: (cumulative_chars_at_this_segment_start, start_sec, end_sec)
-    w_anchors: list[tuple[float, float, float]] = []
+    # Build 4-tuple anchors: (c_start, c_end, t_start, t_end)
+    # c_start/c_end are cumulative character positions in the Whisper timeline.
+    # t_start/t_end are the segment's audio timestamps (monotonic after sanitization).
+    w_anchors: list[tuple[float, float, float, float]] = []
     cum = 0.0
     for seg in whisper_segments:
-        w_anchors.append((cum, seg["start"], seg["end"]))
-        cum += max(1, seg["char_count"])
+        c = max(1, seg["char_count"])
+        w_anchors.append((cum, cum + c, float(seg["start"]), float(seg["end"])))
+        cum += c
     w_total_chars = cum
 
     # Build cumulative char positions for Gemini segments
@@ -245,8 +332,11 @@ def _map_timestamps(
     if g_total_chars == 0 or w_total_chars == 0:
         return
 
+    max_time = whisper_segments[-1]["end"]
+    prev_start = 0.0
     cum_g = 0.0
-    for seg in transcript.segments:
+
+    for i, seg in enumerate(transcript.segments):
         n_chars = max(1, len(seg.text))
 
         # Fractional position of this Gemini segment in [0, 1]
@@ -257,44 +347,66 @@ def _map_timestamps(
         w_char_start = g_frac_start * w_total_chars
         w_char_end   = g_frac_end   * w_total_chars
 
-        seg.start = _interpolate_time(w_anchors, w_char_start, whisper_segments[-1]["end"])
-        seg.end   = _interpolate_time(w_anchors, w_char_end,   whisper_segments[-1]["end"])
+        seg.start = _interpolate_time(w_anchors, w_char_start, max_time)
+        seg.end   = _interpolate_time(w_anchors, w_char_end,   max_time)
 
-        # Safety: end must be > start
-        if seg.end <= seg.start:
-            seg.end = seg.start + 0.5
+        # These conditions should not occur after sanitization, but must
+        # stay detectable rather than silently corrected.
+        if seg.end < seg.start:
+            logger.error(
+                "Alignment: inverted segment on tx=%s idx=%d start=%.3f end=%.3f — "
+                "the formula has a bug that survived sanitization, please report.",
+                getattr(transcript, "id", "?"), i, seg.start, seg.end,
+            )
+        elif i > 0 and seg.start < prev_start:
+            logger.error(
+                "Alignment: non-monotonic segment on tx=%s idx=%d start=%.3f < prev=%.3f — "
+                "the formula has a bug that survived sanitization, please report.",
+                getattr(transcript, "id", "?"), i, seg.start, prev_start,
+            )
 
+        prev_start = seg.start
         cum_g += n_chars
 
 
 def _interpolate_time(
-    anchors: list[tuple[float, float, float]],
+    anchors: list[tuple[float, float, float, float]],
     target_chars: float,
     max_time: float,
 ) -> float:
-    """Linearly interpolate a time value from the Whisper char-time anchors.
+    """Interpolate a time value from 4-tuple Whisper char-time anchors.
+
+    Each anchor is ``(c_start, c_end, t_start, t_end)`` representing one
+    Whisper segment.  The target character position is looked up in the
+    anchor whose ``[c_start, c_end)`` interval contains it, and the result
+    is linearly interpolated within ``[t_start, t_end]``.
+
+    Because ``t_end >= t_start`` for all anchors (guaranteed by
+    ``_sanitize_whisper_segments``), the returned value is always
+    non-decreasing as ``target_chars`` increases — the inversion defect
+    present in the previous 3-tuple / cross-gap formula cannot occur.
 
     Parameters
     ----------
     anchors:
-        Sorted list of (cumulative_chars, seg_start_sec, seg_end_sec).
+        Sorted list of (c_start, c_end, t_start, t_end) from ``_map_timestamps``.
     target_chars:
-        The cumulative character position to look up.
+        The cumulative Whisper character position to look up.
     max_time:
-        Clip result to this upper bound (last whisper segment end time).
+        Upper bound: the end time of the last Whisper segment.
     """
     if not anchors:
         return 0.0
 
-    # Clamp below
+    # Clamp below: target is before all whisper content
     if target_chars <= anchors[0][0]:
-        return anchors[0][1]
+        return anchors[0][2]  # t_start of first anchor
 
-    # Clamp above
-    if target_chars >= anchors[-1][0]:
-        return min(max_time, anchors[-1][2])
+    # Clamp above: target is after all whisper content
+    if target_chars >= anchors[-1][1]:
+        return min(max_time, anchors[-1][3])  # t_end of last anchor
 
-    # Binary search for the surrounding pair of anchors
+    # Binary search for the anchor whose [c_start, c_end) contains target_chars
     lo, hi = 0, len(anchors) - 1
     while lo + 1 < hi:
         mid = (lo + hi) // 2
@@ -303,16 +415,15 @@ def _interpolate_time(
         else:
             hi = mid
 
-    lo_chars, lo_start, lo_end = anchors[lo]
-    hi_chars, hi_start, hi_end = anchors[hi]
+    c_start, c_end, t_start, t_end = anchors[lo]
 
-    span = hi_chars - lo_chars
+    span = c_end - c_start
     if span == 0:
-        return lo_start
+        return t_start
 
-    frac = (target_chars - lo_chars) / span
-    # Interpolate between the end of the lo segment and start of hi segment
-    return lo_end + frac * (hi_start - lo_end)
+    frac = max(0.0, min(1.0, (target_chars - c_start) / span))
+    # Interpolate WITHIN the segment's spoken span — never across the silence gap
+    return t_start + frac * (t_end - t_start)
 
 
 # ---------------------------------------------------------------------------

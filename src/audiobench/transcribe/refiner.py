@@ -154,7 +154,7 @@ class TranscriptRefiner:
             if "<think>" in raw_output:
                 import re
                 raw_output = re.sub(r"<think>.*?</think>", "", raw_output, flags=re.DOTALL).strip()
-                
+
             parsed = self._parse_numbered_lines(raw_output)
 
             if len(parsed) != len(batch):

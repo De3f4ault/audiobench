@@ -31,6 +31,40 @@ from audiobench.transcribe.transcription_result import Segment, Transcript, Word
 
 logger = get_logger("engines.gemini")
 
+
+def _patch_protobuf_recursion_limit() -> None:
+    """Increase Google Protobuf parser recursion depth to avoid ParseError on large chunks."""
+    try:
+        from google.protobuf import json_format, proto_json
+
+        orig_parse = json_format.Parse
+        orig_parse_dict = json_format.ParseDict
+        orig_proto_parse = proto_json.parse
+
+        def safe_parse(text, message, *args, **kwargs):
+            if "max_recursion_depth" not in kwargs or kwargs["max_recursion_depth"] < 1000:
+                kwargs["max_recursion_depth"] = 1000
+            return orig_parse(text, message, *args, **kwargs)
+
+        def safe_parse_dict(js_dict, message, *args, **kwargs):
+            if "max_recursion_depth" not in kwargs or kwargs["max_recursion_depth"] < 1000:
+                kwargs["max_recursion_depth"] = 1000
+            return orig_parse_dict(js_dict, message, *args, **kwargs)
+
+        def safe_proto_parse(text, message, *args, **kwargs):
+            if "max_recursion_depth" not in kwargs or kwargs["max_recursion_depth"] < 1000:
+                kwargs["max_recursion_depth"] = 1000
+            return orig_proto_parse(text, message, *args, **kwargs)
+
+        json_format.Parse = safe_parse
+        json_format.ParseDict = safe_parse_dict
+        proto_json.parse = safe_proto_parse
+    except Exception:
+        pass
+
+
+_patch_protobuf_recursion_limit()
+
 from audiobench.core.prompts import (
     GEMINI_DIARIZATION_PROMPT,
     GEMINI_DIARIZATION_TEXT_ONLY_PROMPT,

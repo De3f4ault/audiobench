@@ -387,6 +387,45 @@ def probe(file_path: str | Path) -> AudioInfo:
     )
 
 
+def probe_tags(file_path: str | Path) -> dict[str, str]:
+    """Read embedded format-level tags (title, artist, album, etc.) via ffprobe.
+
+    This is intentionally separate from :func:`probe` because ``probe`` uses
+    ``-select_streams a:0`` which limits output to stream-level data and never
+    includes the format-level ``tags`` section where ID3 / MP4 metadata lives.
+
+    Args:
+        file_path: Path to the audio file.
+
+    Returns:
+        Dict of lowercase tag keys → string values.  Empty dict if ffprobe
+        fails or the file has no embedded tags.
+    """
+    _check_ffmpeg()
+    cmd = [
+        "ffprobe",
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",  # format section contains format_tags
+        str(file_path),
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if result.returncode != 0:
+            return {}
+        data = json.loads(result.stdout or "{}")
+        raw_tags: dict = data.get("format", {}).get("tags", {})
+        # Normalise to lowercase keys so callers don't have to worry about
+        # TITLE vs title vs Title differences across container formats.
+        return {k.lower(): str(v).strip() for k, v in raw_tags.items() if v}
+    except Exception as exc:
+        logger.debug("probe_tags failed for %s: %s", file_path, exc)
+        return {}
+
+
 def load_as_numpy(
     file_path: str | Path,
     filters: list[str] | None = None,
@@ -434,7 +473,10 @@ def load_as_numpy(
 
     logger.info("ffmpeg command: %s", " ".join(cmd))
 
-    result = subprocess.run(cmd, capture_output=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=1800)
+    except subprocess.TimeoutExpired:
+        raise AudioLoadError(file_path, "ffmpeg conversion timed out after 1800s")
     if result.returncode != 0:
         stderr = result.stderr.decode(errors="replace").strip()
         # Extract the last meaningful line from ffmpeg stderr
