@@ -103,6 +103,9 @@ class ChatSession:
     ) -> None:
         if client is None:
             client = create_chat_client(model)
+        elif type(client).__name__ == "ProviderRouter":
+            if model:
+                client.set_primary_model(model)
         else:
             # Reconcile if client provider does not match model
             is_gem = (model or "").lower().startswith("gemini")

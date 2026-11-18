@@ -126,7 +126,13 @@ class ProviderRouter:
         slot.breaker.reset()
 
     def set_primary_model(self, model: str) -> None:
-        """Rebuild the Ollama slot with a new model and fresh breaker."""
+        """Set primary model and reorder slots so the matching provider is tried first."""
+        if model.lower().startswith("gemini"):
+            gemini_slots = [s for s in self._slots if s.name == "gemini"]
+            other_slots = [s for s in self._slots if s.name != "gemini"]
+            if gemini_slots:
+                self._slots = gemini_slots + other_slots
+            return
         for i, slot in enumerate(self._slots):
             if slot.name == "ollama":
                 from audiobench.chat.providers.ollama_provider import OllamaClient
@@ -140,7 +146,54 @@ class ProviderRouter:
                         recovery_timeout=self._settings.circuit_breaker_timeout_seconds,
                     ),
                 )
+                ollama_slots = [s for s in self._slots if s.name == "ollama"]
+                other_slots = [s for s in self._slots if s.name != "ollama"]
+                self._slots = ollama_slots + other_slots
                 return
+
+    @property
+    def model(self) -> str:
+        for slot in self._slots:
+            client = getattr(slot.provider, "_client", None)
+            if client is not None and hasattr(client, "model"):
+                return client.model
+        return self._settings.ollama_model
+
+    @property
+    def _model(self) -> str:
+        return self.model
+
+    def is_available(self, provider: str | None = None) -> bool:
+        """Check if a specific provider or at least one underlying provider is available."""
+        for slot in self._slots:
+            if provider and slot.name != provider:
+                continue
+            if not slot.breaker.can_call():
+                continue
+            client = getattr(slot.provider, "_client", None)
+            if client is not None and hasattr(client, "is_available"):
+                try:
+                    if client.is_available():
+                        return True
+                except Exception:
+                    continue
+            else:
+                return True
+        return False
+
+    def list_models(self) -> list[str]:
+        """List models available across underlying providers (e.g. Ollama)."""
+        models: list[str] = []
+        for slot in self._slots:
+            client = getattr(slot.provider, "_client", None)
+            if client is not None and hasattr(client, "list_models"):
+                try:
+                    for m in client.list_models():
+                        if m not in models:
+                            models.append(m)
+                except Exception:
+                    pass
+        return models
 
     def available_providers(self) -> list[str]:
         return [s.name for s in self._slots if s.breaker.can_call()]

@@ -538,3 +538,53 @@ def test_retry_fatal_during_retry_returns_failed():
     assert outcome.type == OutcomeType.FAILED
     assert outcome.error is fatal_err
     gemini_mock.generate.assert_not_called()
+
+
+def test_router_is_available():
+    router = _make_test_router()
+    mock_client = MagicMock()
+    mock_client.is_available.return_value = True
+    mock_prov = MagicMock()
+    mock_prov._client = mock_client
+
+    router._slots = [ProviderSlot("ollama", mock_prov, CircuitBreaker())]
+    assert router.is_available() is True
+    assert router.is_available("ollama") is True
+    assert router.is_available("gemini") is False
+
+    mock_client.is_available.return_value = False
+    assert router.is_available() is False
+
+
+def test_router_list_models():
+    router = _make_test_router()
+    mock_client = MagicMock()
+    mock_client.list_models.return_value = ["model1", "model2"]
+    mock_prov = MagicMock()
+    mock_prov._client = mock_client
+
+    router._slots = [ProviderSlot("ollama", mock_prov, CircuitBreaker())]
+    assert router.list_models() == ["model1", "model2"]
+
+
+def test_router_model_property():
+    router = _make_test_router()
+    mock_client = MagicMock()
+    mock_client.model = "my-test-model"
+    mock_prov = MagicMock()
+    mock_prov._client = mock_client
+
+    router._slots = [ProviderSlot("ollama", mock_prov, CircuitBreaker())]
+    assert router.model == "my-test-model"
+    assert router._model == "my-test-model"
+
+
+def test_set_primary_model_gemini_reorders():
+    router = _make_test_router()
+    s1 = ProviderSlot("ollama", MagicMock(), CircuitBreaker())
+    s2 = ProviderSlot("gemini", MagicMock(), CircuitBreaker())
+    router._slots = [s1, s2]
+
+    router.set_primary_model("gemini")
+    assert [s.name for s in router._slots] == ["gemini", "ollama"]
+

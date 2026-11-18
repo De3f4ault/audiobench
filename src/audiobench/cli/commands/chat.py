@@ -496,24 +496,34 @@ def chat(
                 )
             )
             return
+        elif model:
+            console.print(
+                error_panel(
+                    "Ollama not running",
+                    f"Start with: ollama serve\nPull model: ollama pull {model_name}",
+                )
+            )
+            return
         else:
-            from audiobench.chat.providers.gemini_provider import GeminiClient
+            console.print(
+                error_panel(
+                    "No LLM provider available",
+                    "Neither local Ollama nor Gemini API is available.\n"
+                    "Start Ollama with: ollama serve\n"
+                    "Or set GEMINI_API_KEY for cloud access.",
+                )
+            )
+            return
 
-            g_client = GeminiClient(model=settings.gemini_model)
-            if g_client.is_available() and not model:
-                console.print(
-                    f"  [yellow]Notice: Ollama not running. Switching to Gemini ({settings.gemini_model})...[/]"
-                )
-                client = g_client
-                model_name = "gemini"
-            else:
-                console.print(
-                    error_panel(
-                        "Ollama not running",
-                        f"Start with: ollama serve\nPull model: ollama pull {model_name}",
-                    )
-                )
-                return
+    # If Ollama is not running but Gemini is available, and user did not explicitly request a model,
+    # switch primary provider to Gemini and inform the user.
+    if hasattr(client, "_slots") and not model and not model_name.lower().startswith("gemini"):
+        if not client.is_available("ollama") and client.is_available("gemini"):
+            console.print(
+                f"  [yellow]Notice: Ollama not running. Switching to Gemini ({settings.gemini_model})...[/]"
+            )
+            client.set_primary_model("gemini")
+            model_name = "gemini"
 
     target_search_session_id: int | None = None
 

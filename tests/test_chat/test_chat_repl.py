@@ -79,6 +79,25 @@ def test_chat_cmd_uses_chat_repl_not_inline_loop():
     assert "while True:" not in source or source.count("while True:") <= 1
 
 
+def test_chat_cmd_handles_provider_router_availability(monkeypatch):
+    """audiobench chat command handles router availability checks without crashing."""
+    from unittest.mock import MagicMock, patch
+    from click.testing import CliRunner
+    from audiobench.cli.commands.chat import chat
+
+    mock_router = MagicMock()
+    mock_router.is_available.side_effect = lambda provider=None: provider == "gemini" if provider else True
+    mock_router.available_providers.return_value = ["gemini"]
+    mock_router._slots = [MagicMock()]
+
+    runner = CliRunner()
+    with patch("audiobench.chat.chat_session.create_chat_client", return_value=mock_router), \
+         patch("audiobench.chat.chat_repl.ChatREPL.run") as mock_run:
+        result = runner.invoke(chat, ["--delete", "999999"])
+        assert result.exit_code == 0
+
+
+
 def test_chat_repl_sentinel_actions():
     from unittest.mock import MagicMock
     from audiobench.chat.chat_repl import ChatREPL
