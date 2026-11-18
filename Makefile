@@ -1,5 +1,5 @@
 .PHONY: install dev test lint format clean help
-.PHONY: transcribe transcribe-srt history search info download
+.PHONY: transcribe transcribe-srt history search info download download-all download-memory
 .PHONY: translate subtitle subtitle-hard listen speak download-voice summarize ask diarize
 .PHONY: repl chat vocab doctor status cleanup preset preset-create
 .PHONY: daemon-start daemon-status daemon-stop memory-search memory-ask db-status jobs-list
@@ -46,6 +46,12 @@ info: ## Show system info and settings
 
 download: ## Download a model (make download MODEL=large-v3-turbo)
 	$(CLI) download $(or $(MODEL),large-v3-turbo)
+
+download-all: ## Download all offline models (Whisper + semantic memory daemon)
+	$(CLI) download --all
+
+download-memory: ## Download memory & daemon retrieval models
+	$(CLI) download --memory
 
 # ── Feature Commands ─────────────────────────────────────────
 

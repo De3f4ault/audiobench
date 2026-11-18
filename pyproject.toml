@@ -45,6 +45,7 @@ dependencies = [
     "psutil>=5.9.0",
     "sounddevice>=0.5.0",
     "piper-tts>=1.2.0",
+    "bcrypt>=4.0.0",
 ]
 
 [project.optional-dependencies]
@@ -89,6 +90,12 @@ audiobench = "audiobench.cli.app:cli"
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["audiobench*"]
+
+[tool.setuptools.package-data]
+audiobench = [
+    "storage/migrations/*.sql",
+    "export/templates/*.html",
+]
 
 [tool.black]
 line-length = 100
