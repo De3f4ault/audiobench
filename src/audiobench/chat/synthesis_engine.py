@@ -21,9 +21,10 @@ import time
 from typing import Any
 
 from audiobench.chat.providers.ollama_provider import OllamaClient
+from audiobench.chat.providers.provider_outcome import OutcomeType
+from audiobench.chat.providers.router import ProviderRouter, router_for_settings
 from audiobench.core.db_session import get_session
 from audiobench.core.settings import get_settings
-from audiobench.memory.query_engine import _call_llm, Ok, Err
 from audiobench.memory.synthesis_retriever import (
     AmbiguousAuthorError,
     RetrievalMeta,
@@ -289,43 +290,36 @@ def generate_synthesis(
     full_prompt = f"{_SYNTHESIS_SYSTEM_PROMPT}\n\n{prompt}"
 
     settings = get_settings()
-    client = llm or OllamaClient()
-    api_key = settings.gemini_api_key
+    router = llm if (llm is not None and hasattr(llm, "generate")) else router_for_settings(settings)
 
-    llm_res = _call_llm(full_prompt, temperature, client, api_key)
+    outcome = router.generate(
+        messages=[{"role": "user", "content": full_prompt}],
+        temperature=temperature,
+        context_fragments=fragments,
+        query=query,
+        digest_mode="extractive",
+    )
 
     fallback_from: str | None = None
     fallback_reason: str | None = None
 
-    if isinstance(llm_res, Ok):
-        answer = _clean_synthesis_citations(llm_res.value)
-        # Sentinel-aware: Ok.model defaults to "unknown" (truthy) so bare `or` is a no-op.
-        # Compare against sentinel explicitly and fall back to client model name.
-        model_used = (
-            llm_res.model if llm_res.model and llm_res.model != "unknown"
-            else getattr(client, "_model", "gemma4:31b-cloud")
-        )
-        # Carry primary-failure info when secondary (Gemini) succeeded — set by _call_llm.
-        fallback_from = getattr(llm_res, "fallback_from", None)
-        fallback_reason = getattr(llm_res, "fallback_reason", None)
+    if outcome.type == OutcomeType.OK and outcome.content:
+        answer = _clean_synthesis_citations(outcome.content)
+        model_used = outcome.provider or "unknown"
+        fallback_from = outcome.fallback_from
+        fallback_reason = outcome.fallback_reason
+    elif outcome.type == OutcomeType.DEGRADED:
+        answer = outcome.content
+        model_used = "digest_fallback"
+        fallback_from = outcome.fallback_from or "all_providers"
+        fallback_reason = outcome.fallback_reason
     else:
-        logger.warning("LLM call failed in synthesis engine: %s; falling back to digest.", llm_res.error)
+        logger.warning("LLM call failed in synthesis engine: %s; falling back to digest.", outcome.error)
         model_used = "digest_fallback"
         fallback_from = "all_providers"
-        fallback_reason = llm_res.error
-        # Structured fallback if local model and cloud are unreachable
-        digest_lines = [
-            f"### Dialectic Digest: {query}",
-            "",
-            "*(LLM service unavailable — displaying grounded comparative excerpts)*",
-            "",
-        ]
-        for idx, f in enumerate(fragments, 1):
-            digest_lines.append(
-                f"**[{idx}] {f.author}** — *{f.work_title}* (Relevance: `{f.effective_rel:.3f}`)\n"
-                f"> \"{f.content}\"\n"
-            )
-        answer = "\n".join(digest_lines)
+        fallback_reason = str(outcome.error) if outcome.error else "all providers failed"
+        from audiobench.chat.providers.llm_providers import _render_extractive_digest
+        answer = _render_extractive_digest(fragments, query=query)
 
     elapsed = round(time.perf_counter() - t0, 3)
     return SynthesisResponse(

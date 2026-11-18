@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
+from audiobench.chat.providers.provider_outcome import LlmOutcome, OutcomeType
 from audiobench.chat.synthesis_engine import (
     SynthesisResponse,
     _SYNTHESIS_SYSTEM_PROMPT,
@@ -164,9 +165,15 @@ class TestGenerateSynthesisMocked:
         ]
 
         with patch("audiobench.chat.synthesis_engine.retrieve_synthesis_context") as mock_ret, \
-             patch("audiobench.chat.synthesis_engine._call_llm") as mock_llm:
+             patch("audiobench.chat.synthesis_engine.router_for_settings") as mock_rfs:
             mock_ret.return_value = (frags, empty_meta())
-            mock_llm.return_value = Ok("Author A argues that resilience is built internally [1].", model="gemma4:31b-cloud")
+            mock_router = MagicMock()
+            mock_router.generate.return_value = LlmOutcome(
+                type=OutcomeType.OK,
+                content="Author A argues that resilience is built internally [1].",
+                provider="gemma4:31b-cloud",
+            )
+            mock_rfs.return_value = mock_router
 
             resp = generate_synthesis("resilience")
             assert isinstance(resp, SynthesisResponse)
@@ -191,9 +198,21 @@ class TestGenerateSynthesisMocked:
         ]
 
         with patch("audiobench.chat.synthesis_engine.retrieve_synthesis_context") as mock_ret, \
-             patch("audiobench.chat.synthesis_engine._call_llm") as mock_llm:
+             patch("audiobench.chat.synthesis_engine.router_for_settings") as mock_rfs:
             mock_ret.return_value = (frags, empty_meta())
-            mock_llm.return_value = Err("Ollama offline")
+            mock_router = MagicMock()
+            mock_router.generate.return_value = LlmOutcome(
+                type=OutcomeType.DEGRADED,
+                content=(
+                    "### Dialectic Digest: choice\n\n"
+                    "*(LLM service unavailable — displaying grounded comparative excerpts)*\n\n"
+                    "**[1] Author B** — *Title B* (Relevance: `0.820`)\n"
+                    '> "Passage B on existential choice."\n'
+                ),
+                provider="digest",
+                fallback_reason="Ollama offline",
+            )
+            mock_rfs.return_value = mock_router
 
             resp = generate_synthesis("choice")
             assert resp.model_used == "digest_fallback"
@@ -526,8 +545,14 @@ class TestAuthorCapEnforced:
         )
 
         with patch("audiobench.chat.synthesis_engine.retrieve_synthesis_context", return_value=(frags, meta)), \
-             patch("audiobench.chat.synthesis_engine._call_llm") as mock_llm:
-            mock_llm.return_value = Ok("Synthesized text spanning multiple sources [1] [2].", model="gemma4:31b-cloud")
+             patch("audiobench.chat.synthesis_engine.router_for_settings") as mock_rfs:
+            mock_router = MagicMock()
+            mock_router.generate.return_value = LlmOutcome(
+                type=OutcomeType.OK,
+                content="Synthesized text spanning multiple sources [1] [2].",
+                provider="gemma4:31b-cloud",
+            )
+            mock_rfs.return_value = mock_router
 
             resp = generate_synthesis("antifragile", top_k=20)
 
