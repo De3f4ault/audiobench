@@ -187,7 +187,7 @@ Links in `#141413`, `#5e5d59`, or `#3d3d3a`. CTA is Brand Terracotta or White Su
 | Whisper | `rgba(0,0,0,0.05) 0 4px 24px` | Elevated cards, screenshots |
 | Inset | `inset 0 0 0 1px` at 15% opacity | Pressed button states |
 
-The most dramatic depth shift is the light/dark section alternation (`#f5f4ed` ↔ `#141413`). This is the primary depth tool — entire sections change ambient light level to create reading rhythm.
+The most dramatic depth shift is the light/dark section alternation (`#f5f4ed` <-> `#141413`). This is the primary depth tool — entire sections change ambient light level to create reading rhythm.
 
 ---
 
@@ -381,15 +381,15 @@ The following ratios were calculated using the WCAG 2.1 relative luminance formu
 
 | Pairing | Ratio | AA Normal | AA Large |
 |---|---|---|---|
-| Primary text `#141413` on parchment `#f5f4ed` | 16.7:1 | ✅ PASS | ✅ PASS |
-| Secondary text `#5e5d59` on parchment | 5.98:1 | ✅ PASS | ✅ PASS |
-| **Tertiary/stone `#87867f` on parchment** | **3.31:1** | **❌ FAIL** | ✅ PASS |
-| **Stone gray on ivory `#faf9f5`** | **3.47:1** | **❌ FAIL** | ✅ PASS |
-| Button text `#4d4c48` on warm-sand `#e8e6dc` | 6.87:1 | ✅ PASS | ✅ PASS |
-| **Brand terracotta `#c96442` on ivory** | **3.70:1** | **❌ FAIL** | ✅ PASS |
-| **Accent orange `#d97757` on parchment** | **2.83:1** | **❌ FAIL** | ❌ FAIL |
-| Dark secondary `#b0aea5` on dark `#141413` | 8.29:1 | ✅ PASS | ✅ PASS |
-| Ivory `#faf9f5` on dark `#141413` | 17.5:1 | ✅ PASS | ✅ PASS |
+| Primary text `#141413` on parchment `#f5f4ed` | 16.7:1 | PASS | PASS |
+| Secondary text `#5e5d59` on parchment | 5.98:1 | PASS | PASS |
+| **Tertiary/stone `#87867f` on parchment** | **3.31:1** | **FAIL** | PASS |
+| **Stone gray on ivory `#faf9f5`** | **3.47:1** | **FAIL** | PASS |
+| Button text `#4d4c48` on warm-sand `#e8e6dc` | 6.87:1 | PASS | PASS |
+| **Brand terracotta `#c96442` on ivory** | **3.70:1** | **FAIL** | PASS |
+| **Accent orange `#d97757` on parchment** | **2.83:1** | **FAIL** | FAIL |
+| Dark secondary `#b0aea5` on dark `#141413` | 8.29:1 | PASS | PASS |
+| Ivory `#faf9f5` on dark `#141413` | 17.5:1 | PASS | PASS |
 
 ### Key findings
 

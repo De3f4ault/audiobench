@@ -68,6 +68,8 @@ def get_engine() -> Engine:
 
             @event.listens_for(_engine, "connect")
             def _set_sqlite_pragmas(dbapi_conn: Any, _connection_record: Any) -> None:
+                if hasattr(dbapi_conn, "text_factory"):
+                    dbapi_conn.text_factory = lambda b: b.decode("utf-8", "replace")
                 cursor = dbapi_conn.cursor()
                 cursor.execute("PRAGMA journal_mode=WAL")
                 cursor.execute("PRAGMA busy_timeout=15000")   # wait up to 15s on lock, not 0ms

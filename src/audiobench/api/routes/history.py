@@ -16,14 +16,14 @@ repo = TranscriptionRepository()
 def get_history(limit: int = 50, search: str | None = None) -> list[dict[str, Any]]:
     """Get transcription history, optionally filtered by search."""
     if search:
-        return repo.search(search, limit=limit)
+        return repo.search(search, limit=limit, session=None)
     return repo.get_history(limit=limit)
 
 
 @router.get("/{transcription_id}")
 def get_transcription(transcription_id: int) -> dict[str, Any]:
     """Get a single transcription by ID."""
-    data = repo.get_by_id(transcription_id)
+    data = repo.get_by_id(transcription_id, session=None)
     if not data:
         raise HTTPException(status_code=404, detail="Transcription not found")
     return data

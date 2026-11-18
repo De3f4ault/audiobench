@@ -73,7 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Bookmark & Annotation System** — full-featured timestamp marking for audio files
   - Point bookmarks and region markers (Audacity-inspired dual marker model)
-  - 5 bookmark types: 🔖 bookmark, ⭐ highlight, 📌 todo, 📝 note, ✂️ edit
+  - 5 bookmark types: [BM] bookmark, [HL] highlight, [TODO] todo, [NOTE] note, [CUT] edit
   - Interactive player keybindings (`b` point, `B` region, `n`/`p` jump, `l` cycle type)
   - Zero-interruption UX — bookmarks auto-named from transcript text at current position
   - Visual bookmark indicator bar and green flash feedback during playback
@@ -87,7 +87,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **AI Auto-Bookmarking** — intelligent transcript annotation
   - `audiobench bookmark auto <ID>` — AI identifies key moments and creates structured bookmarks
   - Exact timestamp extraction from transcript segments (no rounding)
-  - 5-type classification: ⭐ highlight, 📌 todo, 📝 note, 🔖 bookmark, ✂️ edit
+  - 5-type classification: [HL] highlight, [TODO] todo, [NOTE] note, [BM] bookmark, [CUT] edit
   - Length-scaled output (3–15 bookmarks based on duration)
   - `--model` override (default: `qwen3-coder:480b-cloud`), `--focus`, `--dry-run`
   - Configurable `AUDIOBENCH_BOOKMARK_MODEL` setting

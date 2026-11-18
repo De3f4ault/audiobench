@@ -53,12 +53,24 @@ class ChapterDetector:
             if chapters:
                 return chapters
 
-        # 3. Fallback: single chapter
+        # 3. Fallback: single chapter (hydrating title from tags if available)
         logger.debug("No chapters found for %s, treating as single chapter", file_path.name)
+        title = "Full Recording"
+        try:
+            from audiobench.transcribe.audio_converter import probe_tags
+            tags = probe_tags(file_path)
+            raw_title = tags.get("title")
+            if raw_title and raw_title.strip():
+                clean_title = raw_title.strip()
+                if clean_title.lower() not in {"full recording", "untitled", "unknown"}:
+                    title = clean_title
+        except Exception as e:
+            logger.debug("Failed to read format tags for fallback chapter title: %s", e)
+
         return [
             ChapterInfo(
                 index=0,
-                title="Full Recording",
+                title=title,
                 start_time=0.0,
                 end_time=total_duration,
                 is_ghost=False,

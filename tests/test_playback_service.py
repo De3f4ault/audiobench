@@ -24,6 +24,7 @@ def test_playback_service_initial_state():
         "loop_a": None,
         "loop_b": None,
         "filter": "",
+        "last_eof_reason": None,
     }
     assert svc.get_segment_at(10.0) is None
     ctx = svc.get_context_window(10.0)
@@ -116,6 +117,7 @@ def test_playback_service_controls(mock_mpv_cls):
         "loop_a": None,
         "loop_b": None,
         "filter": "",
+        "last_eof_reason": "stop",
     }
     # Phase 2A: stop() sends 'stop' command (daemon stays alive), not quit()
     mock_mpv.stop.assert_called_once()
@@ -294,3 +296,57 @@ def test_resume_rearms_position_timer(mock_mpv_cls, mock_schedule):
     svc.resume()
 
     mock_schedule.assert_called_once()
+
+
+@patch.object(PlaybackService, "_write_resume_position")
+@patch("audiobench.playback.service.MpvController")
+def test_stop_followed_by_trailing_eof_keeps_stop_reason(mock_mpv_cls, mock_write_pos):
+    """Verify that stop() followed by a trailing EOF event from mpv reader thread
+    does NOT overwrite last_eof_reason='stop' back to 'eof'.
+    """
+    mock_mpv = MagicMock()
+    mock_mpv.is_running.return_value = True
+    mock_mpv.get_playback_state.return_value = (10.0, 1.0, False)
+    mock_mpv.get_position.return_value = 10.0
+    mock_mpv_cls.return_value = mock_mpv
+
+    svc = PlaybackService()
+    svc.play("/path/to/track1.mp3", start_pos=0.0)
+    assert svc.status()["last_eof_reason"] is None
+
+    # User calls stop()
+    st = svc.stop()
+    assert st["last_eof_reason"] == "stop"
+    assert svc.status()["last_eof_reason"] == "stop"
+
+    # Trailing EOF event arrives from reader thread
+    svc._on_eof("eof")
+
+    # Reason MUST remain 'stop', NOT 'eof'
+    assert svc.status()["last_eof_reason"] == "stop"
+    assert svc.status()["playing"] is False
+    assert svc.status()["state"] == "stopped"
+
+
+@patch.object(PlaybackService, "_write_resume_position")
+@patch("audiobench.playback.service.MpvController")
+def test_playback_service_natural_eof_sets_eof_reason(mock_mpv_cls, mock_write_pos):
+    """Natural completion of track sets last_eof_reason='eof' and state='stopped'."""
+    mock_mpv = MagicMock()
+    mock_mpv.is_running.return_value = True
+    mock_mpv.get_playback_state.return_value = (100.0, 1.0, False)
+    mock_mpv.get_position.return_value = 100.0
+    mock_mpv_cls.return_value = mock_mpv
+
+    svc = PlaybackService()
+    svc.play("/path/to/track1.mp3", start_pos=0.0)
+    assert svc.status()["last_eof_reason"] is None
+    assert svc.status()["playing"] is True
+
+    # Natural EOF arrives
+    svc._on_eof("eof")
+
+    st = svc.status()
+    assert st["last_eof_reason"] == "eof"
+    assert st["playing"] is False
+    assert st["state"] == "stopped"

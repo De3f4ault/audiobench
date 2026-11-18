@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from audiobench.core.db_session import get_session
+from audiobench.core import db_session
+
+
+def get_session():
+    """Get database session dynamically from db_session module to prevent mock freeze across tests."""
+    return db_session.get_session()
 from audiobench.core.logger_factory import get_logger
 from audiobench.daemon.client import DaemonClient
 from audiobench.memory.enums import RelationType, SourceType

@@ -644,7 +644,7 @@ def _run_channel_workspace(channel_id: str) -> str:
         _render_channel_header(state, render_session)
         if api_error:
             console.print(
-                f"  [{DIM}]⚠ YouTube API unavailable — showing cached catalog. "
+                f"  [{DIM}][!] YouTube API unavailable — showing cached catalog. "
                 f"Set AUDIOBENCH_YOUTUBE_API_KEY to check for new uploads.[/]"
             )
             console.print()

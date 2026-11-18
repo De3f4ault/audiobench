@@ -33,7 +33,10 @@ def mock_user_types_exit(monkeypatch):
             return "/exit"
 
     import prompt_toolkit
+    import audiobench.cli.shared.repl_shell
     monkeypatch.setattr(prompt_toolkit, "PromptSession", MockPromptSession)
+    monkeypatch.setattr(audiobench.cli.shared.repl_shell, "PromptSession", MockPromptSession)
+    monkeypatch.setattr(audiobench.cli.shared.repl_shell, "make_prompt_session", lambda *args, **kwargs: MockPromptSession())
 
 @pytest.fixture(autouse=True)
 def _isolate_chat_db(test_db):

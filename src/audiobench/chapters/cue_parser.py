@@ -27,6 +27,11 @@ class ChapterInfo:
     id: int | None = None  # DB primary key; populated after save
 
     @property
+    def chapter_index(self) -> int:
+        """Alias for index for backwards compatibility with ChapterRecord."""
+        return self.index
+
+    @property
     def duration_seconds(self) -> float:
         """Duration of this chapter in seconds."""
         return max(0.0, self.end_time - self.start_time)
@@ -46,6 +51,42 @@ class ChapterInfo:
 
 class CueParser:
     """Parses .cue files to extract chapter boundaries."""
+
+    def parse_disc_title(self, cue_path: Path) -> str | None:
+        """Return the top-level TITLE from a .cue file (the disc / album title).
+
+        CUE sheets have a global TITLE line before any TRACK block that names
+        the whole disc.  The existing :meth:`parse` state-machine skips it
+        because ``current_track`` is ``None`` at that point.  This method reads
+        only that header line so rename_service can use the official title
+        without touching chapter-level data.
+
+        Returns:
+            The disc title string, or ``None`` if absent / unreadable.
+        """
+        if not cue_path.exists():
+            return None
+
+        try:
+            content = cue_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            try:
+                content = cue_path.read_text(encoding="latin-1")
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+        for line in content.splitlines():
+            stripped = line.strip()
+            # Stop once we hit the first TRACK — everything after is per-track
+            if re.match(r"^TRACK\s+\d+\s+AUDIO", stripped, re.IGNORECASE):
+                break
+            title_match = re.match(r'^TITLE\s+"?([^"]+)"?', stripped, re.IGNORECASE)
+            if title_match:
+                return title_match.group(1).strip()
+
+        return None
 
     def parse(self, cue_path: Path, total_duration: float) -> list[ChapterInfo]:
         """Parse a .cue file into a list of ChapterInfo objects.

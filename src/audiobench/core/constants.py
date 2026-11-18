@@ -31,3 +31,14 @@ MIME_MAP = {
 def get_mime(suffix: str) -> str:
     """Resolve MIME type from file extension."""
     return MIME_MAP.get(suffix.lower(), "audio/mpeg")
+
+
+# --- Text & Search Constants ---
+# Common English grammatical stop words that match broadly across corpora.
+# Used for noise reduction while preserving 1-3 letter domain terms (fox, tax, law, war, net, etc.).
+ENGLISH_STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for",
+    "if", "in", "into", "is", "it", "no", "not", "of", "on", "or",
+    "such", "that", "the", "their", "then", "there", "these", "they",
+    "this", "to", "was", "will", "with",
+}

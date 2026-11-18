@@ -41,6 +41,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+from audiobench.core.constants import ENGLISH_STOP_WORDS
 from audiobench.core.db_engine import init_db
 from audiobench.core.error_types import AudioBenchError
 from audiobench.core.logger_factory import get_logger
@@ -1885,7 +1886,10 @@ class ChatREPL:
                                     # 1. Probe explicit quotes first
                                     quotes = re.findall(r'["\']([^"\']{10,})["\']', msg_content)
                                     for q in quotes:
-                                        q_words = [w for w in re.sub(r"[^\w\s]", " ", q).split() if len(w) > 3][:4]
+                                        raw_q_words = [w for w in re.sub(r"[^\w\s]", " ", q).split() if len(w) >= 2]
+                                        q_words = [w for w in raw_q_words if w.lower() not in ENGLISH_STOP_WORDS][:4]
+                                        if not q_words:
+                                            q_words = raw_q_words[:4]
                                         if len(q_words) >= 2:
                                             pat = "%" + "%".join(q_words) + "%"
                                             matched_seg = (
@@ -1903,7 +1907,10 @@ class ChatREPL:
                                     # 2. Sliding word windows from message content
                                     if not matched_seg:
                                         clean_probe = re.sub(r"[^\w\s]", " ", msg_content.strip()[:120]).strip()
-                                        words = [w for w in clean_probe.split() if len(w) > 3]
+                                        raw_words = [w for w in clean_probe.split() if len(w) >= 2]
+                                        words = [w for w in raw_words if w.lower() not in ENGLISH_STOP_WORDS]
+                                        if len(words) < 3 and len(raw_words) >= 3:
+                                            words = raw_words
                                         if len(words) >= 3:
                                             for i in range(min(5, len(words) - 2)):
                                                 pat = "%" + "%".join(words[i : i + 3]) + "%"

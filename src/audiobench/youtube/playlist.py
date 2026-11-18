@@ -450,7 +450,7 @@ def on_workspace_entry(channel_id: str, session: Session) -> dict:
             refresh_channel_cache(channel_id, session)
         except RuntimeError as e:
             # Expected case: API key not configured, or quota exhausted.
-            # The workspace shows a user-facing ⚠ notice — no need to also
+            # The workspace shows a user-facing [!] notice — no need to also
             # print a WARNING line to the terminal before the workspace renders.
             logger.debug("on_workspace_entry: API unavailable (stale cache): %s", e)
             return _api_unavailable_result()
@@ -468,7 +468,7 @@ def on_workspace_entry(channel_id: str, session: Session) -> dict:
     try:
         result = check_for_new_uploads(channel_id, session)
     except RuntimeError as e:
-        # Expected: API key not configured. UI ⚠ notice handles the user-facing message.
+        # Expected: API key not configured. UI [!] notice handles the user-facing message.
         logger.debug("on_workspace_entry: API unavailable (fresh cache): %s", e)
         return _api_unavailable_result(cache_age_hours=0.0)
     except Exception as e:

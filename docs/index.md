@@ -1,4 +1,4 @@
-# 🎙️ AudioBench
+# AudioBench
 
  **offline** AudioBench powered by [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
 
@@ -188,7 +188,7 @@ audiobench listen --save meeting.txt
 
 - **Cadence**: Text appears every ~4 seconds of continuous speech or after a 0.4s pause.
 - **Model**: Defaults to `base` (tuned with 4 CPU threads for ~0.5x real-time speed).
-- **History**: Live sessions appear in `audiobench history` as "🎤 Live session" and can be searched or spoken via TTS.
+- **History**: Live sessions appear in `audiobench history` as "Live session" and can be searched or spoken via TTS.
 
 ---
 

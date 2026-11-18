@@ -496,11 +496,11 @@ audiobench bookmark auto 66 --model deepseek-v3.2:cloud
 ```
 
 AI identifies 5 types of moments:
-- ⭐ **Highlight** — key insight, decision, turning point
-- 📌 **Todo** — action item, follow-up, commitment
-- 📝 **Note** — interesting context, background info
-- 🔖 **Bookmark** — structural marker, topic shift
-- ✂️ **Edit** — dead air, filler, cut candidate
+- `[HL]` **Highlight** — key insight, decision, turning point
+- `[TODO]` **Todo** — action item, follow-up, commitment
+- `[NOTE]` **Note** — interesting context, background info
+- `[BM]` **Bookmark** — structural marker, topic shift
+- `[CUT]` **Edit** — dead air, filler, cut candidate
 
 ### Interactive playback bookmarking
 

@@ -30,7 +30,9 @@ class TestSettingsDefaults:
         s = AudioBenchSettings()
         assert s.data_dir.is_absolute()
 
-    def test_database_url_points_to_data_dir(self):
+    def test_database_url_points_to_data_dir(self, monkeypatch):
+        monkeypatch.delenv("AUDIOBENCH_DATABASE_URL", raising=False)
+        monkeypatch.delenv("AUDIOBENCH_DATA_DIR", raising=False)
         s = AudioBenchSettings()
         assert "data" in s.database_url
         assert "transcriptions.db" in s.database_url
@@ -114,3 +116,13 @@ class TestSpeedPresetResolution:
     def test_resolve_cpu_threads_positive(self):
         s = AudioBenchSettings()
         assert s.resolve_cpu_threads() >= 1
+
+    def test_resolve_indexing_and_alignment_threads_default(self):
+        s = AudioBenchSettings()
+        assert s.resolve_indexing_threads() >= 1
+        assert s.resolve_alignment_threads() >= 1
+
+    def test_resolve_indexing_and_alignment_threads_configured(self):
+        s = AudioBenchSettings(indexing_threads=4, alignment_threads=6)
+        assert s.resolve_indexing_threads() == 4
+        assert s.resolve_alignment_threads() == 6

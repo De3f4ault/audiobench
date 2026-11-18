@@ -11,8 +11,73 @@ Provides:
 from __future__ import annotations
 
 import os
+import tempfile
+from pathlib import Path
 import pytest
 from click.testing import CliRunner
+
+_GLOBAL_TEST_TMP_DIR = None
+
+
+def pytest_configure(config):
+    """Early hook executing BEFORE test collection begins.
+
+    Guarantees that environment variables point to an isolated sandbox before any module
+    can lazily initialize database connections during import.
+    """
+    global _GLOBAL_TEST_TMP_DIR
+    _GLOBAL_TEST_TMP_DIR = tempfile.TemporaryDirectory(prefix="audiobench_pytest_")
+    tmp_path = Path(_GLOBAL_TEST_TMP_DIR.name)
+    db_file = tmp_path / "global_test_fallback.db"
+
+    os.environ["AUDIOBENCH_DATABASE_URL"] = f"sqlite:///{db_file}"
+    os.environ["AUDIOBENCH_DATA_DIR"] = str(tmp_path)
+    os.environ["AUDIOBENCH_MODELS_DIR"] = str(tmp_path / "models")
+    os.environ["AUDIOBENCH_DAEMON_SOCKET_PATH"] = "/tmp/audiobench-test-isolated.sock"
+
+    from audiobench.core.settings import get_settings
+
+    get_settings.cache_clear()
+
+    # Eagerly import storage repositories to prevent late first-import mock binding
+    import audiobench.storage.repository
+    import audiobench.storage.expression_repository
+    import audiobench.storage.chapter_repository
+    import audiobench.storage.note_repository
+    import audiobench.storage.bookmark_repository
+
+
+def pytest_unconfigure(config):
+    """Cleanup hook after test session ends."""
+    global _GLOBAL_TEST_TMP_DIR
+    if _GLOBAL_TEST_TMP_DIR is not None:
+        try:
+            _GLOBAL_TEST_TMP_DIR.cleanup()
+        except Exception:
+            pass
+        _GLOBAL_TEST_TMP_DIR = None
+
+
+def empty_meta():
+    """Return a zero-filled RetrievalMeta for use in test mock return values.
+
+    Use this when mocking ``retrieve_synthesis_context`` to return a tuple:
+
+        mock_ret.return_value = (frags, empty_meta())
+
+    Both ``test_synthesis_engine.py`` and ``test_school_scoping.py`` import this
+    helper from conftest so the fixture is not duplicated.
+    """
+    from audiobench.memory.synthesis_retriever import RetrievalMeta
+    return RetrievalMeta(
+        pool_size=0,
+        k_ann=40,
+        author_counts_pool={},
+        author_counts_selected={},
+        capped_authors=set(),
+        prior_count=0,
+        unknown_count=0,
+    )
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -32,6 +97,13 @@ def _isolate_daemon_socket_for_tests():
     else:
         os.environ["AUDIOBENCH_DAEMON_SOCKET_PATH"] = old_sock
     get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _prevent_background_worker_spawn_in_tests(monkeypatch):
+    """Ensure no test ever spawns detached worker_daemon background processes."""
+    monkeypatch.setattr("audiobench.jobs.scheduler._spawn_daemon", lambda: None)
+    monkeypatch.setattr("audiobench.daemon.factory._fork_daemon", lambda *args, **kwargs: False)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -160,6 +232,16 @@ def test_db(test_settings):
     # Restore originals (supports nested/parallel fixture usage)
     db_mod._engine = old_engine
     sess_mod._SessionLocal = old_session_factory
+
+
+@pytest.fixture(autouse=True)
+def reset_shared_hnsw_index():
+    """Reset the module-level shared HNSW index singleton between tests to prevent cross-test leakage."""
+    import audiobench.daemon.index as index_mod
+    orig_index = index_mod._shared_index
+    index_mod._shared_index = None
+    yield
+    index_mod._shared_index = orig_index
 
 
 @pytest.fixture

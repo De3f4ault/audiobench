@@ -67,3 +67,23 @@ class TestDatabaseEngine:
             assert nested.parent.exists()
 
         db_mod._engine = old_engine
+
+    def test_production_database_firewall_blocks_access(self):
+        """get_engine() must raise RuntimeError if test code attempts to access production database."""
+        import pytest
+        from pathlib import Path
+        import audiobench.core.db_engine as db_mod
+
+        prod_db = (Path(db_mod.__file__).resolve().parent.parent.parent.parent / "data" / "transcriptions.db").resolve()
+        settings = AudioBenchSettings(
+            database_url=f"sqlite:///{prod_db}",
+        )
+        old_engine = db_mod._engine
+        db_mod._engine = None
+
+        try:
+            with patch("audiobench.core.db_engine.get_settings", return_value=settings):
+                with pytest.raises(RuntimeError, match="SAFETY BLOCK"):
+                    db_mod.get_engine()
+        finally:
+            db_mod._engine = old_engine
