@@ -95,9 +95,31 @@ def render_system_info() -> None:
 # ── Download Command ────────────────────────────────────────
 
 
+def download_memory_models() -> None:
+    """Pre-download all semantic memory and retrieval models."""
+    console.print(f"\n  [{ACCENT}]Downloading semantic memory & retrieval models...[/]")
+    from huggingface_hub import snapshot_download
+
+    models = [
+        ("Boundary embedder", "sentence-transformers/all-MiniLM-L6-v2"),
+        ("Primary 768-dim embedder", "nomic-ai/nomic-embed-text-v1.5"),
+        ("Cross-encoder reranker", "cross-encoder/ms-marco-MiniLM-L-6-v2"),
+        ("ColBERT reranker", "answerdotai/answerai-colbert-small-v1"),
+    ]
+
+    for label, repo_id in models:
+        console.print(f"  [{DIM}]• {label}:[/] [bold]{repo_id}[/bold] ...", end=" ")
+        try:
+            snapshot_download(repo_id=repo_id, resume_download=True)
+            console.print(f"[{SUCCESS}]✓[/]")
+        except Exception as e:
+            console.print(f"[bold red]✗ ({e})[/]")
+
+
 @click.command()
 @click.argument(
     "model_name",
+    required=False,
     type=click.Choice(
         [
             "tiny",
@@ -109,18 +131,38 @@ def render_system_info() -> None:
         ]
     ),
 )
-def download(model_name: str) -> None:
-    """Pre-download a Whisper model for offline use."""
-    console.print(f"  [{ACCENT}]Downloading model:[/] {model_name} ...")
+@click.option(
+    "--all",
+    "download_all",
+    is_flag=True,
+    help="Download Whisper model and all memory/retrieval models.",
+)
+@click.option(
+    "--memory",
+    "download_memory",
+    is_flag=True,
+    help="Download only memory & daemon retrieval models (embedders + rerankers).",
+)
+def download(model_name: str | None, download_all: bool, download_memory: bool) -> None:
+    """Pre-download models for offline use."""
+    if not model_name and not download_all and not download_memory:
+        model_name = "large-v3-turbo"
 
-    try:
-        from faster_whisper import WhisperModel
+    if download_memory or download_all:
+        download_memory_models()
 
-        WhisperModel(model_name, device="cpu", compute_type="int8")
-        console.print(f"  [{SUCCESS}]✓[/] Model '{model_name}' downloaded and cached.")
-    except Exception as e:
-        console.print(error_panel(f"Download failed: {model_name}", str(e)))
-        sys.exit(1)
+    if model_name or download_all:
+        whisper_model = model_name or "large-v3-turbo"
+        console.print(f"\n  [{ACCENT}]Downloading Whisper model:[/] {whisper_model} ...")
+
+        try:
+            from faster_whisper import WhisperModel
+
+            WhisperModel(whisper_model, device="cpu", compute_type="int8")
+            console.print(f"  [{SUCCESS}]✓[/] Whisper model '{whisper_model}' downloaded and cached.")
+        except Exception as e:
+            console.print(error_panel(f"Download failed: {whisper_model}", str(e)))
+            sys.exit(1)
 
 
 # ── Doctor Command ──────────────────────────────────────────

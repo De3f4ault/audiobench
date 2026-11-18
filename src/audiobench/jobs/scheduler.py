@@ -324,24 +324,27 @@ def _spawn_daemon() -> None:
 def startup_recovery() -> int:
     """Mark stale running jobs with dead PIDs as failed or reset for retry."""
     recovered = 0
-    with get_session() as session:
-        running_jobs = session.query(UnifiedJob).filter_by(status="running").all()
-        for job in running_jobs:
-            if not is_alive(job.pid):
-                recovered += 1
-                if job.attempt < job.max_attempts:
-                    job.status = "pending"
-                    job.attempt += 1
-                    job.pid = None
-                    job.started_at = None
-                    logger.info("Recovered job #%d -> pending (attempt %d)", job.id, job.attempt)
-                else:
-                    job.status = "failed"
-                    job.ended_at = datetime.now(UTC)
-                    job.exit_code = -1
-                    job.error_summary = f"Process died (PID {job.pid})"
-                    logger.warning("Marked job #%d failed (dead PID %s)", job.id, job.pid)
-        session.commit()
+    try:
+        with get_session() as session:
+            running_jobs = session.query(UnifiedJob).filter_by(status="running").all()
+            for job in running_jobs:
+                if not is_alive(job.pid):
+                    recovered += 1
+                    if job.attempt < job.max_attempts:
+                        job.status = "pending"
+                        job.attempt += 1
+                        job.pid = None
+                        job.started_at = None
+                        logger.info("Recovered job #%d -> pending (attempt %d)", job.id, job.attempt)
+                    else:
+                        job.status = "failed"
+                        job.ended_at = datetime.now(UTC)
+                        job.exit_code = -1
+                        job.error_summary = f"Process died (PID {job.pid})"
+                        logger.warning("Marked job #%d failed (dead PID %s)", job.id, job.pid)
+            session.commit()
+    except Exception as e:
+        logger.debug("Startup recovery skipped: %s", e)
     return recovered
 
 
