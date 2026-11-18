@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from audiobench.memory.query_engine import Ok, ResearchEngine
+from audiobench.memory.query_engine import ResearchEngine
 from audiobench.memory.query_reformulator import ReformulatedQuery
 from audiobench.memory.rrf_fusion import FusedResult
 
@@ -30,6 +30,31 @@ def make_fused(sid: int, score: float, source: str = "podcast_episode.m4a", text
 
 def test_research_engine_synthesis_floor_and_source_labeling(monkeypatch):
     """Verify low-score fragments (< 0.020) are excluded from synthesis unless pinned, and source stem is included in header."""
+    from unittest.mock import MagicMock
+    from audiobench.chat.providers.provider_outcome import LlmOutcome, OutcomeType
+
+    captured_prompt: list[str] = []
+
+    mock_router = MagicMock()
+
+    def _capture_generate(messages, **kwargs):
+        # capture the user message content as the "prompt"
+        for m in messages:
+            if m.get("role") == "user":
+                captured_prompt.append(m["content"])
+                break
+        return LlmOutcome(type=OutcomeType.OK, content="synthesised answer", provider="ollama")
+
+    mock_router.generate.side_effect = _capture_generate
+
+    monkeypatch.setattr(
+        "audiobench.memory.query_engine.router_for_settings",
+        lambda *a, **kw: mock_router,
+    )
+    monkeypatch.setattr(
+        "audiobench.memory.query_reformulator.router_for_settings",
+        lambda *a, **kw: mock_router,
+    )
     monkeypatch.setattr(
         "audiobench.memory.query_reformulator.QueryReformulator.reformulate",
         lambda self, q: any_rq(),
@@ -48,15 +73,6 @@ def test_research_engine_synthesis_floor_and_source_labeling(monkeypatch):
         "audiobench.memory.query_engine._temporal_dedup",
         lambda hits: hits,
     )
-
-    captured_prompt: list[str] = []
-
-    def mock_call_llm(prompt, **kwargs):
-        captured_prompt.append(prompt)
-        return Ok(value="synthesised answer")
-
-    monkeypatch.setattr("audiobench.memory.query_engine._call_llm", mock_call_llm)
-    monkeypatch.setattr("audiobench.memory.query_engine._call_llm_for_model", mock_call_llm)
 
     engine = ResearchEngine()
 

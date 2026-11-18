@@ -32,7 +32,24 @@ def _make_hit(segment_id: int, start: float = 1.0, end: float = 2.0) -> SegmentH
 @pytest.fixture(autouse=True)
 def _stub_synthesis_and_llm(monkeypatch):
     """Prevent ResearchEngine tests from hanging on external Ollama or loading models in-process."""
+    from unittest.mock import MagicMock
+    from audiobench.chat.providers.provider_outcome import LlmOutcome, OutcomeType
     from audiobench.memory.query_engine import Ok
+
+    mock_router = MagicMock()
+    mock_router.generate.return_value = LlmOutcome(
+        type=OutcomeType.OK,
+        content="mock answer",
+        provider="ollama",
+    )
+    monkeypatch.setattr(
+        "audiobench.memory.query_engine.router_for_settings",
+        lambda *a, **kw: mock_router,
+    )
+    monkeypatch.setattr(
+        "audiobench.memory.query_reformulator.router_for_settings",
+        lambda *a, **kw: mock_router,
+    )
     monkeypatch.setattr(
         "audiobench.memory.retrieval_streams.SynthesisStream.retrieve",
         lambda *a, **kw: [],

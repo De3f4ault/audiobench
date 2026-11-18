@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 
 from audiobench.chat.chat_store import ChatRepository
 from audiobench.chat.providers.ollama_provider import OllamaClient
+from audiobench.chat.providers.provider_outcome import LlmOutcome, OutcomeType
+from audiobench.chat.providers.router import ProviderRouter, router_for_settings
 from audiobench.core.db_session import get_session
 from audiobench.core.logger_factory import get_logger
 from audiobench.core.settings import get_settings
@@ -278,6 +280,7 @@ class MemoryQueryEngine:
         self.daemon = get_daemon_client()
         self.expr_repo = ExpressionRepository()
         self.chat_repo = ChatRepository()
+        self.router = router_for_settings(self.settings)
         self.llm = OllamaClient(
             base_url=self.settings.ollama_base_url, model=self.settings.ollama_model
         )
@@ -335,12 +338,16 @@ class MemoryQueryEngine:
                 "Do not include any preambles, greetings, facts you are unsure about, or meta-commentary. Just "
                 f"produce the raw hypothetical text as if it were a direct transcript.\n\nQuery: {text}"
             )
-            match _call_llm(hyde_prompt, 0.7, self.llm, self.settings.gemini_api_key):
-                case Ok(value=doc):
-                    hyde_document = doc
-                    logger.debug("HyDE document generated (%d chars)", len(doc))
-                case Err(error=reason):
-                    logger.warning("HyDE generation failed: %s — proceeding without HyDE", reason)
+            outcome = self.router.generate(
+                messages=[{"role": "user", "content": hyde_prompt}],
+                temperature=0.7,
+            )
+            if outcome.type == OutcomeType.OK and outcome.content:
+                hyde_document = outcome.content
+                logger.debug("HyDE document generated (%d chars)", len(hyde_document))
+            else:
+                reason = str(outcome.error) if outcome.error else (outcome.fallback_reason or "HyDE failed")
+                logger.warning("HyDE generation failed: %s — proceeding without HyDE", reason)
 
         # ── Step 2: Vector Search via Daemon ─────────────────────────────────
         try:
@@ -537,27 +544,32 @@ class MemoryQueryEngine:
             "Provide a clear, structured answer with inline citations."
         )
 
-        match _call_llm(prompt, 0.2, self.llm, self.settings.gemini_api_key):
-            case Ok(value=answer):
-                self.daemon.write_cache(text, answer, hyde_document=hyde_document)
-                return QueryResult(
-                    query=text,
-                    answer=answer,
-                    sources=sources,
-                    query_time_seconds=time.time() - t0,
-                    hyde_document=hyde_document,
-                )
-            case Err(error=reason):
-                logger.error("Synthesis failed completely: %s", reason)
-                return QueryResult(
-                    query=text,
-                    answer=None,
-                    sources=sources,
-                    query_time_seconds=time.time() - t0,
-                    hyde_document=hyde_document,
-                    synthesis_failed=True,
-                    synthesis_error=reason,
-                )
+        outcome = self.router.generate(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        if outcome.type == OutcomeType.OK and outcome.content:
+            answer = outcome.content
+            self.daemon.write_cache(text, answer, hyde_document=hyde_document)
+            return QueryResult(
+                query=text,
+                answer=answer,
+                sources=sources,
+                query_time_seconds=time.time() - t0,
+                hyde_document=hyde_document,
+            )
+        else:
+            reason = str(outcome.error) if outcome.error else (outcome.fallback_reason or "Synthesis failed")
+            logger.error("Synthesis failed completely: %s", reason)
+            return QueryResult(
+                query=text,
+                answer=None,
+                sources=sources,
+                query_time_seconds=time.time() - t0,
+                hyde_document=hyde_document,
+                synthesis_failed=True,
+                synthesis_error=reason,
+            )
 
 
 
@@ -726,31 +738,41 @@ class ResearchEngine:
                 f"Query: {query}"
             )
             settings = get_settings()
-            llm = OllamaClient(base_url=settings.ollama_base_url, model=settings.ollama_model)
-            match _call_llm_for_model(hyde_prompt, 0.7, model, llm, settings.gemini_api_key):
-                case Ok(value=doc):
-                    # Inject hyde_document into the (frozen) ReformulatedQuery by rebuilding it
-                    import dataclasses
-                    rq = dataclasses.replace(rq, hyde_document=doc)
-                    hyde_ms = (time.perf_counter() - t_hyde) * 1000
-                    log_event(
-                        subsystem="memory.search",
-                        event_type="hyde.ok",
-                        message="HyDE document generated",
-                        duration_ms=hyde_ms,
-                        metadata={"doc_chars": len(doc)},
-                    )
-                case Err(error=reason):
-                    hyde_fallback = True
-                    logger.warning(
-                        "HyDE generation failed (%s) — falling back to direct query embedding", reason
-                    )
-                    log_event(
-                        subsystem="memory.search",
-                        event_type="hyde.failed",
-                        message=f"HyDE failed: {reason[:80]}",
-                        level="WARNING",
-                    )
+            router = router_for_settings(settings)
+            if model and model.lower() == "gemini":
+                from dataclasses import replace
+                router = ProviderRouter(replace(settings, llm_provider_order=["gemini"]))
+            elif model:
+                router.set_primary_model(model)
+
+            outcome = router.generate(
+                messages=[{"role": "user", "content": hyde_prompt}],
+                temperature=0.7,
+            )
+            if outcome.type == OutcomeType.OK and outcome.content:
+                doc = outcome.content
+                import dataclasses
+                rq = dataclasses.replace(rq, hyde_document=doc)
+                hyde_ms = (time.perf_counter() - t_hyde) * 1000
+                log_event(
+                    subsystem="memory.search",
+                    event_type="hyde.ok",
+                    message="HyDE document generated",
+                    duration_ms=hyde_ms,
+                    metadata={"doc_chars": len(doc)},
+                )
+            else:
+                reason = str(outcome.error) if outcome.error else (outcome.fallback_reason or "HyDE failed")
+                hyde_fallback = True
+                logger.warning(
+                    "HyDE generation failed (%s) — falling back to direct query embedding", reason
+                )
+                log_event(
+                    subsystem="memory.search",
+                    event_type="hyde.failed",
+                    message=f"HyDE failed: {reason[:80]}",
+                    level="WARNING",
+                )
 
         fts_hits: list = []
         dense_hits: list = []
@@ -1025,71 +1047,75 @@ class ResearchEngine:
 
         t_synth = time.perf_counter()
 
-        # Allow explicit opt-in to Gemini
+        router = router_for_settings(settings)
         if model_name.lower() == "gemini":
-            result = _call_gemini(synthesis_prompt, 0.2, settings.gemini_api_key)
-            if isinstance(result, Err):
-                result = Err(error=f"gemini forced: {result.error}")
-        else:
-            llm = OllamaClient(base_url=settings.ollama_base_url, model=model_name)
-            result = _call_llm(synthesis_prompt, temperature=0.2, llm=llm, api_key=settings.gemini_api_key)
+            from dataclasses import replace
+            router = ProviderRouter(replace(settings, llm_provider_order=["gemini"]))
+        elif model_name:
+            router.set_primary_model(model_name)
 
-        match result:
-            case Ok(value=answer):
-                t_done = time.perf_counter()
-                synth_s = t_done - t_synth
-                synth_ms = synth_s * 1000
-                log_event(
-                    subsystem="memory.search",
-                    event_type="synthesis.ok",
-                    message="Synthesis completed",
-                    duration_ms=synth_ms,
-                    metadata={"answer_chars": len(answer)},
-                )
-                return ResearchResult(
-                    query=query,
-                    sources=fused,
-                    prior_synthesis_hits=synthesis_hits,
-                    query_time_seconds=t_done - t0,
-                    retrieval_time_seconds=t_retrieval_done - t0,
-                    synthesis_time_seconds=synth_s,
-                    answer=answer,
-                    streams_skipped=streams_skipped,
-                    hyde_fallback=hyde_fallback,
-                    hyde_document=rq.hyde_document,
-                )
-            case Err(error=reason):
-                t_done = time.perf_counter()
-                synth_s = t_done - t_synth
-                synth_ms = synth_s * 1000
-                logger.error("ResearchEngine synthesis failed: %s", reason)
-                log_event(
-                    subsystem="memory.search",
-                    event_type="synthesis.failed",
-                    message=f"Synthesis failed: {reason[:120]}",
-                    level="ERROR",
-                    duration_ms=synth_ms,
-                    metadata={"error": reason[:200]},
-                )
-                # ── Extractive fallback ───────────────────────────────────────
-                # Fragments are already retrieved and in memory. Rather than
-                # returning nothing when the LLM is unavailable, surface the top
-                # fragments as a readable answer so the session stays useful.
-                # synthesis_is_fallback=True lets the UI label it distinctly.
-                fallback_answer = self._extractive_fallback(synthesis_frags, query) if synthesis_frags else None
-                return ResearchResult(
-                    query=query,
-                    sources=fused,
-                    prior_synthesis_hits=synthesis_hits,
-                    query_time_seconds=t_done - t0,
-                    retrieval_time_seconds=t_retrieval_done - t0,
-                    synthesis_time_seconds=synth_s,
-                    answer=fallback_answer,
-                    synthesis_failed=fallback_answer is None,   # only truly failed if no frags
-                    synthesis_is_fallback=fallback_answer is not None,
-                    synthesis_error=reason,
-                    streams_skipped=streams_skipped,
-                    hyde_fallback=hyde_fallback,
-                    hyde_document=rq.hyde_document,
-                )
+        outcome = router.generate(
+            messages=[{"role": "user", "content": synthesis_prompt}],
+            temperature=0.2,
+        )
+
+        if outcome.type == OutcomeType.OK and outcome.content:
+            answer = outcome.content
+            t_done = time.perf_counter()
+            synth_s = t_done - t_synth
+            synth_ms = synth_s * 1000
+            log_event(
+                subsystem="memory.search",
+                event_type="synthesis.ok",
+                message="Synthesis completed",
+                duration_ms=synth_ms,
+                metadata={"answer_chars": len(answer)},
+            )
+            return ResearchResult(
+                query=query,
+                sources=fused,
+                prior_synthesis_hits=synthesis_hits,
+                query_time_seconds=t_done - t0,
+                retrieval_time_seconds=t_retrieval_done - t0,
+                synthesis_time_seconds=synth_s,
+                answer=answer,
+                streams_skipped=streams_skipped,
+                hyde_fallback=hyde_fallback,
+                hyde_document=rq.hyde_document,
+            )
+        else:
+            reason = str(outcome.error) if outcome.error else (outcome.fallback_reason or "synthesis failed")
+            t_done = time.perf_counter()
+            synth_s = t_done - t_synth
+            synth_ms = synth_s * 1000
+            logger.error("ResearchEngine synthesis failed: %s", reason)
+            log_event(
+                subsystem="memory.search",
+                event_type="synthesis.failed",
+                message=f"Synthesis failed: {reason[:120]}",
+                level="ERROR",
+                duration_ms=synth_ms,
+                metadata={"error": reason[:200]},
+            )
+            # ── Extractive fallback ───────────────────────────────────────
+            # Fragments are already retrieved and in memory. Rather than
+            # returning nothing when the LLM is unavailable, surface the top
+            # fragments as a readable answer so the session stays useful.
+            # synthesis_is_fallback=True lets the UI label it distinctly.
+            fallback_answer = self._extractive_fallback(synthesis_frags, query) if synthesis_frags else None
+            return ResearchResult(
+                query=query,
+                sources=fused,
+                prior_synthesis_hits=synthesis_hits,
+                query_time_seconds=t_done - t0,
+                retrieval_time_seconds=t_retrieval_done - t0,
+                synthesis_time_seconds=synth_s,
+                answer=fallback_answer,
+                synthesis_failed=fallback_answer is None,   # only truly failed if no frags
+                synthesis_is_fallback=fallback_answer is not None,
+                synthesis_error=reason,
+                streams_skipped=streams_skipped,
+                hyde_fallback=hyde_fallback,
+                hyde_document=rq.hyde_document,
+            )
 

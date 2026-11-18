@@ -42,8 +42,27 @@ def make_failed_query_result(sources: int = 3) -> ResearchResult:
 
 @pytest.fixture
 def mock_all_llm_fail(monkeypatch):
-    """Make all LLM paths return Err so synthesis always fails."""
+    """Make all LLM paths return failure so synthesis always fails."""
+    from unittest.mock import MagicMock
     from audiobench.memory.query_engine import Err
+    from audiobench.chat.providers.provider_outcome import LlmOutcome, OutcomeType
+
+    # Patch router_for_settings so the router.generate() path returns FAILED
+    mock_router = MagicMock()
+    mock_router.generate.return_value = LlmOutcome(
+        type=OutcomeType.FAILED,
+        content="",
+        error=Exception("all llm providers failed"),
+    )
+    monkeypatch.setattr(
+        "audiobench.memory.query_engine.router_for_settings",
+        lambda *a, **kw: mock_router,
+    )
+    monkeypatch.setattr(
+        "audiobench.memory.query_reformulator.router_for_settings",
+        lambda *a, **kw: mock_router,
+    )
+    # Keep the shim patch as a belt-and-suspenders fallback while shim exists
     monkeypatch.setattr(
         "audiobench.memory.query_engine._call_llm",
         lambda *a, **kw: Err(error="all llm providers failed"),
