@@ -26,7 +26,7 @@ def test_llama_adapter_delegates_correctly(mock_engine_cls):
     assert text_res == [0.1, 0.2, 0.3]
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 @patch("audiobench.memory.llama_adapter.EmbeddingEngine")
 async def test_llama_adapter_async_delegation(mock_engine_cls):
     """Verify async LlamaIndex adapter methods delegate correctly."""

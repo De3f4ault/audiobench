@@ -63,6 +63,9 @@ def _configure_hf() -> bool:
     if is_offline:
         os.environ["HF_HUB_OFFLINE"] = "1"
 
+    # Avoid LiteLLM remote pricing network calls
+    os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
     _hf_configured = True
     return is_offline
 
@@ -278,7 +281,9 @@ def get_colbert_reranker() -> Any:
                     try:
                         with _force_offline_env():
                             _colbert_reranker = ColbertReranker(
-                                model_name="answerdotai/answerai-colbert-small-v1", column="content"
+                                model_name="answerdotai/answerai-colbert-small-v1",
+                                column="content",
+                                verbose=0,
                             )
                     except Exception as e:
                         logger.debug("Failed to load ColBERT reranker from cache: %s", e)
@@ -286,7 +291,9 @@ def get_colbert_reranker() -> Any:
                             raise
                         # Attempt 2: online download (first-run path).
                         _colbert_reranker = ColbertReranker(
-                            model_name="answerdotai/answerai-colbert-small-v1", column="content"
+                            model_name="answerdotai/answerai-colbert-small-v1",
+                            column="content",
+                            verbose=0,
                         )
 
                     logger.info("ColBERT reranker loaded in %.2fs", time.time() - t0)

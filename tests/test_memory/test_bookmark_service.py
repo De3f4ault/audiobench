@@ -90,7 +90,7 @@ class TestGenerateSmartBookmarkCardMocked:
 
             # Rendered markdown verification
             assert "Tier 1: Local Narrative Arc" in card.rendered_markdown
-            assert "Tier 2: Cross-Library Dialectic Bridges" in card.rendered_markdown
+            assert "Tier 2: Cross-Library Semantic Bridges" in card.rendered_markdown
             assert "Consensus Triangle Badge" in card.rendered_markdown
             assert "Fyodor Dostoyevsky" in card.rendered_markdown
             assert "Alan Watts" in card.rendered_markdown

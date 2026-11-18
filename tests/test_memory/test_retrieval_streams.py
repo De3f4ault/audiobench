@@ -138,8 +138,18 @@ def test_fts5_stream_returns_empty_on_no_match(db_with_fts5):
     assert hits == []
 
 
-def test_stream_retrieve_never_raises(broken_db_connection, any_rq):
+def test_stream_retrieve_never_raises(broken_db_connection, any_rq, monkeypatch):
     """Every stream must catch its own errors and return empty list. Never propagate."""
+    # Ensure DenseStream and ColBERTStream do not block on a live daemon socket
+    class BrokenDaemon:
+        def embed_query(self, *args, **kwargs):
+            raise RuntimeError("Daemon inference engine unavailable")
+
+        def rerank(self, *args, **kwargs):
+            raise RuntimeError("Daemon reranker unavailable")
+
+    monkeypatch.setattr("audiobench.daemon.factory.get_daemon_client", lambda: BrokenDaemon())
+
     assert FTS5Stream().retrieve(any_rq, top_k=5) == []
     assert DenseStream().retrieve(any_rq, top_k=5) == []
     assert ColBERTStream().retrieve(any_rq, top_k=5) == []

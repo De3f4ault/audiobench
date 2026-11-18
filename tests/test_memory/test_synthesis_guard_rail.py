@@ -109,7 +109,7 @@ def test_cli_displays_segments_on_synthesis_failure(capsys):
     _display_results(result)
     captured = capsys.readouterr()
     # Must show synthesis failed banner
-    assert "synthesis failed" in captured.out.lower() or "⚠" in captured.out or "synthesis✗" in captured.out
+    assert "synthesis failed" in captured.out.lower() or "[!]" in captured.out or "synthesis✗" in captured.out
     # Must show fragment markers
     assert "FRAGMENT" in captured.out.upper() or "→" in captured.out or "fragments" in captured.out.lower()
     # Must show timestamps in HH:MM:SS format (contains ":")

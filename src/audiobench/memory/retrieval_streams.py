@@ -83,7 +83,7 @@ class FTS5Stream:
                     FROM segments_fts fts
                     JOIN segments s ON fts.rowid = s.id
                     JOIN transcriptions t ON s.transcription_id = t.id
-                    JOIN audio_files af ON t.audio_file_id = af.id
+                    LEFT JOIN audio_files af ON t.audio_file_id = af.id
                     WHERE segments_fts MATCH :match_query
                     {focus_clause}
                     ORDER BY bm25_score ASC

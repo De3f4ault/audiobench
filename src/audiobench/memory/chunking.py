@@ -13,6 +13,7 @@ from typing import Any
 
 import numpy as np
 
+from audiobench.core.constants import ENGLISH_STOP_WORDS
 from audiobench.core.logger_factory import get_logger
 from audiobench.core.settings import get_settings
 from audiobench.memory.boilerplate import clean_audio_disclaimers, is_pure_boilerplate
@@ -430,7 +431,10 @@ def attribute_chunks_to_segments(
                 c_end_raw = idx_raw + len(c_clean)
             else:
                 # Tier 5: normalized raw ft match
-                words = [w for w in c_clean.split() if len(w) > 3]
+                raw_words = [w for w in c_clean.split() if len(w) >= 2]
+                words = [w for w in raw_words if w.lower() not in ENGLISH_STOP_WORDS]
+                if len(words) < 4 and len(raw_words) >= 4:
+                    words = raw_words
                 if len(words) >= 4:
                     search_phrase = " ".join(words[:4])
                     idx_sp = raw_ft.find(search_phrase)

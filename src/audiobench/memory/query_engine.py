@@ -45,6 +45,10 @@ class Ok:
     """Successful LLM call result."""
     value: str
     model: str = "unknown"
+    # Populated only when Ollama failed and Gemini succeeded — carries the primary
+    # error so synthesis_engine.py can surface it in the footer.
+    fallback_from: str | None = None   # "ollama" if primary failed and secondary succeeded
+    fallback_reason: str | None = None # primary error string on fallback success
 
 
 @dataclass(frozen=True)
@@ -222,6 +226,10 @@ def _call_llm(
 ) -> LLMResult:
     """Try Ollama, fall back to Gemini, return Ok or Err.
 
+    When Ollama fails but Gemini succeeds, the returned Ok carries
+    ``fallback_from='ollama'`` and ``fallback_reason=<primary error>`` so
+    callers can surface the fallback in diagnostics (e.g. the synthesis footer).
+
     Callers use structural pattern matching:
 
         match _call_llm(prompt, 0.2, llm, api_key):
@@ -230,18 +238,26 @@ def _call_llm(
     """
     result = _call_ollama(prompt, temperature, llm)
     if isinstance(result, Ok):
-        return result
+        return result  # no fallback; fallback_from / fallback_reason are None
 
-    logger.warning("Ollama LLM call failed (%s), trying Gemini fallback", result.error)
+    primary_error = result.error
+    logger.warning("Ollama LLM call failed (%s), trying Gemini fallback", primary_error)
 
     if not api_key:
-        return Err(error=f"{result.error} | gemini: no api key configured")
+        return Err(error=f"{primary_error} | gemini: no api key configured")
 
     gemini_result = _call_gemini(prompt, temperature, api_key)
     if isinstance(gemini_result, Ok):
-        return gemini_result
+        # Carry the primary failure info through so the synthesis footer can
+        # report "Ollama failed (reason), fell back to Gemini".
+        return Ok(
+            value=gemini_result.value,
+            model=gemini_result.model,
+            fallback_from="ollama",
+            fallback_reason=primary_error,
+        )
 
-    return Err(error=f"{result.error} | {gemini_result.error}")
+    return Err(error=f"{primary_error} | {gemini_result.error}")
 
 
 def _call_llm_for_model(
