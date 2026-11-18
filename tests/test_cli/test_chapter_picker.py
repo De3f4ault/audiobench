@@ -1,5 +1,7 @@
-import pytest
 from unittest.mock import MagicMock
+
+import pytest
+
 
 @pytest.fixture
 def mock_input_returns(monkeypatch):
@@ -14,12 +16,12 @@ def audio_file_with_13_chapters(monkeypatch):
     mock_file = MagicMock(spec=AudioFileRecord)
     mock_file.id = 1
     mock_chapters = [MagicMock(spec=ChapterRecord, id=i, transcript_length=1000) for i in range(1, 14)]
-    
+
     # Mock get_session to return a mock session that returns this file
     mock_session = MagicMock()
     mock_session.query().filter_by().first.return_value = mock_file
     mock_session.query().filter_by().order_by().all.return_value = mock_chapters
-    
+
     # We mock core.db_session because the chat module might use it
     monkeypatch.setattr("audiobench.core.db_session.get_session", lambda: MagicMock(__enter__=lambda self: mock_session, __exit__=lambda self, *args: None))
     return mock_file
@@ -30,7 +32,7 @@ def large_audio_file(monkeypatch):
     mock_file = MagicMock(spec=AudioFileRecord)
     mock_file.id = 2
     mock_chapters = [MagicMock(spec=ChapterRecord, id=i, transcript_length=40000) for i in range(1, 14)]
-    
+
     mock_session = MagicMock()
     mock_session.query().filter_by().order_by().all.return_value = mock_chapters
     monkeypatch.setattr("audiobench.core.db_session.get_session", lambda: MagicMock(__enter__=lambda self: mock_session, __exit__=lambda self, *args: None))
@@ -42,7 +44,7 @@ def small_audio_file(monkeypatch):
     mock_file = MagicMock(spec=AudioFileRecord)
     mock_file.id = 3
     mock_chapters = [MagicMock(spec=ChapterRecord, id=i, transcript_length=1000) for i in range(1, 14)]
-    
+
     mock_session = MagicMock()
     mock_session.query().filter_by().order_by().all.return_value = mock_chapters
     monkeypatch.setattr("audiobench.core.db_session.get_session", lambda: MagicMock(__enter__=lambda self: mock_session, __exit__=lambda self, *args: None))

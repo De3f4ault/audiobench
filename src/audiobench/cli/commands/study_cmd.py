@@ -5,7 +5,6 @@ from __future__ import annotations
 import click
 
 from audiobench.cli.display.theme import ACCENT, BOLD, DIM, SUCCESS, console, error_panel
-from audiobench.core.settings import get_settings
 
 
 @click.group()
@@ -27,11 +26,11 @@ def study_new(file_id: int, name: str | None) -> None:
       audiobench study new 83
       audiobench study new 83 --name "Goggins Deep Dive"
     """
+    import json
+
     from audiobench.core.db_engine import init_db
     from audiobench.core.db_session import get_session
     from audiobench.storage.models import AudioFileRecord, StudyProject, StudySession
-    from audiobench.cli.tui.chapter_picker import pick_chapters
-    import json
 
     init_db()
 
@@ -78,8 +77,8 @@ def study_new(file_id: int, name: str | None) -> None:
     if picked_chapters:
         console.print(f"    Chapters: {len(picked_chapters)} selected")
     else:
-        console.print(f"    Chapters: All (no chapter filter)")
-    console.print(f"    Session:  #1 (just created)")
+        console.print("    Chapters: All (no chapter filter)")
+    console.print("    Session:  #1 (just created)")
     console.print(f"  [{DIM}]{'─' * 44}[/]")
     console.print()
     console.print(f"  [{DIM}]Start chatting: audiobench chat --project {project_id}[/]")
@@ -102,7 +101,8 @@ def study_close(project_id: int, session_id: int | None, no_memoir: bool) -> Non
       audiobench study close 1 --no-memoir
     """
     import sys
-    from datetime import datetime, UTC
+    from datetime import UTC, datetime
+
     from audiobench.core.db_engine import init_db
     from audiobench.core.db_session import get_session
     from audiobench.storage.models import StudyProject, StudySession
@@ -144,8 +144,8 @@ def study_close(project_id: int, session_id: int | None, no_memoir: bool) -> Non
         console.print(f"  [{DIM}]Generating memoir for session #{sess_id}...[/]")
         try:
             from audiobench.core.db_session import get_session
-            from audiobench.storage.models import ChatConversation
             from audiobench.memory.memoir_writer import MemoirWriter
+            from audiobench.storage.models import ChatConversation
 
             with get_session() as db:
                 conv = db.query(ChatConversation).filter_by(id=conv_id).first()
@@ -192,11 +192,11 @@ def study_resume(project_id: int) -> None:
     Examples:
       audiobench study resume 1
     """
-    import json
+    import sys
+
     from audiobench.core.db_engine import init_db
     from audiobench.core.db_session import get_session
     from audiobench.storage.models import StudyProject, StudySession
-    import sys
 
     init_db()
 
@@ -266,7 +266,7 @@ def study_list() -> None:
             )
             status = f"[{ACCENT}]{open_count} open[/]" if open_count > 0 else f"[{DIM}]all closed[/]"
             console.print(
-                f"    [{ACCENT}]#{p.id}[/] {p.name[:40]} "
+                f"    [{ACCENT}]#{p.id}[/] {(p.name or 'Unnamed Project')[:40]} "
                 f"[{DIM}]({sess_count} sessions, {status})[/]"
             )
         console.print()

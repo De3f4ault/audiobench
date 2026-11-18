@@ -149,7 +149,7 @@ def inspect(
                         for ch in chapters:
                             dur_str = format_duration(ch.duration_seconds)
                             if ch.is_ghost:
-                                status = "[yellow]⚡ Skipped (0s)[/]"
+                                status = "[yellow]Skipped (0s)[/]"
                             elif tx_ids.get(ch.index):
                                 status = f"[{SUCCESS}]Transcribed[/]"
                             else:

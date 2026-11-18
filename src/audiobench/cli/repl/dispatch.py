@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import difflib
 import uuid
-from typing import Callable
+from collections.abc import Callable
 
 # ── Module-level session ID — generated once per REPL process ─────────────────
 SESSION_ID: str = str(uuid.uuid4())[:8]
@@ -84,6 +84,7 @@ def dispatch_backslash(session, line: str) -> bool:
             console.print(f"  [{DIM}]Type [{ACCENT}]\\help[/] for available commands.[/]")
         return False
 
+    session._command_count += 1
     try:
         handler(session, args)
         return True
@@ -91,9 +92,9 @@ def dispatch_backslash(session, line: str) -> bool:
         console.print(f"  [{WARNING}]Error in \\{cmd}: {e}[/]")
         return False
 
-import click
-import json
 import time
+
+import click
 
 from audiobench.cli.display.theme import (
     ACCENT,
@@ -205,17 +206,21 @@ def print_context_summary(session: ReplSession) -> None:
                 f"[{ACCENT}]{audio_file.get('file_name', '?')}[/] "
                 f"[{DIM}]({dur_str})[/]"
             )
+        else:
+            console.print(
+                f"  [{SUCCESS}]✓[/] Focused on file: [{ACCENT}]#{session.focus.id}[/]"
+            )
 
         # Mention transcript if there is one
         tx_id = session.last_id
         if tx_id:
-            rec = repo.get_by_id(tx_id)
+            rec = repo.get_by_id(tx_id, session=session)
             if rec:
                 words = rec.get("word_count", 0) or 0
                 console.print(f"      [{DIM}]↳ Active transcript: #{tx_id} ({words:,} words)[/]")
 
     elif session.focus.type == "transcript":
-        rec = repo.get_by_id(session.focus.id)
+        rec = repo.get_by_id(session.focus.id, session=session)
         if rec:
             words = rec.get("word_count", 0) or 0
             dur_str = format_duration(rec.get("duration", 0) or 0)
@@ -225,3 +230,48 @@ def print_context_summary(session: ReplSession) -> None:
                 f"{rec.get('file_name', '?')} "
                 f"[{DIM}]({words:,} words, {dur_str})[/]"
             )
+        else:
+            console.print(
+                f"  [{SUCCESS}]✓[/] Focused on transcript: [{ACCENT}]#{session.focus.id}[/]"
+            )
+
+    elif session.focus.type == "school":
+        from audiobench.core.db_session import get_session
+        from sqlalchemy import text as _sql
+
+        with get_session() as db:
+            row = db.execute(
+                _sql("SELECT name, node_count FROM expression_communities WHERE community_id = :cid"),
+                {"cid": session.focus.id},
+            ).fetchone()
+            if row:
+                name, count = row[0], row[1]
+                console.print(
+                    f"  [{SUCCESS}]✓[/] Focused on school: "
+                    f"[{ACCENT}]#{session.focus.id}[/] — "
+                    f"{name} "
+                    f"[{DIM}]({count:,} chunks)[/]"
+                )
+            else:
+                console.print(
+                    f"  [{SUCCESS}]✓[/] Focused on school: [{ACCENT}]#{session.focus.id}[/]"
+                )
+
+    elif session.focus.type == "work":
+        from audiobench.core.db_session import get_session
+        from audiobench.storage.models import WorkRecord
+
+        with get_session() as db:
+            work = db.query(WorkRecord).filter_by(id=session.focus.id).first()
+            if work:
+                author_str = f" by {work.author}" if work.author else ""
+                console.print(
+                    f"  [{SUCCESS}]✓[/] Focused on work: "
+                    f"[{ACCENT}]#{session.focus.id}[/] — "
+                    f"{work.title}{author_str}"
+                )
+            else:
+                console.print(
+                    f"  [{SUCCESS}]✓[/] Focused on work: [{ACCENT}]#{session.focus.id}[/]"
+                )
+

@@ -266,7 +266,7 @@ def list_cmd(
     )
 
     for b in bookmarks:
-        emoji = BOOKMARK_TYPES.get(b["bookmark_type"], "🔖")
+        emoji = BOOKMARK_TYPES.get(b["bookmark_type"], "[BM]")
         if b["is_region"]:
             time_str = (
                 f"{_format_timestamp(b['timestamp'])}→{_format_timestamp(b['end_timestamp'])}"
@@ -372,7 +372,7 @@ def add(
         console.print(
             f"  [{SUCCESS}]✓[/] Region #{bid}: "
             f"{_format_timestamp(start)}→{_format_timestamp(end)} "
-            f"{BOOKMARK_TYPES.get(bookmark_type, '🔖')} {default_name}"
+            f"{BOOKMARK_TYPES.get(bookmark_type, '[BM]')} {default_name}"
         )
     else:
         bid = repo.add(
@@ -385,7 +385,7 @@ def add(
         console.print(
             f"  [{SUCCESS}]✓[/] Bookmark #{bid}: "
             f"{_format_timestamp(start)} "
-            f"{BOOKMARK_TYPES.get(bookmark_type, '🔖')} {default_name}"
+            f"{BOOKMARK_TYPES.get(bookmark_type, '[BM]')} {default_name}"
         )
 
 
@@ -440,7 +440,7 @@ def set_type(bookmark_id: int, new_type: str) -> None:
 
     repo = BookmarkRepository()
     if repo.update(bookmark_id, bookmark_type=new_type):
-        emoji = BOOKMARK_TYPES.get(new_type, "🔖")
+        emoji = BOOKMARK_TYPES.get(new_type, "[BM]")
         console.print(f"  [{SUCCESS}]✓[/] #{bookmark_id} type → {emoji} {new_type}")
     else:
         console.print(error_panel(f"Bookmark #{bookmark_id} not found"))
@@ -500,7 +500,7 @@ def search(query: str, limit: int) -> None:
         return
 
     for b in results:
-        emoji = BOOKMARK_TYPES.get(b["bookmark_type"], "🔖")
+        emoji = BOOKMARK_TYPES.get(b["bookmark_type"], "[BM]")
         time_str = _format_timestamp(b["timestamp"])
         console.print(f"    [{ACCENT}]#{b['id']}[/] {emoji} {time_str}  {b['name']}")
         if b.get("notes"):
@@ -536,12 +536,16 @@ def export_cmd(target: str, output_path: str | None, fmt: str) -> None:
     else:
         data = repo.export_json(audio_id)
 
-    if output_path:
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(output_path).write_text(data, encoding="utf-8")
-        console.print(f"  [{SUCCESS}]✓[/] Exported ({fmt}) → [{ACCENT}]{output_path}[/]")
-    else:
-        stdout.print(data, highlight=False)
+    if not output_path:
+        from audiobench.core.settings import get_settings
+        exports_dir = get_settings().data_dir / "exports" / "bookmarks"
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        ext = "txt" if fmt == "audacity" else "json"
+        output_path = str(exports_dir / f"bookmarks_{audio_id}.{ext}")
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(output_path).write_text(data, encoding="utf-8")
+    console.print(f"  [{SUCCESS}]✓[/] Exported ({fmt}) → [{ACCENT}]{output_path}[/]")
 
 
 # ── Import ──────────────────────────────────────────────────
@@ -632,7 +636,7 @@ def auto_cmd(target: str, model: str | None, focus: str | None, dry_run: bool) -
     record = None
     try:
         tid = int(target)
-        record = repo.get_by_id(tid)
+        record = repo.get_by_id(tid, session=None)
     except ValueError:
         pass
 
@@ -663,7 +667,7 @@ def auto_cmd(target: str, model: str | None, focus: str | None, dry_run: bool) -
 
     # ── Header ──
     console.print()
-    console.print(f"  [{ACCENT}]🤖 AI Auto-Bookmark[/]")
+    console.print(f"  [{ACCENT}]AI Auto-Bookmark[/]")
     console.print(f"  [{DIM}]{'─' * 44}[/]")
     console.print(f"    Source:  [{ACCENT}]#{record['id']} {record['file_name']}[/]")
     console.print(f"    Model:   {model_name}")
@@ -772,7 +776,7 @@ def auto_cmd(target: str, model: str | None, focus: str | None, dry_run: bool) -
         if notes:
             notes = str(notes)[:500]
 
-        emoji = BOOKMARK_TYPES.get(bm_type, "🔖")
+        emoji = BOOKMARK_TYPES.get(bm_type, "[BM]")
         time_str = _format_timestamp(ts)
         if end_ts:
             time_str += f"→{_format_timestamp(end_ts)}"
@@ -810,7 +814,7 @@ def auto_cmd(target: str, model: str | None, focus: str | None, dry_run: bool) -
     console.print()
 
     if dry_run:
-        console.print(f"  [yellow]⚠ Dry run — {len(bookmarks_data)} bookmark(s) NOT saved[/]")
+        console.print(f"  [yellow][!] Dry run — {len(bookmarks_data)} bookmark(s) NOT saved[/]")
     else:
         console.print(f"  [{SUCCESS}]✓[/] Created {created} bookmark(s) via AI")
     console.print()

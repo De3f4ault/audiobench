@@ -140,3 +140,90 @@ class TestAliases:
         from audiobench.cli.repl.slash_commands import ALIASES
 
         assert ALIASES["quit"] == "/exit"
+
+
+class TestPrefixNormalization:
+    """Test transparent / vs \\ command routing and \\context handler."""
+
+    def _make_session(self):
+        from audiobench.cli.repl.session import ReplSession
+
+        group = click.Group("test")
+        return ReplSession(group)
+
+    def test_slash_focus_routes_without_warning(self):
+        from audiobench.cli.display.theme import console
+        from audiobench.cli.repl import _dispatch_single
+
+        session = self._make_session()
+        # Dispatch /focus (without arguments)
+        with console.capture() as cap:
+            should_exit = _dispatch_single(session, "/focus")
+        assert should_exit is False
+        out = cap.get()
+        # Must execute cmd_focus directly, never reprimand the user
+        assert "Did you mean \\focus? (backslash, not slash)" not in out
+        assert "No focus set" in out
+
+    def test_backslash_context_handler_registered(self):
+        from audiobench.cli.display.theme import console
+        from audiobench.cli.repl import _dispatch_single
+        from audiobench.core.focused_entity import FocusedEntity
+
+        session = self._make_session()
+        # When unfocused
+        with console.capture() as cap:
+            _dispatch_single(session, "\\context")
+        out1 = cap.get()
+        assert "No context set" in out1
+        assert "Did you mean: \\next?" not in out1
+
+        # When focused
+        session.focus = FocusedEntity(type="transcript", id=42, label="Transcript #42")
+        with console.capture() as cap:
+            _dispatch_single(session, "\\context")
+        out2 = cap.get()
+        assert "#42" in out2
+        assert "transcript" in out2.lower()
+
+    def test_slash_context_transparent_routing(self):
+        from audiobench.cli.display.theme import console
+        from audiobench.cli.repl import _dispatch_single
+        from audiobench.core.focused_entity import FocusedEntity
+
+        session = self._make_session()
+        session.focus = FocusedEntity(type="transcript", id=101, label="Transcript #101")
+        with console.capture() as cap:
+            _dispatch_single(session, "/context")
+        out = cap.get()
+        assert "#101" in out
+        assert "transcript" in out.lower()
+        assert "Did you mean" not in out
+
+
+class TestActionMenuBracketEscaping:
+    """Test that Rich does not swallow single-letter menu hotkeys [v], [g], [f]."""
+
+    def test_action_menu_options_display_brackets(self):
+        import io
+        from rich.console import Console
+        from audiobench.cli.display.theme import ACCENT
+
+        out_io = io.StringIO()
+        test_console = Console(file=out_io, force_terminal=False)
+
+        options = [
+            ("v", "View full content"),
+            ("g", "Show graph context"),
+            ("f", "Focus source file"),
+            ("n", "Capture to active/context note"),
+            ("a", "Use as context for .ask synthesis"),
+            ("s", "Show surrounding expressions"),
+            ("q", "Back to results"),
+        ]
+        for key, desc in options:
+            test_console.print(f"    [{ACCENT}]\\[{key}][/] {desc}")
+
+        rendered = out_io.getvalue()
+        for key, _ in options:
+            assert f"[{key}]" in rendered, f"Expected visible hotkey [{key}] in rendered output"

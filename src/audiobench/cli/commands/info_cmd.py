@@ -346,8 +346,11 @@ def render_file_dossier(
                     seg_ts = fmt_timestamp(n.segment.start_time)
                 elif tx_rows and n.body:
                     active_tx_id = tx_rows[0].id
+                    from audiobench.core.constants import ENGLISH_STOP_WORDS
                     clean_body = re.sub(r"[^\w\s]", " ", n.body.strip()[:100]).strip()
-                    words = [w for w in clean_body.split() if len(w) > 3]
+                    words = [w for w in clean_body.split() if len(w) >= 2 and w.lower() not in ENGLISH_STOP_WORDS]
+                    if not words:
+                        words = clean_body.split()
                     matched_s = None
                     if len(words) >= 3:
                         for i in range(min(5, len(words) - 2)):

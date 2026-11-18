@@ -61,6 +61,7 @@ def dispatch_dot(session: ReplSession, line: str) -> bool:
         console.print(f"  [{DIM}]Type [{ACCENT}].help[/] for available dot-commands.[/]")
         return False
 
+    session._command_count += 1
     try:
         handler(session, args)
         return True
@@ -99,7 +100,7 @@ def dot_use(session: ReplSession, args: str) -> None:
 
     tx_id = int(arg)
     repo = TranscriptionRepository()
-    rec = repo.get_by_id(tx_id)
+    rec = repo.get_by_id(tx_id, session=session)
     if not rec:
         console.print(f"  [{WARNING}]Transcript #{tx_id} not found.[/]")
         return
@@ -137,7 +138,7 @@ _SOURCE_ICONS: dict[str, str] = {
     "chapter_summary":     "▸",
     "system_inference":    "⬡",
     "user_correction":     "✎",
-    "journal_entry":       "📝",
+    "journal_entry":       "§",
 }
 
 _SOURCE_LABELS: dict[str, str] = {
@@ -287,7 +288,7 @@ def _render_results_ddm(
                 f"[bold]{icon}[/] [{WARNING}]{label}[/]  "
                 f"[{WARNING}][REDACTED — {tier_label} required][/]"
             )
-            console.print(f"       [{WARNING}]{'█' * 42}  🔒[/]")
+            console.print(f"       [{WARNING}]{'█' * 42}  [LOCKED][/]")
             console.print(
                 f"       [{DIM}]Run [{ACCENT}]\\unlock {tier_num}[/] to access this memory.[/]"
             )
@@ -379,7 +380,7 @@ def _action_menu(
     options = [o for o in options if o is not None]
 
     for key, desc in options:
-        console.print(f"    [{ACCENT}][{key}][/] {desc}")
+        console.print(f"    [{ACCENT}]\\[{key}][/] {desc}")
 
     while True:
         try:
@@ -399,7 +400,7 @@ def _action_menu(
             console.print()
 
         elif choice == "g":
-            _show_graph_context(expr, expr_repo)
+            _show_graph_context(expr, expr_repo, session=session)
 
         elif choice == "f" and prov.get("audio_file_id"):
             from audiobench.cli.repl.dispatch import print_context_summary
@@ -424,19 +425,19 @@ def _action_menu(
             return
 
         elif choice == "s":
-            _show_surrounding(expr, expr_repo)
+            _show_surrounding(expr, expr_repo, session=session)
 
         else:
             console.print(f"  [{WARNING}]Unknown action. Choose from: {', '.join(k for k, _ in options)}[/]")
 
 
-def _show_graph_context(expr, expr_repo) -> None:
+def _show_graph_context(expr, expr_repo, session: ReplSession | None = None) -> None:
     """Show parent expression, inbound/outbound relations, and linked inferences."""
     console.print(f"\n  [{BOLD}]Graph Context — Expression #{expr.id}[/]")
     console.print(f"  [{DIM}]{'─' * 50}[/]")
 
     # Walk to parent
-    parent = expr_repo.walk_to_parent(expr.id)
+    parent = expr_repo.walk_to_parent(expr.id, session=session)
     if parent:
         parent_label = _SOURCE_LABELS.get(parent.source_type, parent.source_type)
         snippet = parent.content.strip().replace("\n", " ")[:100]
@@ -451,7 +452,7 @@ def _show_graph_context(expr, expr_repo) -> None:
     other_relations = []
     for rel in relations:
         other_id = rel.to_expression_id if rel.from_expression_id == expr.id else rel.from_expression_id
-        other = expr_repo.get_by_id(other_id)
+        other = expr_repo.get_by_id(other_id, session=session)
         if other:
             if other.source_type == SourceType.SYSTEM_INFERENCE.value:
                 inferences.append(other)
@@ -474,12 +475,12 @@ def _show_graph_context(expr, expr_repo) -> None:
     console.print()
 
 
-def _show_surrounding(expr, expr_repo) -> None:
+def _show_surrounding(expr, expr_repo, session: ReplSession | None = None) -> None:
     """Show sibling expressions by walking to the parent and listing its children."""
     console.print(f"\n  [{BOLD}]Surrounding Context[/]")
     console.print(f"  [{DIM}]{'─' * 50}[/]")
 
-    parent = expr_repo.walk_to_parent(expr.id)
+    parent = expr_repo.walk_to_parent(expr.id, session=session)
     if not parent:
         console.print(f"  [{DIM}]No parent — cannot show surrounding context.[/]")
         return
@@ -501,7 +502,7 @@ def _show_surrounding(expr, expr_repo) -> None:
         current_pos = sibling_ids.index(expr.id) if expr.id in sibling_ids else -1
 
         for pos, sid in enumerate(sibling_ids):
-            sib = expr_repo.get_by_id(sid)
+            sib = expr_repo.get_by_id(sid, session=session)
             if not sib:
                 continue
             snippet = sib.content.strip().replace("\n", " ")[:100]
@@ -661,20 +662,138 @@ def dot_search(session: ReplSession, args: str) -> None:
             console.print(f"  [{DIM}]No results for \"{query}\".[/]")
             return
 
+        # ── Synthesis router: apply scope from last \synthesize ──────────────
+        from audiobench.cli.repl.synthesis_router import (
+            get_synthesis_scope,
+            soft_boost,
+        )
+        router = get_synthesis_scope(session)
+
+        # EC-12: If focus is a school and the router scope has no overlap with
+        # that community's works, the scope is stale w.r.t. current focus.
+        # Downgrade to soft and log — this feeds the same instrumentation loop
+        # used to decide whether soft-mode is pulling its weight.
+        if router.mode == "hard" and session.focus and session.focus.type == "school":
+            # Check whether any cited work_id is accessible in the focused community
+            from audiobench.core.db_session import get_session as _gs
+            from sqlalchemy import text as sa_text
+            if router.work_ids:
+                with _gs() as _db:
+                    ph = ", ".join(f":cwid{i}" for i in range(len(router.work_ids)))
+                    pm = {f"cwid{i}": wid for i, wid in enumerate(router.work_ids)}
+                    pm["cid"] = session.focus.id
+                    overlap = _db.execute(
+                        sa_text(
+                            f"SELECT COUNT(*) FROM expressions"
+                            f" WHERE work_id IN ({ph}) AND community_id = :cid LIMIT 1"
+                        ),
+                        pm,
+                    ).scalar()
+                if not overlap:
+                    import logging as _logging
+                    _logging.getLogger("audiobench.synthesis_router").warning(
+                        "EC-12: router scope work_ids=%s have no overlap with "
+                        "focused community_id=%s — downgrading hard→soft",
+                        router.work_ids, session.focus.id,
+                    )
+                    from dataclasses import replace as _dc_replace
+                    router = _dc_replace(router, mode="soft")
+
         # Fetch ExpressionRecords and provenance
         enriched = []
         for r in raw_results:
             expr_id = r.get("expression_id")
             if not expr_id:
                 continue
-            expr = expr_repo.get_by_id(expr_id)
+            expr = expr_repo.get_by_id(expr_id, session=session)
             if not expr:
                 continue
             if source_type_filter and expr.source_type != source_type_filter:
                 continue
+            if session.focus and session.focus.type == "school":
+                if expr.community_id != session.focus.id:
+                    continue
+
+            # Hard mode: drop out-of-scope expressions entirely.
+            if router.mode == "hard" and router.work_ids:
+                if expr.work_id not in router.work_ids:
+                    continue
+
             score = float(r.get("score", 0.0))
+
+            # Soft mode: add +0.05 to in-scope expressions, then re-rank below.
+            # ANN scores are similarities (higher = better), so boost adds directly.
+            boost = soft_boost(router, expr.work_id)
+            score += boost
+
             prov = _resolve_provenance(expr)
             enriched.append((expr, score, prov))
+
+        # Soft mode: re-rank by boosted score (preserve relative order among
+        # non-boosted results; in-scope results float up by exactly one boost unit).
+        if router.mode == "soft" and router.work_ids:
+            before_ranks = {e.id: i for i, (e, _, _) in enumerate(enriched)}
+            enriched.sort(key=lambda t: t[1], reverse=True)
+            after_ranks = {e.id: i for i, (e, _, _) in enumerate(enriched)}
+
+            # Instrumentation — feeds kill-threshold measurement (Step 4).
+            # Denominator definition (Option B, pre-registered):
+            #   Only soft-mode queries count. Queries that hit hard/off mode
+            #   are out of scope for this measurement.
+            # Kill criterion: remove soft if <30% of soft-mode queries show
+            #   ANY in-scope result with rank_shift >= 1.
+            boosted_eids = {e.id for e, _, _ in enriched if e.work_id in set(router.work_ids)}
+            per_result_shifts = [
+                (eid, before_ranks[eid], after_ranks[eid],
+                 after_ranks[eid] - before_ranks[eid])  # negative = moved up
+                for eid in boosted_eids
+                if eid in before_ranks and eid in after_ranks
+            ]
+            shifted = sum(1 for _, _, _, delta in per_result_shifts if delta < 0)  # moved up
+            max_shift = max((abs(d) for _, _, _, d in per_result_shifts if d < 0), default=0)
+            import logging as _logging
+            _logging.getLogger("audiobench.synthesis_router").info(
+                "soft_mode query=%r work_ids=%s "
+                "in_scope=%d total=%d shifted=%d max_shift=%d "
+                "per_result=%s reason=%s",
+                query, router.work_ids,
+                len(boosted_eids), len(enriched), shifted, max_shift,
+                [(b, a, d) for _, b, a, d in per_result_shifts],
+                router.reason,
+            )
+
+
+        # EC-13: Zero-results fallback for hard mode.
+        # If hard-filter leaves nothing, the user's current query has no overlap
+        # with the cited scope. Fall back to unscoped, note the fallback.
+        # Only the zero case is handled here — the 1-3 boundary is NOT shipped
+        # yet. It requires a quality-aware threshold (BM25 rank magnitude / q_sim)
+        # and must be swept against real data before committing to a number.
+        if not enriched and router.mode == "hard":
+            import logging as _logging
+            _logging.getLogger("audiobench.synthesis_router").info(
+                "EC-13: hard-scope zero-results fallback for query=%r work_ids=%s",
+                query, router.work_ids,
+            )
+            console.print(
+                f"  [{DIM}]No results in synthesis scope — expanding to full library.[/]"
+            )
+            # Re-run enrichment without hard-filter (router treated as off)
+            for r in raw_results:
+                expr_id = r.get("expression_id")
+                if not expr_id:
+                    continue
+                expr = expr_repo.get_by_id(expr_id, session=session)
+                if not expr:
+                    continue
+                if source_type_filter and expr.source_type != source_type_filter:
+                    continue
+                if session.focus and session.focus.type == "school":
+                    if expr.community_id != session.focus.id:
+                        continue
+                score = float(r.get("score", 0.0))
+                prov = _resolve_provenance(expr)
+                enriched.append((expr, score, prov))
 
         if not enriched:
             console.print(f"  [{DIM}]No results matched after filtering.[/]")
@@ -686,7 +805,7 @@ def dot_search(session: ReplSession, args: str) -> None:
         if redacted_count > 0:
             noun = "memory" if redacted_count == 1 else "memories"
             console.print(
-                f"  [yellow]⚠[/]  [{WARNING}]{redacted_count} {noun} relevant but locked.[/] "
+                f"  [yellow][!][/]  [{WARNING}]{redacted_count} {noun} relevant but locked.[/] "
                 f"[{DIM}]Run [{ACCENT}]\\unlock[/] for full access.[/]"
             )
 
@@ -705,13 +824,14 @@ def dot_search(session: ReplSession, args: str) -> None:
             return
 
         console.print(
-            f"  [yellow]⚡[/] Semantic engine unavailable — showing text search results instead.\n"
+            f"  [yellow][!][/] Semantic engine unavailable — showing text search results instead.\n"
             f"  [{DIM}]audiobench daemon start[/] for full semantic search.\n"
         )
 
         from audiobench.storage.repository import TranscriptionRepository
         repo = TranscriptionRepository()
-        fts_results = repo.search(query, limit=top_k)
+        cid = session.focus.id if (session.focus and session.focus.type == "school") else None
+        fts_results = repo.search(query, limit=top_k, session=session, community_id=cid)
 
         if not fts_results:
             console.print(f"  [{DIM}]No results for \"{query}\".[/]")

@@ -11,7 +11,7 @@ class ImportFileManager:
         self.cancelled = False
         self.next_mode = None
         self.ui_offset = 0
-        
+
         if start_state:
             self.state_import(start_state)
 
@@ -56,7 +56,7 @@ class ImportFileManager:
             stdscr.clear()
             height, width = stdscr.getmaxyx()
 
-            header = " 🎵 AudioBench Import Manager "
+            header = " AudioBench Import Manager "
             path_str = f" Path: {self.navigator.current_path}"
             if len(path_str) > width - len(header) - 3:
                 path_str = "..." + path_str[-(width - len(header) - 6) :]
@@ -67,7 +67,7 @@ class ImportFileManager:
             info_text = f" Selected Files: {len(self.navigator.selected_files)}"
             if self.navigator.show_hidden:
                 info_text += " | [HIDDEN VISIBLE]"
-                
+
             items = self.navigator.list_items()
             if items:
                 info_text += f" | {self.navigator.selected + 1}/{len(items)}"
@@ -79,14 +79,14 @@ class ImportFileManager:
                 stdscr.addstr(2, 0, "─" * (width - 1), curses.color_pair(6))
 
             max_visible = height - 5
-            
+
             if self.navigator.selected < self.ui_offset:
                 self.ui_offset = self.navigator.selected
             elif self.navigator.selected >= self.ui_offset + max_visible:
                 self.ui_offset = self.navigator.selected - max_visible + 1
 
             list_start_y = 3
-            
+
             visible_items = items[self.ui_offset:self.ui_offset + max_visible]
 
             for idx_offset, item in enumerate(visible_items):
@@ -111,9 +111,9 @@ class ImportFileManager:
 
                 # Icons
                 if item_path.is_dir():
-                    icon = "📁"
+                    icon = "[DIR]"
                 else:
-                    icon = "🎵"
+                    icon = "[AUD]"
 
                 # Checkbox for files
                 if item_path.is_file():
@@ -124,12 +124,12 @@ class ImportFileManager:
                     cb_attr = row_attr
 
                 marker = "►" if idx == self.navigator.selected else " "
-                
+
                 try:
                     stdscr.addstr(y, 0, f"{marker} ", row_attr)
                     stdscr.addstr(y, 2, checkbox, cb_attr)
-                    stdscr.addstr(y, 5, f" {icon} ", row_attr)
-                    stdscr.addstr(y, 9, display_item, row_attr)
+                    stdscr.addstr(y, 6, icon, row_attr)
+                    stdscr.addstr(y, 12, display_item, row_attr)
                 except curses.error:
                     pass
 

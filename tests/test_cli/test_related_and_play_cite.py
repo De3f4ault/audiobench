@@ -413,7 +413,7 @@ def test_cmd_focus_dialectic_bridge(repl_session):
         assert repl_session.focus.label == "tale_of_two_cities.mp3"
         mock_summary.assert_called_once()
         printed = " ".join(str(call) for call in mock_print.call_args_list)
-        assert "Focus switched to dialectic bridge [B1]" in printed
+        assert "Focus switched to semantic bridge [B1]" in printed
         assert "Charles Dickens" in printed
 
 
@@ -475,7 +475,7 @@ def test_cmd_bookmark_hermeneutic_codex_rendering(repl_session):
         assert "Tier 1: Local Narrative Arc" in output
         assert "◄ Context (Ignition)" in output
         assert "► Resolution (Follow-up)" in output
-        assert "Tier 2: Dialectic Bridges" in output
+        assert "Tier 2: Semantic Bridges" in output
         assert "[B1]" in output
         assert "Charles Dickens" in output
         assert "Consensus Partner" in output

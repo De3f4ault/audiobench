@@ -389,7 +389,7 @@ def test_retrieve_synthesis_context_scoped(mock_db):
 
         mock_sess.return_value = SessionContext()
 
-        frags = retrieve_synthesis_context("interpersonal negotiation", top_k=2, community_id=12)
+        frags, _meta = retrieve_synthesis_context("interpersonal negotiation", top_k=2, community_id=12)
 
         assert len(frags) > 0
         for f in frags:

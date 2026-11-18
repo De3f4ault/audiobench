@@ -74,7 +74,7 @@ def handle_slash_command(cmd: str, session: ReplSession) -> bool:
             if available:
                 cmd_str = "  ".join(f"[{ACCENT}]{c}[/]" for c in available)
                 console.print(f"    [{BOLD}]{cat:<12}[/] {cmd_str}")
-        console.print(f"\n  [{DIM}]Type <command> --help for details[/]\n")
+        console.print(f"\n  [{DIM}]Type <command> --help for details, or \\help for REPL backslash commands[/]\n")
 
     elif command == "/context":
         if session.focus:

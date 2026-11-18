@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import datetime
-
 from rich.text import Text
-from textual.widgets import DataTable
 from textual.binding import Binding
-
+from textual.widgets import DataTable
 
 # ── State colour map (truecolor) ───────────────────────────────────────────────
 
@@ -25,8 +22,8 @@ _STATE_ICON = {
     "running":  "●",
     "stopped":  "○",
     "backoff":  "↺",
-    "fatal":    "✖",
-    "stale":    "⚠",
+    "fatal":    "X",
+    "stale":    "!",
     "starting": "◌",
     "unknown":  "?",
 }
@@ -47,7 +44,7 @@ def _relative_time(ts: str | None) -> str:
     try:
         import datetime
         then = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         secs = int((now - then).total_seconds())
         if secs < 60:
             return f"{secs}s"
@@ -63,7 +60,7 @@ class ProcessesPanel(DataTable):
     """Live supervisor process table with per-process state icons."""
 
     COLUMNS = ("●", "Process", "PID", "CPU%", "RAM", "Restarts", "Uptime")
-    
+
     BINDINGS = [
         Binding("r", "restart_process", "Restart"),
         Binding("s", "stop_process", "Stop"),
@@ -99,21 +96,20 @@ class ProcessesPanel(DataTable):
         name, pid = self._get_selected_process()
         if not name:
             return
-            
+
         from audiobench.cli.tui.widgets.confirm_modal import ConfirmModal
-        
+
         def _on_confirm(confirm: bool) -> None:
             if not confirm:
                 return
-            
+
             self.notify(f"Restarting {name}...")
-            from audiobench.supervisor.commands import stop
             import os
             import signal
-            import time
             import subprocess
             import sys
-            
+            import time
+
             def _do_restart():
                 # Direct signal to stop
                 if pid:
@@ -125,7 +121,7 @@ class ProcessesPanel(DataTable):
                 # Spawn a fresh daemon supervisor
                 subprocess.Popen([sys.executable, "-m", "audiobench", "daemon", "start"])
                 self.app.call_from_thread(self.notify, f"{name} restarted.")
-                
+
             self.app.run_worker(_do_restart, thread=True)
 
         self.app.push_screen(ConfirmModal(f"Restart process '{name}'?"), callback=_on_confirm)
@@ -135,19 +131,20 @@ class ProcessesPanel(DataTable):
         if not name or not pid:
             self.notify("Process not running or not selected.", severity="warning")
             return
-            
+
         from audiobench.cli.tui.widgets.confirm_modal import ConfirmModal
-        
+
         def _on_confirm(confirm: bool) -> None:
             if not confirm:
                 return
-                
+
             self.notify(f"Stopping {name}...")
             import os
             import signal
-            from audiobench.supervisor.registry import upsert_process
             import time
-            
+
+            from audiobench.supervisor.registry import upsert_process
+
             def _do_stop():
                 try:
                     os.kill(pid, signal.SIGTERM)
@@ -159,7 +156,7 @@ class ProcessesPanel(DataTable):
                     self.app.call_from_thread(self.notify, f"{name} already stopped.")
                 except Exception as e:
                     self.app.call_from_thread(self.notify, f"Error stopping {name}: {e}", severity="error")
-                    
+
             self.app.run_worker(_do_stop, thread=True)
 
         self.app.push_screen(ConfirmModal(f"Stop process '{name}'?"), callback=_on_confirm)
@@ -168,34 +165,35 @@ class ProcessesPanel(DataTable):
         name, _ = self._get_selected_process()
         if not name:
             return
-            
+
         def _do_clear():
             from audiobench.supervisor.commands import clear_fatal
             clear_fatal(name)
             self.app.call_from_thread(self.notify, f"Cleared fatal state for {name}.")
-            
+
         self.app.run_worker(_do_clear, thread=True)
 
     def _refresh(self) -> None:
         try:
-            from audiobench.supervisor.registry import get_all
             import psutil
+
+            from audiobench.supervisor.registry import get_all
             rows = get_all()
         except Exception:
             return
 
         self.clear()
-        
+
         # Cleanup stale processes from cache
         current_pids = {p.get("pid") for p in rows if p.get("pid")}
         self._ps_cache = {pid: proc for pid, proc in self._ps_cache.items() if pid in current_pids}
 
         for p in rows:
             raw_state = (p.get("state") or "unknown").lower()
-            
+
             cpu_val = 0.0
             ram_val = 0
-            
+
             # Validate PID is actually alive
             pid = p.get("pid")
             if raw_state == "running" and pid:
@@ -221,7 +219,7 @@ class ProcessesPanel(DataTable):
                 restart_text.stylize("#ef5350")  # red if many restarts
             elif restarts > 0:
                 restart_text.stylize("#ffb300")  # amber
-                
+
             cpu_text = Text(f"{cpu_val:.1f}%" if raw_state == "running" else "—")
             if cpu_val >= 70.0:
                 cpu_text.stylize("#ef5350")
@@ -229,7 +227,7 @@ class ProcessesPanel(DataTable):
                 cpu_text.stylize("#ffb300")
             elif raw_state == "running":
                 cpu_text.stylize("#00e676")
-                
+
             from audiobench.cli.tui.panels.health import _fmt
             ram_text = Text(_fmt(ram_val) if raw_state == "running" else "—", style="dim")
 

@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 import pytest
 
 
-def make_query_result(query="test", sources=1):
+def make_query_result(query="test", sources=1, source_file=""):
     from audiobench.memory.query_engine import ResearchResult
     from audiobench.memory.rrf_fusion import FusedResult
     result = ResearchResult(query=query)
@@ -13,6 +13,7 @@ def make_query_result(query="test", sources=1):
             start_time=10.0,
             end_time=20.0,
             text=f"fragment {i}",
+            source_file=source_file or f"file_{i}.mp3",
             rrf_score=0.1,
             stream_contributions=(("fts5", 1),)
         ) for i in range(sources)
@@ -85,9 +86,77 @@ def test_e_triggers_expanded_synthesis_not_new_search(mock_input_returns, mock_e
     assert mock_engine.search.call_count == 1
 
 def test_c_opens_chat_repl_with_preloaded_fragments(mock_input_returns, mock_engine, mock_repl):
-    mock_input_returns(["c"])
+    mock_input_returns(["c", "q"])
     mock_engine.search.return_value = make_query_result(query="bike incident", sources=3)
     from audiobench.cli.commands.memory_cmd import _run_search_loop
     _run_search_loop(mock_engine, "test", SearchSessionState())
     # mock_repl should be instantiated and run called
     assert mock_repl.return_value.run.call_count == 1
+
+
+def test_space_pauses_when_playing(mock_input_returns, mock_engine, monkeypatch, capsys):
+    mock_input_returns(["\x00SPACE", "q"])
+    mock_engine.search.return_value = make_query_result(query="philosophy", sources=3)
+    mock_client = MagicMock()
+    mock_client.playback_status.return_value = {
+        "playing": True,
+        "paused": False,
+        "state": "playing",
+        "position": 120.0,
+    }
+    monkeypatch.setattr("audiobench.daemon.factory.get_daemon_client", lambda: mock_client)
+
+    from audiobench.cli.commands.memory_cmd import _run_search_loop
+    _run_search_loop(mock_engine, "test", SearchSessionState())
+
+    mock_client.playback_pause.assert_called_once()
+    mock_client.playback_resume.assert_not_called()
+    mock_client.playback_play.assert_not_called()
+    out = capsys.readouterr().out
+    assert "Playback paused" in out
+
+
+def test_space_resumes_when_paused(mock_input_returns, mock_engine, monkeypatch, capsys):
+    mock_input_returns(["\x00SPACE", "q"])
+    mock_engine.search.return_value = make_query_result(query="philosophy", sources=3)
+    mock_client = MagicMock()
+    mock_client.playback_status.return_value = {
+        "playing": True,
+        "paused": True,
+        "state": "paused",
+        "position": 120.0,
+    }
+    monkeypatch.setattr("audiobench.daemon.factory.get_daemon_client", lambda: mock_client)
+
+    from audiobench.cli.commands.memory_cmd import _run_search_loop
+    _run_search_loop(mock_engine, "test", SearchSessionState())
+
+    mock_client.playback_resume.assert_called_once()
+    mock_client.playback_pause.assert_not_called()
+    mock_client.playback_play.assert_not_called()
+    out = capsys.readouterr().out
+    assert "Resumed playback at 00:02:00" in out
+
+
+def test_space_starts_citation_1_when_stopped(mock_input_returns, mock_engine, monkeypatch, capsys):
+    mock_input_returns(["\x00SPACE", "q"])
+    res = make_query_result(query="philosophy", sources=3, source_file="/fake/audio.mp3")
+    mock_engine.search.return_value = res
+    mock_client = MagicMock()
+    mock_client.playback_status.return_value = {
+        "playing": False,
+        "paused": False,
+        "state": "stopped",
+        "position": 0.0,
+    }
+    monkeypatch.setattr("audiobench.daemon.factory.get_daemon_client", lambda: mock_client)
+
+    from audiobench.cli.commands.memory_cmd import _run_search_loop
+    _run_search_loop(mock_engine, "test", SearchSessionState())
+
+    mock_client.playback_play.assert_called_once()
+    mock_client.playback_pause.assert_not_called()
+    mock_client.playback_resume.assert_not_called()
+    out = capsys.readouterr().out
+    assert "Playing citation [1]" in out
+

@@ -1,12 +1,18 @@
-import click
 from pathlib import Path
-from rich.table import Table
 
-from audiobench.cli.display.theme import ACCENT, SUCCESS, DIM, console, error_panel, make_table
+import click
+
+from audiobench.cli.display.theme import ACCENT, DIM, SUCCESS, console, error_panel, make_table
 from audiobench.core.db_session import get_session
-from audiobench.storage.models import WorkRecord, AudioFileRecord, ExpressionRecord, TranscriptionRecord
-from audiobench.memory.enums import SourceType
 from audiobench.events import get_bus
+from audiobench.memory.enums import SourceType
+from audiobench.storage.models import (
+    AudioFileRecord,
+    ExpressionRecord,
+    TranscriptionRecord,
+    WorkRecord,
+)
+
 
 @click.group(name="work", invoke_without_command=True)
 @click.pass_context
@@ -40,20 +46,20 @@ def work_list():
 
     with get_session() as session:
         works = session.query(WorkRecord).order_by(WorkRecord.id).all()
-        
+
     if not works:
         console.print(f"[{DIM}]No works found.[/]")
         return
-        
+
     table = make_table("Semantic Works", [
         ("ID", {"justify": "right", "style": DIM, "width": 4}),
         ("Title", {"style": ACCENT, "max_width": 50}),
         ("Author", {"style": "green", "max_width": 30}),
     ])
-    
+
     for work in works:
         table.add_row(str(work.id), work.title, work.author or "")
-        
+
     console.print(table)
 
 
@@ -75,7 +81,7 @@ def work_assign(args):
     if not work_id_str.isdigit():
         console.print(error_panel("Invalid work_id", f"'{work_id_str}' is not a valid integer Work ID."))
         return
-        
+
     work_id = int(work_id_str)
     targets = args[:-1]
 
@@ -87,7 +93,7 @@ def work_assign(args):
             return
 
         audio_ids = set()
-        
+
         for target in targets:
             if target.isdigit():
                 # Direct ID
@@ -110,7 +116,7 @@ def work_assign(args):
                             af_match = session.query(AudioFileRecord).filter(AudioFileRecord.file_path == resolved_p).first()
                             if af_match:
                                 audio_ids.add(af_match.id)
-        
+
         if not audio_ids:
             console.print(error_panel("Not found", "No matching audio files found."))
             return
@@ -121,7 +127,7 @@ def work_assign(args):
             af = session.query(AudioFileRecord).filter_by(id=aid).first()
             if af and af.work_id != work_id:
                 af.work_id = work_id
-                
+
                 # Also cascade directly to related expressions in SQLite
                 # (LanceDB will be reconciled later via events/queue)
                 session.query(ExpressionRecord).filter(
@@ -131,9 +137,9 @@ def work_assign(args):
                     ),
                     ExpressionRecord.source_type == SourceType.AUDIO_TRANSCRIPT.value
                 ).update({"work_id": work_id}, synchronize_session=False)
-                
+
                 updated_count += 1
-                
+
                 # Emit event for the reconciliation queue
                 get_bus().emit(
                     "work_assigned",
@@ -142,7 +148,7 @@ def work_assign(args):
                 )
 
         session.commit()
-        
+
         console.print(f"[{SUCCESS}]✓ Assigned {updated_count} audio file(s) to Work #{work_id}[/]")
 
 
@@ -154,17 +160,17 @@ def work_unassigned():
 
     with get_session() as session:
         files = session.query(AudioFileRecord).filter(AudioFileRecord.work_id == None).all()
-        
+
     if not files:
         console.print(f"[{SUCCESS}]All audio files are assigned to a work![/]")
         return
-        
+
     table = make_table("Unassigned Audio Files", [
         ("ID", {"justify": "right", "style": DIM, "width": 4}),
         ("File Name", {"style": ACCENT, "max_width": 60}),
     ])
-    
+
     for f in files:
         table.add_row(str(f.id), f.file_name)
-        
+
     console.print(table)

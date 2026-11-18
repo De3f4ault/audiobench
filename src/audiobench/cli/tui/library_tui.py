@@ -50,7 +50,7 @@ class LibraryTUI:
             stdscr.clear()
             height, width = stdscr.getmaxyx()
 
-            header = " 📚 AudioBench Library Command Center "
+            header = " AudioBench Library Command Center "
             stdscr.addstr(0, 0, header.ljust(width), curses.color_pair(1) | curses.A_BOLD)
 
             # Tabs
@@ -153,31 +153,31 @@ class LibraryTUI:
 
                     marker = "►" if idx == self.selected_index else " "
                     checkbox = "[x]" if item["id"] in self.selected_files else "[ ]"
-                    icon = "🎵" if self.current_tab == 0 else "📝"
+                    icon = "[AUD]" if self.current_tab == 0 else "[TXT]"
 
                     attr_normal = curses.color_pair(2)
                     attr_sel = curses.color_pair(3) | curses.A_BOLD
                     attr_meta = curses.color_pair(6)
-                    
+
                     row_attr = attr_sel if idx == self.selected_index else attr_normal
 
                     try:
                         stdscr.addstr(y, 0, f"{marker} ", row_attr)
                         cb_attr = curses.color_pair(3) if item["id"] in self.selected_files else curses.color_pair(6)
                         stdscr.addstr(y, 2, checkbox, cb_attr)
-                        stdscr.addstr(y, 5, f" {icon} ", row_attr)
-                        
-                        max_name_len = width - 10 - len(meta_str)
+                        stdscr.addstr(y, 6, icon, row_attr)
+
+                        max_name_len = width - 14 - len(meta_str)
                         if max_name_len < 5:
                             max_name_len = 5
-                            
+
                         display_name = name[:max_name_len - 2] + ".." if len(name) > max_name_len else name
-                        
-                        stdscr.addstr(y, 9, display_name, row_attr)
-                        
+
+                        stdscr.addstr(y, 12, display_name, row_attr)
+
                         if meta_str:
                             meta_x = width - len(meta_str) - 1
-                            if meta_x > 9 + len(display_name):
+                            if meta_x > 12 + len(display_name):
                                 stdscr.addstr(y, meta_x, meta_str, attr_meta)
                     except:
                         pass

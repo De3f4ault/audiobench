@@ -118,6 +118,12 @@ def collect_files(
             collected.extend(_walk_directory(p))
         elif p.is_file() and not _is_excluded(p):
             collected.append(p)
+        elif any(c in path_str for c in ("*", "?", "[")):
+            import glob
+            for m in glob.glob(path_str, recursive=recursive):
+                mp = Path(m)
+                if mp.is_file() and _is_supported(mp) and not _is_excluded(mp):
+                    collected.append(mp)
         # else: Click's exists=True already validated, but be safe
 
     # Deduplicate via resolved paths, preserving order
@@ -127,6 +133,6 @@ def collect_files(
         resolved = f.resolve()
         if resolved not in seen:
             seen.add(resolved)
-            deduped.append(f)
+            deduped.append(resolved)
 
     return deduped

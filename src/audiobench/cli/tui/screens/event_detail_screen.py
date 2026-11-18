@@ -2,18 +2,16 @@
 
 from __future__ import annotations
 
-import sqlite3
 import re
+import sqlite3
 import subprocess
-from pathlib import Path
 
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, Horizontal
+from textual.containers import Horizontal
 from textual.screen import Screen
 from textual.widgets import DataTable, Input, Label, Static
-from rich.text import Text
-
 
 _LEVEL_COLOR = {
     "INFO":     "#00e676",  # green
@@ -100,7 +98,7 @@ class EventDetailScreen(Screen):
     def _load_data(self) -> None:
         from audiobench.observatory.db import get_journal_db_path
         db_path = get_journal_db_path()
-        
+
         query = "SELECT timestamp, level, subsystem, event_type, message FROM system_events "
         params = []
         conditions = []
@@ -108,14 +106,14 @@ class EventDetailScreen(Screen):
         if self._subsystem:
             conditions.append("subsystem = ?")
             params.append(self._subsystem)
-            
+
         if self._level:
             conditions.append("level = ?")
             params.append(self._level)
 
         if conditions:
             query += "WHERE " + " AND ".join(conditions) + " "
-            
+
         # Oldest first so bottom is newest, cap at 5000
         query += "ORDER BY timestamp DESC LIMIT 5000"
 
@@ -143,7 +141,7 @@ class EventDetailScreen(Screen):
         for timestamp, level, subsystem, event_type, message in rows:
             if regex and not regex.search(message) and not regex.search(event_type):
                 continue
-                
+
             lvl_color = _LEVEL_COLOR.get(level, "white")
             table.add_row(
                 Text(timestamp[11:19], style="dim"),
@@ -152,7 +150,7 @@ class EventDetailScreen(Screen):
                 Text(event_type or "—", style="#1c6bb0"),
                 Text(message or "")
             )
-            
+
         table.scroll_end(animate=False)
 
     def action_focus_search(self) -> None:
@@ -184,12 +182,12 @@ class EventDetailScreen(Screen):
         table = self.query_one(DataTable)
         if table.cursor_row is None:
             return
-            
+
         try:
             row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
             row = table.get_row(row_key)
             msg = row[-1].plain
-            
+
             # Try Wayland
             try:
                 subprocess.run(["wl-copy"], input=msg.encode(), check=True)
@@ -197,7 +195,7 @@ class EventDetailScreen(Screen):
                 return
             except Exception:
                 pass
-                
+
             # Try X11
             try:
                 subprocess.run(["xclip", "-selection", "clipboard"], input=msg.encode(), check=True)
@@ -205,7 +203,7 @@ class EventDetailScreen(Screen):
                 return
             except Exception:
                 pass
-                
+
             # Try xsel
             try:
                 subprocess.run(["xsel", "--clipboard", "--input"], input=msg.encode(), check=True)
@@ -213,8 +211,8 @@ class EventDetailScreen(Screen):
                 return
             except Exception:
                 pass
-                
+
             self.notify("Clipboard tools not found (wl-copy/xclip/xsel)", severity="warning")
-            
+
         except Exception as e:
             self.notify(f"Copy failed: {e}", severity="error")

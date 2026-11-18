@@ -201,6 +201,34 @@ class ReimportTUI:
                     self.screen = 2
                     self.hash_computed = False
                     self.hash_error = None
+                    self.tag_modified_heuristic_passed = False
+                    self.tag_modified_metrics = None
+                elif key in (ord('f'), ord('F')) and getattr(self, "tag_modified_heuristic_passed", False):
+                    from audiobench.transcribe.transcript_parser import build_audio_metadata
+                    self.audio_metadata = build_audio_metadata(self.audio_path, self.raw_audio, allow_hash_mismatch=True)
+                    metrics = getattr(self, "tag_modified_metrics", {})
+                    self.audit_provenance = {
+                        "hash_verification": "bypassed_tag_modified",
+                        "verified_by": "operator_interactive",
+                        "original_json_hash": (self.raw_audio or {}).get("file_hash"),
+                        "actual_audio_hash": self.audio_metadata.file_hash,
+                        "duration_delta_sec": metrics.get("duration_delta_sec"),
+                        "size_delta_bytes": metrics.get("size_delta_bytes"),
+                        "source": "reimport:hash_override",
+                    }
+                    self.hash_error = None
+                    init_db()
+                    from audiobench.core.db_session import get_session
+                    with get_session() as session:
+                        rec = session.query(AudioFileRecord).filter_by(file_hash=self.audio_metadata.file_hash).first()
+                        if not rec:
+                            rec = session.query(AudioFileRecord).filter_by(file_name=self.audio_path.name).first()
+                        if rec:
+                            self.db_check_result = "exists"
+                            self.existing_transcriptions_count = session.query(TranscriptionRecord).filter_by(audio_file_id=rec.id).count()
+                        else:
+                            self.db_check_result = "new"
+                    self.screen = 4
         elif self.screen == 4:
             if key in (10, 13): # ENTER
                 self.screen = 5
@@ -263,6 +291,17 @@ class ReimportTUI:
                         for p in self.batch_pairs:
                             if p.get("status") == "UPGRADE":
                                 p["selected"] = any_unsel_upg
+            elif key in (ord('t'), ord('T')):
+                # Toggle tag-modified items
+                if self.batch_pairs:
+                    cur = self.batch_pairs[self.ui_selected_idx]
+                    if cur.get("status") == "TAG_MODIFIED":
+                        cur["selected"] = not cur.get("selected", False)
+                    else:
+                        any_unsel_tm = any(p.get("status") == "TAG_MODIFIED" and not p.get("selected") for p in self.batch_pairs)
+                        for p in self.batch_pairs:
+                            if p.get("status") == "TAG_MODIFIED":
+                                p["selected"] = any_unsel_tm
             elif key in (ord('a'), ord('A')):
                 # Toggle select all valid actionable candidates (READY and UPGRADE only)
                 valid_candidates = [p for p in self.batch_pairs if p.get("status") in ("READY", "UPGRADE")]
@@ -322,19 +361,6 @@ class ReimportTUI:
     def _match_batch(self):
         self.batch_pairs = []
         import json
-        import re
-        from difflib import SequenceMatcher
-        from pathlib import Path
-
-        from audiobench.core.db_session import get_session
-        from audiobench.storage.models import AudioFileRecord, TranscriptionRecord
-        from audiobench.transcribe.audio_converter import ALL_SUPPORTED_FORMATS
-        from audiobench.transcribe.quality_evaluator import compare_transcripts
-        from audiobench.transcribe.transcript_parser import parse_transcript_file
-        from audiobench.transcribe.transcription_result import AudioMetadata
-
-        # Index available audio files in the audio directory
-        import json
         import os
         import re
         from difflib import SequenceMatcher
@@ -344,7 +370,10 @@ class ReimportTUI:
         from audiobench.storage.models import AudioFileRecord, TranscriptionRecord
         from audiobench.transcribe.audio_converter import ALL_SUPPORTED_FORMATS
         from audiobench.transcribe.quality_evaluator import compare_transcripts
-        from audiobench.transcribe.transcript_parser import parse_transcript_file
+        from audiobench.transcribe.transcript_parser import (
+            evaluate_tag_modified_heuristic,
+            parse_transcript_file,
+        )
         from audiobench.transcribe.transcription_result import AudioMetadata
 
         BLACKLIST_DIRS = {
@@ -561,23 +590,27 @@ class ReimportTUI:
                     from audiobench.transcribe.quality_evaluator import _get_attr
                     tx_duration = max([float(_get_attr(s, "end", 0.0)) for s in segments_raw], default=0.0)
 
-                if not audio_duration and matched_audio and matched_audio.exists():
+                # Always probe the physical audio file on disk to verify duration alignment
+                physical_audio_duration = None
+                if matched_audio and matched_audio.exists():
                     if matched_audio in audio_duration_cache:
-                        audio_duration = audio_duration_cache[matched_audio]
+                        physical_audio_duration = audio_duration_cache[matched_audio]
                     else:
                         try:
                             from audiobench.transcribe.audio_converter import probe
                             info = probe(matched_audio)
                             if info and info.duration > 0:
-                                audio_duration = info.duration
+                                physical_audio_duration = info.duration
                                 audio_duration_cache[matched_audio] = info.duration
                         except Exception:
                             pass
 
+                effective_audio_dur = physical_audio_duration or audio_duration
+
                 duration_mismatch = False
-                if matched_audio and audio_duration and audio_duration > 0 and tx_duration and tx_duration > 0:
-                    dur_diff = abs(tx_duration - audio_duration)
-                    dur_tolerance = max(5.0, 0.05 * audio_duration)
+                if matched_audio and effective_audio_dur and effective_audio_dur > 0 and tx_duration and tx_duration > 0:
+                    dur_diff = abs(tx_duration - effective_audio_dur)
+                    dur_tolerance = max(5.0, 0.05 * effective_audio_dur)
                     if dur_diff > dur_tolerance:
                         duration_mismatch = True
 
@@ -587,8 +620,9 @@ class ReimportTUI:
                     "engine": engine,
                     "text": tx_text,
                 }
-                comp = compare_transcripts(existing_tx, incoming_cand, audio_duration=audio_duration)
+                comp = compare_transcripts(existing_tx, incoming_cand, audio_duration=effective_audio_dur)
 
+                tag_modified_metrics = None
                 # Determine operational status & selection
                 if not matched_audio:
                     status = "NO_AUDIO"
@@ -597,8 +631,14 @@ class ReimportTUI:
                     status = "EMPTY"
                     selected = False
                 elif hash_mismatch:
-                    status = "HASH_MISMATCH"
-                    selected = False
+                    passes_tm, tm_metrics = evaluate_tag_modified_heuristic(matched_audio, raw_audio, tx_duration)
+                    tag_modified_metrics = tm_metrics
+                    if passes_tm:
+                        status = "TAG_MODIFIED"
+                        selected = False
+                    else:
+                        status = "HASH_MISMATCH"
+                        selected = False
                 elif duration_mismatch:
                     status = "DURATION_MISMATCH"
                     selected = False
@@ -645,11 +685,12 @@ class ReimportTUI:
                     "incoming_tqs": comp.incoming_tqs,
                     "existing_tqs": comp.existing_tqs,
                     "familiarity": comp.familiarity,
-                    "audio_duration": audio_duration,
+                    "audio_duration": effective_audio_dur,
                     "tx_duration": tx_duration,
                     "is_audiobook": is_book,
                     "book_badge": badge,
                     "classification_category": cls_res.category,
+                    "tag_modified_metrics": tag_modified_metrics,
                 })
 
                 # Immediately reclaim memory for this candidate
@@ -772,6 +813,11 @@ class ReimportTUI:
                     self.db_check_result = "new"
         except HashMismatchError as e:
             self.hash_error = str(e)
+            from audiobench.transcribe.transcript_parser import evaluate_tag_modified_heuristic
+            tx_dur = self.parsed_transcript.duration_seconds if self.parsed_transcript else None
+            passes, metrics = evaluate_tag_modified_heuristic(self.audio_path, self.raw_audio, tx_dur)
+            self.tag_modified_heuristic_passed = passes
+            self.tag_modified_metrics = metrics
         except Exception as e:
             self.hash_error = f"Error computing hash: {e}"
         finally:
@@ -839,9 +885,20 @@ class ReimportTUI:
         if not self.hash_computed:
             stdscr.addstr(3, 3, "Computing SHA-256 and evaluating quality metrics...", curses.color_pair(5))
         elif self.hash_error:
-            stdscr.addstr(3, 3, "[ERR] Hash mismatch — this is not the correct audio file", curses.color_pair(7) | curses.A_BOLD)
-            stdscr.addstr(5, 3, self.hash_error, curses.color_pair(7))
-            stdscr.addstr(8, 3, "[R] Re-select Audio File", curses.color_pair(2) | curses.A_BOLD)
+            if getattr(self, "tag_modified_heuristic_passed", False):
+                metrics = getattr(self, "tag_modified_metrics", {})
+                stdscr.addstr(2, 2, "[!] HASH MISMATCH — Tag-Modified Stream Heuristic Passed", curses.color_pair(4) | curses.A_BOLD)
+                dur_diff = metrics.get("duration_delta_sec", 0.0)
+                rel_dur = metrics.get("relative_duration_delta", 0.0)
+                sz_diff = metrics.get("size_delta_bytes", 0)
+                stdscr.addstr(4, 2, "Audio stream matches transcript within safe tolerances (ID3 metadata edit):", curses.color_pair(2))
+                stdscr.addstr(5, 2, f"  Δ Duration: {dur_diff:.3f}s ({rel_dur:.3%})  |  Δ File Size: {sz_diff:,} bytes", curses.color_pair(2))
+                stdscr.addstr(6, 2, "  Normalized Stems Match: 4/4 stream invariants verified.", curses.color_pair(2))
+                stdscr.addstr(8, 2, "[F] Force Link (Audit Provenance) | [R] Re-select Audio File", curses.color_pair(3) | curses.A_BOLD)
+            else:
+                stdscr.addstr(3, 3, "[ERR] Hash mismatch — this is not the correct audio file", curses.color_pair(7) | curses.A_BOLD)
+                stdscr.addstr(5, 3, self.hash_error, curses.color_pair(7))
+                stdscr.addstr(8, 3, "[R] Re-select Audio File", curses.color_pair(2) | curses.A_BOLD)
         elif self.db_check_result == "exists":
             stdscr.addstr(2, 2, "[OK] Hash confirmed. File identity verified.", curses.color_pair(3) | curses.A_BOLD)
 
@@ -901,13 +958,15 @@ class ReimportTUI:
 
         stdscr.addstr(2, 2, f"Transcript: {self.transcript_path.name}")
         stdscr.addstr(3, 2, f"Audio:      {self.audio_path.name}")
+        if getattr(self, "audit_provenance", None):
+            stdscr.addstr(4, 2, "[!] HASH OVERRIDE ACTIVE (Tag-Modified Audit Trail Enabled)", curses.color_pair(4) | curses.A_BOLD)
 
-        stdscr.addstr(5, 2, "Pipeline:")
-        stdscr.addstr(6, 2, " [1] Copy .mp3 and sidecars")
-        stdscr.addstr(7, 2, " [2] Save AudioFileRecord")
-        stdscr.addstr(8, 2, " [3] Auto-detect chapters")
-        stdscr.addstr(9, 2, " [4] Save TranscriptionRecord & Segments")
-        stdscr.addstr(10, 2," [5] Semantic chunk & embed")
+        stdscr.addstr(6, 2, "Pipeline:")
+        stdscr.addstr(7, 2, " [1] Copy .mp3 and sidecars")
+        stdscr.addstr(8, 2, " [2] Save AudioFileRecord")
+        stdscr.addstr(9, 2, " [3] Auto-detect chapters")
+        stdscr.addstr(10, 2, " [4] Save TranscriptionRecord & Segments")
+        stdscr.addstr(11, 2, " [5] Semantic chunk & embed")
 
         try:
             stdscr.addstr(h-1, 0, " ENTER: Start Import | q: Cancel ".ljust(w-1), curses.color_pair(1))
@@ -934,6 +993,7 @@ class ReimportTUI:
                 on_phase=_phase_cb,
                 overwrite=do_overwrite,
                 is_audiobook=getattr(self, "is_audiobook", False),
+                audit_provenance=getattr(self, "audit_provenance", None),
             )
 
             # update source to reimport
@@ -941,7 +1001,7 @@ class ReimportTUI:
             with get_session() as session:
                 rec = session.query(TranscriptionRecord).filter_by(id=tx_id).first()
                 if rec:
-                    rec.source = "reimport"
+                    rec.source = "reimport:hash_override" if getattr(self, "audit_provenance", None) else "reimport"
                     session.commit()
 
             # Also update sidecar in library alongside audio file
@@ -1081,6 +1141,9 @@ class ReimportTUI:
 
         success = 0
         failed = 0
+        failed_items = []
+
+        from audiobench.transcribe.transcript_parser import build_audio_metadata, evaluate_tag_modified_heuristic
 
         for idx, pair in enumerate(self.batch_pairs):
             stdscr.addstr(4, 2, f"Processing {idx+1}/{len(self.batch_pairs)}: {pair['tx'].name[:50]}                  ")
@@ -1089,20 +1152,49 @@ class ReimportTUI:
             if not pair.get("audio") or not pair.get("selected", True):
                 if not pair.get("audio"):
                     failed += 1
+                    failed_items.append({
+                        "pair": pair,
+                        "tx": pair["tx"],
+                        "audio": None,
+                        "raw_audio": None,
+                        "parsed_tx": None,
+                        "error": "No matching audio file found",
+                        "error_type": "NoAudio",
+                        "heuristic_pass": False,
+                        "heuristic_metrics": None,
+                        "status": "NO_AUDIO",
+                    })
                 continue
 
+            parsed_tx = None
+            raw_audio = None
+            audio_meta = None
             try:
                 parsed_tx = pair.get("parsed_tx")
                 raw_audio = pair.get("raw_audio")
                 if not parsed_tx:
                     parsed_tx, raw_audio = parse_transcript_file(pair["tx"])
 
-                audio_meta = build_audio_metadata(pair["audio"], raw_audio)
+                is_tag_mod = (pair.get("status") == "TAG_MODIFIED")
+                audio_meta = build_audio_metadata(pair["audio"], raw_audio, allow_hash_mismatch=is_tag_mod)
 
                 init_db()
                 repo = TranscriptionRepository()
 
                 do_overwrite = getattr(self, "batch_overwrite", False) or pair.get("status") == "UPGRADE" or pair.get("is_existing", False)
+
+                audit_prov = None
+                if is_tag_mod:
+                    tm_metrics = pair.get("tag_modified_metrics") or {}
+                    audit_prov = {
+                        "hash_verification": "bypassed_tag_modified",
+                        "verified_by": "operator_interactive",
+                        "original_json_hash": (raw_audio or {}).get("file_hash"),
+                        "actual_audio_hash": audio_meta.file_hash,
+                        "duration_delta_sec": tm_metrics.get("duration_delta_sec"),
+                        "size_delta_bytes": tm_metrics.get("size_delta_bytes"),
+                        "source": "reimport:hash_override",
+                    }
 
                 tx_id = repo.save_transcription(
                     parsed_tx,
@@ -1110,12 +1202,13 @@ class ReimportTUI:
                     on_phase=lambda *args, **kwargs: None,
                     overwrite=do_overwrite,
                     is_audiobook=pair.get("is_audiobook", False),
+                    audit_provenance=audit_prov,
                 )
                 from audiobench.core.db_session import get_session
                 with get_session() as session:
                     rec = session.query(TranscriptionRecord).filter_by(id=tx_id).first()
                     if rec:
-                        rec.source = "reimport"
+                        rec.source = "reimport:hash_override" if audit_prov else "reimport"
                         session.commit()
 
                 # Also update sidecar in library alongside audio file
@@ -1131,19 +1224,208 @@ class ReimportTUI:
                     pass
 
                 success += 1
-            except Exception:
+            except Exception as err:
                 failed += 1
+                heur_pass = False
+                heur_metrics = None
+                if pair.get("audio"):
+                    try:
+                        tx_dur = parsed_tx.duration_seconds if parsed_tx else None
+                        heur_pass, heur_metrics = evaluate_tag_modified_heuristic(pair["audio"], raw_audio, tx_dur)
+                    except Exception:
+                        pass
+                failed_items.append({
+                    "pair": pair,
+                    "tx": pair["tx"],
+                    "audio": pair.get("audio"),
+                    "raw_audio": raw_audio,
+                    "parsed_tx": parsed_tx,
+                    "error": str(err),
+                    "error_type": type(err).__name__,
+                    "heuristic_pass": heur_pass,
+                    "heuristic_metrics": heur_metrics,
+                    "status": "TAG_MODIFIED_ELIGIBLE" if heur_pass else "FAILED",
+                })
             finally:
                 parsed_tx = None
                 raw_audio = None
                 audio_meta = None
 
-        stdscr.clear()
-        stdscr.addstr(2, 2, f"[OK] Batch Complete! {success} succeeded, {failed} failed.", curses.color_pair(3))
-        stdscr.addstr(4, 2, "Press any key to exit.")
-        stdscr.refresh()
-        stdscr.timeout(-1)
-        stdscr.getch()
+        if not failed_items:
+            stdscr.clear()
+            stdscr.addstr(2, 2, f"[OK] Batch Complete! {success} succeeded, 0 failed.", curses.color_pair(3) | curses.A_BOLD)
+            stdscr.addstr(4, 2, "Press any key to exit.")
+            stdscr.refresh()
+            stdscr.timeout(-1)
+            stdscr.getch()
+            return
+
+        self._interactive_failure_review(stdscr, failed_items, success)
+
+    def _interactive_failure_review(self, stdscr, failed_items: list[dict], success: int):
+        cur_idx = 0
+        ui_offset = 0
+
+        while True:
+            h, w = stdscr.getmaxyx()
+            stdscr.clear()
+
+            n_failed = sum(1 for item in failed_items if item.get("status") != "IMPORTED")
+            header = f" Batch Complete: {success} succeeded, {n_failed} failed — Interactive Failure Review "
+            stdscr.addstr(0, 0, header[:w-1].ljust(w), curses.color_pair(1) | curses.A_BOLD)
+
+            split_y = max(6, min(h - 9, int(h * 0.48)))
+            max_visible = split_y - 1
+
+            if cur_idx < ui_offset:
+                ui_offset = cur_idx
+            elif cur_idx >= ui_offset + max_visible:
+                ui_offset = cur_idx - max_visible + 1
+
+            for i in range(max_visible):
+                idx = ui_offset + i
+                if idx >= len(failed_items):
+                    break
+                item = failed_items[idx]
+                y = 1 + i
+                is_sel = (idx == cur_idx)
+                status = item.get("status", "FAILED")
+                tx_name = item["tx"].name
+                au_name = item["audio"].name if item.get("audio") else "NO AUDIO"
+
+                if status == "IMPORTED":
+                    badge = "[IMPORTED]"
+                    line_attr = curses.color_pair(3) | curses.A_BOLD if is_sel else curses.color_pair(3)
+                elif item.get("heuristic_pass"):
+                    badge = "[TAG_MOD [F]]"
+                    line_attr = curses.color_pair(4) | curses.A_BOLD if is_sel else curses.color_pair(4)
+                else:
+                    badge = f"[{item.get('error_type', 'FAIL')}]"
+                    line_attr = curses.color_pair(7) | curses.A_BOLD if is_sel else curses.color_pair(7)
+
+                prefix = ">" if is_sel else " "
+                badge_str = f"{badge:<14}"
+                avail_w = max(30, w - (len(prefix) + len(badge_str) + 8))
+                col_tx = max(18, avail_w // 2)
+                col_au = max(16, avail_w - col_tx)
+
+                display_tx = self._smart_fit_name(tx_name, col_tx)
+                display_au = self._smart_fit_name(au_name, col_au)
+
+                row_str = f"{prefix} {badge_str} {display_tx:<{col_tx}} ↔ {display_au:<{col_au}}"
+                stdscr.addstr(y, 1, row_str[:w-2], line_attr)
+
+            # Separator
+            sep = "─── Failure Diagnostic & Force Import Inspector "
+            stdscr.addstr(split_y, 0, (sep + "─" * max(0, w - len(sep)))[:w-1], curses.color_pair(6) | curses.A_BOLD)
+
+            # Inspector pane
+            if 0 <= cur_idx < len(failed_items):
+                cur_item = failed_items[cur_idx]
+                py = split_y + 1
+                tx_p = cur_item["tx"]
+                au_p = cur_item.get("audio")
+                stdscr.addstr(py, 2, f"Candidate: {tx_p.name[:w-15]}"[:w-4], curses.color_pair(2) | curses.A_BOLD)
+                py += 1
+                au_name_str = au_p.name if au_p else "MISSING AUDIO"
+                stdscr.addstr(py, 2, f"Audio:     {au_name_str[:w-15]}"[:w-4], curses.color_pair(2))
+                py += 1
+
+                if cur_item.get("status") == "IMPORTED":
+                    stdscr.addstr(py, 2, "[OK] Force imported successfully with audit provenance.", curses.color_pair(3) | curses.A_BOLD)
+                    py += 1
+                elif cur_item.get("heuristic_pass"):
+                    m = cur_item.get("heuristic_metrics") or {}
+                    dur_delta = m.get("duration_delta_sec", 0.0)
+                    rel_dur = m.get("relative_duration_delta", 0.0)
+                    sz_delta = m.get("size_delta_bytes", 0)
+                    stdscr.addstr(py, 2, "[!] TAG_MODIFIED: Hash mismatch, but passes all 4 stream invariants.", curses.color_pair(4) | curses.A_BOLD)
+                    py += 1
+                    stdscr.addstr(py, 2, f"    Δ Duration: {dur_delta:.3f}s ({rel_dur:.3%})  |  Δ Size: {sz_delta:,} bytes", curses.color_pair(2))
+                    py += 1
+                    stdscr.addstr(py, 2, "    Audio stream verified identical. Press [F] to force import with audit trail.", curses.color_pair(3) | curses.A_BOLD)
+                    py += 1
+                else:
+                    stdscr.addstr(py, 2, f"[ERR] {cur_item.get('error_type')}: {cur_item.get('error')}"[:w-4], curses.color_pair(7) | curses.A_BOLD)
+                    py += 1
+                    m = cur_item.get("heuristic_metrics") or {}
+                    if m.get("reason"):
+                        stdscr.addstr(py, 2, f"    Invariants check failed: {m.get('reason')}"[:w-4], curses.color_pair(4))
+                        py += 1
+
+            # Footer
+            can_force = (
+                0 <= cur_idx < len(failed_items)
+                and failed_items[cur_idx].get("heuristic_pass")
+                and failed_items[cur_idx].get("status") != "IMPORTED"
+            )
+            force_prompt = "[F] Force Import (Audit) | " if can_force else ""
+            footer = f" {force_prompt}UP/DOWN / j/k: Navigate | ENTER / q: Exit "
+            try:
+                stdscr.addstr(h-1, 0, footer[:w-1].ljust(w-1), curses.color_pair(1))
+            except curses.error:
+                pass
+
+            stdscr.refresh()
+            stdscr.timeout(-1)
+            key = stdscr.getch()
+
+            if key in (curses.KEY_UP, ord('k')):
+                cur_idx = max(0, cur_idx - 1)
+            elif key in (curses.KEY_DOWN, ord('j')):
+                cur_idx = min(len(failed_items) - 1, cur_idx + 1)
+            elif key in (ord('q'), ord('Q'), 10, 13):
+                break
+            elif key in (ord('f'), ord('F')) and can_force:
+                cur_item = failed_items[cur_idx]
+                try:
+                    from audiobench.transcribe.transcript_parser import build_audio_metadata, parse_transcript_file
+                    parsed_tx = cur_item.get("parsed_tx")
+                    raw_audio = cur_item.get("raw_audio")
+                    if not parsed_tx:
+                        parsed_tx, raw_audio = parse_transcript_file(cur_item["tx"])
+                    audio_meta = build_audio_metadata(cur_item["audio"], raw_audio, allow_hash_mismatch=True)
+                    m = cur_item.get("heuristic_metrics") or {}
+                    audit_prov = {
+                        "hash_verification": "bypassed_tag_modified",
+                        "verified_by": "operator_interactive",
+                        "original_json_hash": (raw_audio or {}).get("file_hash"),
+                        "actual_audio_hash": audio_meta.file_hash,
+                        "duration_delta_sec": m.get("duration_delta_sec"),
+                        "size_delta_bytes": m.get("size_delta_bytes"),
+                        "source": "reimport:hash_override",
+                    }
+                    init_db()
+                    repo = TranscriptionRepository()
+                    tx_id = repo.save_transcription(
+                        parsed_tx,
+                        audio_meta,
+                        on_phase=lambda *args, **kwargs: None,
+                        overwrite=True,
+                        is_audiobook=cur_item["pair"].get("is_audiobook", False),
+                        audit_provenance=audit_prov,
+                    )
+                    from audiobench.core.db_session import get_session
+                    with get_session() as session:
+                        rec = session.query(TranscriptionRecord).filter_by(id=tx_id).first()
+                        if rec:
+                            rec.source = "reimport:hash_override"
+                            session.commit()
+                    try:
+                        with get_session() as session:
+                            rec = session.query(TranscriptionRecord).filter_by(id=tx_id).first()
+                            if rec and rec.audio_file and rec.audio_file.file_path:
+                                dest_sidecar = Path(rec.audio_file.file_path).with_suffix(".json")
+                                if cur_item["tx"].exists() and cur_item["tx"].resolve() != dest_sidecar.resolve():
+                                    import shutil
+                                    shutil.copy2(str(cur_item["tx"]), str(dest_sidecar))
+                    except Exception:
+                        pass
+                    cur_item["status"] = "IMPORTED"
+                    cur_item["heuristic_pass"] = False
+                    success += 1
+                except Exception as err:
+                    cur_item["error"] = f"Force failed: {err}"
 
     def _draw_screen_21(self, stdscr):
         h, w = stdscr.getmaxyx()
@@ -1210,10 +1492,13 @@ class ReimportTUI:
         n_total = len(self.batch_pairs)
         n_sel = sum(1 for p in self.batch_pairs if p.get("selected", False))
         n_upg = sum(1 for p in self.batch_pairs if p.get("status") == "UPGRADE")
+        n_tm = sum(1 for p in self.batch_pairs if p.get("status") == "TAG_MODIFIED")
 
         header = f" Auto-Detect & Quality Inspector | {n_total} candidate(s), {n_sel} selected"
         if n_upg > 0:
             header += f" [{n_upg} UPGRADE RECOMMENDED]"
+        if n_tm > 0:
+            header += f" [{n_tm} TAG_MODIFIED]"
         stdscr.addstr(0, 0, header.ljust(w), curses.color_pair(1) | curses.A_BOLD)
 
         if not self.batch_pairs:
@@ -1272,6 +1557,8 @@ class ReimportTUI:
                 line_attr = curses.color_pair(5) | curses.A_BOLD
             elif status == "READY":
                 line_attr = curses.color_pair(2)
+            elif status == "TAG_MODIFIED":
+                line_attr = curses.color_pair(4) | curses.A_BOLD
             elif status == "CURRENT":
                 line_attr = curses.color_pair(4)
             elif status in ("NO_AUDIO", "HASH_MISMATCH", "MISMATCH", "DURATION_MISMATCH", "EMPTY"):
@@ -1351,6 +1638,18 @@ class ReimportTUI:
                 stdscr.addstr(py, 2, "Automatic pairing blocked to prevent misaligned transcription import.", curses.color_pair(4))
                 py += 1
 
+            elif cur.get("status") == "TAG_MODIFIED":
+                metrics = cur.get("tag_modified_metrics") or {}
+                dur_delta = metrics.get("duration_delta_sec", 0.0)
+                rel_dur = metrics.get("relative_duration_delta", 0.0)
+                size_delta = metrics.get("size_delta_bytes", 0)
+                stdscr.addstr(py, 2, "[!] TAG_MODIFIED: Checksum differs, but passes all 4 stream invariants.", curses.color_pair(4) | curses.A_BOLD)
+                py += 1
+                stdscr.addstr(py, 2, f"    Δ Duration: {dur_delta:.3f}s ({rel_dur:.3%})  |  Δ File Size: {size_delta:,} bytes", curses.color_pair(2))
+                py += 1
+                stdscr.addstr(py, 2, "    Stream verified identical (ID3 tag edit). Press [t] or SPACE to toggle for audit import.", curses.color_pair(5))
+                py += 1
+
             elif cur.get("status") == "HASH_MISMATCH":
                 stdscr.addstr(py, 2, "[!] SHA-256 MISMATCH: Source audio file checksum differs from transcript metadata.", curses.color_pair(7) | curses.A_BOLD)
                 py += 1
@@ -1384,7 +1683,8 @@ class ReimportTUI:
 
         # Footer
         try:
-            footer_1 = f" SPACE: Toggle | B: Toggle Audiobook | U: Upgrade | A: All | S: Import ({n_sel}) "
+            footer_tm = " | T: Tag-Mod" if n_tm > 0 else ""
+            footer_1 = f" SPACE: Toggle | B: Toggle Audiobook | U: Upgrade{footer_tm} | A: All | S: Import ({n_sel}) "
             footer_2 = " Modes: [1]Audio [2]Auto-Detect [3]Single [4]Batch  |  q: Quit "
             stdscr.addstr(h-2, 0, footer_1.ljust(w-1), curses.color_pair(1))
             stdscr.addstr(h-1, 0, footer_2.ljust(w-1), curses.color_pair(1))

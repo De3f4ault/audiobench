@@ -13,6 +13,7 @@ from audiobench.cli.display.theme import (
     BOLD,
     DIM,
     SUCCESS,
+    WARNING,
     console,
     error_panel,
     format_duration,
@@ -161,7 +162,20 @@ def history(
                 rec["file_name"] += f" [{DIM}]({file_chapter_counts[aid]} chs)[/]"
 
     for rec in records:
-        dur = format_duration(rec["duration"]) if rec["duration"] else "–"
+        status = rec.get("status")
+        if status == "transcribing":
+            dur = f"[{ACCENT}]in-flight[/]"
+            words = f"[{ACCENT}][...] active[/]"
+            preview = f"[{ACCENT}]Transcription in progress...[/]"
+        elif status == "failed":
+            dur = f"[{WARNING}]failed[/]"
+            words = f"[{WARNING}]✗ 0[/]"
+            preview = f"[{WARNING}]Transcription failed[/]"
+        else:
+            dur = format_duration(rec["duration"]) if rec["duration"] else "–"
+            words = f"{rec['word_count']:,}"
+            preview = (rec["text_preview"] or "")[:35]
+
         date = rec["created_at"][:10] if rec["created_at"] else "–"
         refined_badge = f"[{SUCCESS}]✓[/]" if rec.get("refined_at") else f"[{DIM}]·[/]"
         table.add_row(
@@ -169,11 +183,11 @@ def history(
             rec["file_name"],
             rec["language"],
             rec["model"],
-            str(rec["word_count"]),
+            words,
             dur,
             date,
             refined_badge,
-            (rec["text_preview"] or "")[:35],
+            preview,
         )
 
     console.print(table)
@@ -253,7 +267,7 @@ def search(
 
     init_db()
     repo = TranscriptionRepository()
-    results = repo.search(query, limit=limit)
+    results = repo.search(query, limit=limit, session=None)
 
     if not results:
         if output_format == "json":
@@ -304,7 +318,13 @@ def search(
 
 
 @click.command()
-@click.argument("transcription_id", type=int)
+@click.argument("target", required=False, default=None)
+@click.option(
+    "-i",
+    "--interactive",
+    is_flag=True,
+    help="Launch interactive reader REPL with autocomplete",
+)
 @click.option(
     "--timestamps/--no-timestamps",
     default=True,
@@ -316,9 +336,10 @@ def search(
     help="Show/hide speaker labels",
 )
 @click.option(
+    "-f",
     "--format",
     "output_format",
-    type=click.Choice(["text", "srt", "json"]),
+    type=click.Choice(["text", "txt", "srt", "vtt", "json", "tsv", "csv", "raw"]),
     default="text",
     show_default=True,
     help="Display format",
@@ -335,67 +356,70 @@ def search(
     help="Display original Whisper output instead of refined text",
 )
 def show(
-    transcription_id: int,
+    target: str | None,
+    interactive: bool,
     timestamps: bool,
     speakers: bool,
     output_format: str,
     raw: bool,
     show_raw_whisper: bool,
 ) -> None:
-    """View a past transcription with timestamps.
+    """View a past transcription with timestamps or enter the interactive viewer.
 
     \b
     Examples:
-      audiobench show 3                         View in pager with timestamps
-      audiobench show 3 --no-timestamps         Plain text only
-      audiobench show 3 --format srt            View as SRT subtitles
-      audiobench show 3 --format json           View as JSON
-      audiobench show 3 --raw | grep "budget"   Pipe-friendly output
+      audiobench show                           Interactive reader (latest transcript)
+      audiobench show latest                    View latest transcript in pager
+      audiobench show 84                        View by ID
+      audiobench show #84                       View by #ID
+      audiobench show "Taoism"                  View by title / keyword
+      audiobench show 84 --format srt           View as SRT subtitles
+      audiobench show 84 --format vtt           View as WebVTT subtitles
+      audiobench show 84 --format json          View as JSON
+      audiobench show 84 --format tsv           View as TSV table
+      audiobench show 84 --raw | grep "zen"     Pipe-friendly raw text
+      audiobench show -i 84                     Launch interactive reader REPL
     """
+    from audiobench.cli.shared.transcript_resolver import resolve_transcript_target
+    from audiobench.cli.shared.transcript_views import (
+        format_transcript,
+        render_transcript_header,
+    )
     from audiobench.core.db_engine import init_db
-    from audiobench.storage.repository import TranscriptionRepository
 
     init_db()
-    repo = TranscriptionRepository()
-    data = repo.get_by_id(transcription_id)
 
+    # Launch interactive REPL if requested or when zero-arg run in a TTY without --raw
+    if interactive or (target is None and sys.stdout.isatty() and not raw):
+        from audiobench.cli.show_repl import start_show_repl
+
+        start_show_repl(
+            initial_target=target,
+            initial_format="txt" if output_format == "text" else output_format,
+            timestamps=timestamps,
+            speakers=speakers,
+            console=console,
+        )
+        return
+
+    data = resolve_transcript_target(target, interactive=False, console=console, session=None)
     if not data:
-        console.print(error_panel(f"Transcription #{transcription_id} not found"))
         sys.exit(1)
 
-    # Build output content
-    if output_format == "json":
-        content = json_lib.dumps(data, indent=2, default=str)
-    elif output_format == "srt":
-        content = _format_as_srt(data.get("segments", []))
-    else:
-        # --show-raw-whisper: display the original pre-refinement Whisper text
-        if show_raw_whisper:
-            raw_whisper = data.get("raw_text") or data.get("full_text", "")
-            content = raw_whisper if raw_whisper else "(no raw Whisper text stored)"
-        else:
-            content = _format_as_text(data, timestamps=timestamps, speakers=speakers)
-
-    # Refined status badge
-    refined_at = data.get("refined_at")
-    if refined_at:
-        badge = f"[{SUCCESS}]✓ refined {refined_at[:10]}[/]"
-    else:
-        badge = f"[{DIM}]raw[/]"
+    content = format_transcript(
+        data,
+        format_type=output_format,
+        timestamps=timestamps,
+        speakers=speakers,
+        show_raw_whisper=show_raw_whisper,
+    )
 
     if raw:
         print(content)
         return
 
     # Display with pager via Rich
-    header = (
-        f"[{BOLD} {ACCENT}]#{data['id']}[/]  "
-        f"[{ACCENT}]{data['file_name']}[/]  "
-        f"[{DIM}]{data.get('language', '?')} • "
-        f"{data.get('model', '?')} • "
-        f"{format_duration(data.get('duration', 0))}[/]  "
-        f"{badge}"
-    )
+    header = render_transcript_header(data)
     console.print(header)
     console.print(f"[{DIM}]{'─' * 50}[/]")
 
@@ -403,50 +427,11 @@ def show(
         console.print(content, highlight=False)
 
 
-def _format_as_text(data: dict, *, timestamps: bool = True, speakers: bool = True) -> str:
-    """Format transcript data as readable text with optional timestamps."""
-    lines = []
-    segments = data.get("segments", [])
-
-    for seg in segments:
-        parts = []
-
-        if timestamps:
-            start = seg.get("start", 0)
-            minutes = int(start // 60)
-            seconds = int(start % 60)
-            parts.append(f"[{minutes}:{seconds:02d}]")
-
-        if speakers and seg.get("speaker"):
-            parts.append(f"<{seg['speaker']}>")
-
-        text = seg.get("text", "").strip()
-        parts.append(text)
-        lines.append(" ".join(parts))
-
-    return "\n".join(lines)
-
-
-def _format_as_srt(segments: list[dict]) -> str:
-    """Format segments as SRT subtitle format."""
-    lines = []
-    for i, seg in enumerate(segments, 1):
-        start = seg.get("start", 0)
-        end = seg.get("end", start + 1)
-        lines.append(str(i))
-        lines.append(f"{_srt_time(start)} --> {_srt_time(end)}")
-        lines.append(seg.get("text", "").strip())
-        lines.append("")
-    return "\n".join(lines)
-
-
-def _srt_time(seconds: float) -> str:
-    """Convert seconds to SRT time format: HH:MM:SS,mmm."""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int((seconds % 1) * 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+from audiobench.cli.shared.transcript_views import (
+    _format_as_srt,
+    _format_as_text,
+    _srt_time,
+)
 
 
 # ── Export Command ──────────────────────────────────────────
@@ -531,7 +516,7 @@ def export(
 
     init_db()
     repo = TranscriptionRepository()
-    data = repo.get_by_id(transcription_id)
+    data = repo.get_by_id(transcription_id, session=None)
 
     if not data:
         console.print(error_panel(f"Transcription #{transcription_id} not found"))
@@ -564,7 +549,7 @@ def export(
             from audiobench.core.settings import get_settings
 
             settings = get_settings()
-            exports_dir = settings.data_dir / "exports"
+            exports_dir = settings.data_dir / "exports" / "transcripts"
             exports_dir.mkdir(parents=True, exist_ok=True)
             # Generate a sensible default filename for PDF
             base_name = Path(data.get("file_name", f"transcript_{transcription_id}")).stem
@@ -597,7 +582,7 @@ def export(
         from audiobench.core.settings import get_settings
 
         settings = get_settings()
-        exports_dir = settings.data_dir / "exports"
+        exports_dir = settings.data_dir / "exports" / "transcripts"
         exports_dir.mkdir(parents=True, exist_ok=True)
         base_name = Path(data.get("file_name", f"transcript_{transcription_id}")).stem
         output_path = str(exports_dir / f"{base_name}.{output_format}")

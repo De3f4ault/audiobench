@@ -20,10 +20,10 @@ _STATUS_COLOR = {
 
 _STATUS_ICON = {
     "running":    "⟳",
-    "pending":    "⏳",
-    "failed":     "✖",
-    "done":       "✔",
-    "cancelled":  "⊘",
+    "pending":    "...",
+    "failed":     "X",
+    "done":       "OK",
+    "cancelled":  "-",
 }
 
 

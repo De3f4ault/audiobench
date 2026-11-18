@@ -185,7 +185,7 @@ def clean(
     skipped_count = 0
 
     for tid in target_ids:
-        data = repo.get_by_id(tid)
+        data = repo.get_by_id(tid, session=None)
         if not data:
             if not quiet:
                 console.print(f"  [{DIM}]#{tid} not found — skipping[/]")

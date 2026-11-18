@@ -9,12 +9,12 @@ from audiobench.core.db_session import get_session
 from audiobench.storage.models import StagingCartItem
 
 
-@patch("audiobench.jobs.queue_worker.process_queue")
+@patch("audiobench.jobs.scheduler.drain_slot")
 @patch("audiobench.cli.wizard_checkout.prompt_checkout_cart")
 @patch("audiobench.cli.tui.library_tui.launch_library_tui")
 @patch("audiobench.cli.wizard.prompt_menu")
 def test_transcribe_router_foreground(
-    mock_prompt_menu, mock_tui, mock_checkout, mock_process_queue, runner, test_db
+    mock_prompt_menu, mock_tui, mock_checkout, mock_drain_slot, runner, test_db
 ):
     """Test staging a file and processing immediately in foreground."""
     # 1. User selects Library from main menu
@@ -40,19 +40,19 @@ def test_transcribe_router_foreground(
 
     assert result.exit_code == 0
     assert "Processing 1 files sequentially in foreground" in result.output
-    mock_process_queue.assert_called_once()
+    mock_drain_slot.assert_called_once()
 
     # Cart should be empty
     with get_session() as session:
         assert session.query(StagingCartItem).count() == 0
 
 
-@patch("audiobench.jobs.queue_worker._spawn_daemon")
+@patch("audiobench.jobs.scheduler.ensure_worker")
 @patch("audiobench.cli.wizard_checkout.prompt_checkout_cart")
 @patch("audiobench.cli.commands.import_cmd.run_import_flow")
 @patch("audiobench.cli.wizard.prompt_menu")
 def test_transcribe_router_background(
-    mock_prompt_menu, mock_import, mock_checkout, mock_spawn, runner, test_db
+    mock_prompt_menu, mock_import, mock_checkout, mock_ensure_worker, runner, test_db
 ):
     """Test staging a file via import and processing later in background."""
     mock_prompt_menu.side_effect = ["import", "checkout"]
@@ -75,7 +75,7 @@ def test_transcribe_router_background(
 
     assert result.exit_code == 0
     assert "Added 1 files to background queue" in result.output
-    mock_spawn.assert_called_once()
+    mock_ensure_worker.assert_called_once()
 
     # Cart should be empty
     with get_session() as session:

@@ -99,7 +99,8 @@ def ask(
     # Fetch transcript
     init_db()
     repo = TranscriptionRepository()
-    record = repo.get_by_id(transcript_id)
+    record = repo.get_by_id(transcript_id, session=None)
+
     if not record:
         console.print(error_panel("Not found", f"Transcript #{transcript_id} not found"))
         return
@@ -148,7 +149,7 @@ def ask(
                     db_chap = db.query(ChapterRecord).filter_by(id=chap.id).first()
                     tx_id = db_chap.transcription_id if db_chap else None
                 if tx_id:
-                    chap_record = repo.get_by_id(tx_id)
+                    chap_record = repo.get_by_id(tx_id, session=None)
                     if chap_record:
                         record = chap_record
                     else:
@@ -367,6 +368,12 @@ def ask(
     default=None,
     help="Start/resume a study project by project ID",
 )
+@click.option(
+    "--voice",
+    "voice_mode",
+    is_flag=True,
+    help="Start directly in voice mode (live Gemini Live / microphone)",
+)
 def chat(
     transcript_ids: tuple[int, ...],
     model: str | None,
@@ -380,6 +387,7 @@ def chat(
     chapter: int | None,
     chat_summary: int | None,
     project_id: int | None,
+    voice_mode: bool = False,
 ) -> None:
     """Interactive AI chat with transcript context.
 
@@ -475,19 +483,167 @@ def chat(
             )
         return
 
-    # ── Check Ollama ──
-    client = OllamaClient(
-        base_url=settings.ollama_base_url,
-        model=model_name,
-    )
+    # ── Check Provider Availability ──
+    from audiobench.chat.chat_session import create_chat_client
+
+    client = create_chat_client(model_name, settings)
     if not client.is_available():
-        console.print(
-            error_panel(
-                "Ollama not running",
-                f"Start with: ollama serve\nPull model: ollama pull {model_name}",
+        if model_name.lower().startswith("gemini"):
+            console.print(
+                error_panel(
+                    "Gemini not available",
+                    "Please check GEMINI_API_KEY in your environment or settings.",
+                )
             )
-        )
-        return
+            return
+        else:
+            from audiobench.chat.providers.gemini_provider import GeminiClient
+
+            g_client = GeminiClient(model=settings.gemini_model)
+            if g_client.is_available() and not model:
+                console.print(
+                    f"  [yellow]Notice: Ollama not running. Switching to Gemini ({settings.gemini_model})...[/]"
+                )
+                client = g_client
+                model_name = "gemini"
+            else:
+                console.print(
+                    error_panel(
+                        "Ollama not running",
+                        f"Start with: ollama serve\nPull model: ollama pull {model_name}",
+                    )
+                )
+                return
+
+    target_search_session_id: int | None = None
+
+    # ── Session Picker (if no args provided) ──
+    if (
+        not transcript_ids and 
+        not search_query and 
+        not recent and 
+        resume_id is None and 
+        project_id is None
+    ):
+        recent_chats = chat_repo.list_conversations(limit=15, session_type="chat")
+        research_sessions = chat_repo.get_search_sessions_with_chats(limit=10)
+
+        if recent_chats or research_sessions:
+            if not research_sessions:
+                from audiobench.cli.shared.session_picker import show_session_picker
+                picker_sessions = [
+                    {
+                        "id": c["id"],
+                        "title": c["title"],
+                        "created_at": c["created_at"],
+                        "detail": f"{c['message_count']} msgs, {c['model']}"
+                    }
+                    for c in recent_chats
+                ]
+                try:
+                    chosen_id = show_session_picker(console, picker_sessions, noun="conversation")
+                except KeyboardInterrupt:
+                    import sys
+                    sys.exit(0)
+                if chosen_id is not None:
+                    resume_id = chosen_id
+            else:
+                from datetime import date
+                today = date.today().isoformat()
+                term_width = console.width or 100
+                title_max = max(20, term_width - 40)
+
+                options_map: dict[int, dict] = {}
+                opt_idx = 1
+
+                if recent_chats:
+                    console.print("  [dim]── Standalone Chats ──────────────────────────────[/dim]")
+                    for c in recent_chats:
+                        title = c["title"] or "(untitled)"
+                        if len(title) > title_max:
+                            title = title[:title_max - 1] + "…"
+                        ts = c["created_at"][:16].replace("T", " ") if c["created_at"] else ""
+                        if ts.startswith(today):
+                            ts = ts[11:]
+                        console.print(
+                            f"  [cyan][{opt_idx}][/cyan] [dim]#{c['id']}[/dim] {title} "
+                            f"[dim]· {c['message_count']} msgs, {c['model']} · {ts}[/dim]"
+                        )
+                        options_map[opt_idx] = {"type": "chat", "id": c["id"]}
+                        opt_idx += 1
+
+                if research_sessions:
+                    if recent_chats:
+                        console.print()
+                    console.print("  [dim]── Research Sessions with Chats ──────────────────[/dim]")
+                    for r in research_sessions:
+                        title = r["title"] or f"Search Session #{r['search_session_id']}"
+                        if len(title) > title_max:
+                            title = title[:title_max - 1] + "…"
+                        ts = r["updated_at"][:16].replace("T", " ") if r["updated_at"] else ""
+                        if ts.startswith(today):
+                            ts = ts[11:]
+                        count = r["thread_count"]
+                        count_str = f"{count} chat thread{'s' if count != 1 else ''}"
+                        console.print(
+                            f"  [cyan][{opt_idx}][/cyan] [dim]Search #{r['search_session_id']}[/dim] \"{title}\" "
+                            f"[dim]· {count_str} · {ts}[/dim]"
+                        )
+                        options_map[opt_idx] = {
+                            "type": "search",
+                            "search_session_id": r["search_session_id"],
+                            "title": r["title"],
+                        }
+                        opt_idx += 1
+
+                console.print()
+                prompt_range = f"1-{len(options_map)}" if len(options_map) > 1 else "1"
+                console.print(
+                    f"  [dim]Resume conversation [[{prompt_range}]] or type [cyan]'n'[/cyan] for a new conversation (default: 1)?[/dim]"
+                )
+
+                try:
+                    ans = input("  › ").strip().lower()
+                except (KeyboardInterrupt, EOFError):
+                    import sys
+                    console.print("\n  [dim]Cancelled.[/dim]")
+                    sys.exit(0)
+
+                console.print()
+                if ans in ("", "y", "yes"):
+                    ans = "1"
+
+                if ans != "n":
+                    raw_ans = ans.lstrip("#")
+                    chosen_opt = None
+                    if raw_ans.isdigit():
+                        val = int(raw_ans)
+                        if not ans.startswith("#") and val in options_map:
+                            chosen_opt = options_map[val]
+                        else:
+                            for opt in options_map.values():
+                                if opt.get("id") == val:
+                                    chosen_opt = opt
+                                    break
+
+                    if chosen_opt:
+                        if chosen_opt["type"] == "chat":
+                            resume_id = chosen_opt["id"]
+                        elif chosen_opt["type"] == "search":
+                            from audiobench.cli.commands.memory_cmd import _show_search_thread_navigator
+                            sid = chosen_opt["search_session_id"]
+                            target_search_session_id = sid
+                            threads = chat_repo.get_threads_for_search_session(sid)
+                            chosen_thread_id = _show_search_thread_navigator(
+                                console, threads, query_title=chosen_opt["title"]
+                            )
+                            if chosen_thread_id == "CANCEL":
+                                import sys
+                                sys.exit(0)
+                            elif chosen_thread_id is not None:
+                                resume_id = chosen_thread_id
+                            else:
+                                resume_id = None
 
     # ── Study Project Integration ──
     current_session_number = None
@@ -537,7 +693,7 @@ def chat(
                         db_chap = db.query(ChapterRecord).filter_by(id=chap.id).first()
                         tx_id = db_chap.transcription_id if db_chap else None
                         if tx_id:
-                            chap_record = tx_repo.get_by_id(tx_id)
+                            chap_record = tx_repo.get_by_id(tx_id, session=None)
                             if chap_record:
                                 chap_record["file_name"] = f"{chap_record['file_name']} (Chapter {ch_idx}: {chap.title})"
                                 transcripts_to_load.append(chap_record)
@@ -546,7 +702,7 @@ def chat(
                 from audiobench.storage.models import TranscriptionRecord
                 tx = db.query(TranscriptionRecord).filter_by(audio_file_id=audio_file_id).first()
                 if tx:
-                    record = tx_repo.get_by_id(tx.id)
+                    record = tx_repo.get_by_id(tx.id, session=None)
                     if record:
                         transcripts_to_load.append(record)
 
@@ -561,7 +717,7 @@ def chat(
     )
 
     # Resume existing conversation
-    if resume_id is not None and not session.restore_from_db():
+    if resume_id is not None and not session.restore_from_db(tx_repo=tx_repo):
         console.print(
             error_panel(
                 "Not found",
@@ -574,7 +730,7 @@ def chat(
     if project_id is None:
         # By explicit IDs
         for tid in transcript_ids:
-            record = tx_repo.get_by_id(tid)
+            record = tx_repo.get_by_id(tid, session=None)
             if record:
                 if chapter is not None:
                     from audiobench.core.db_session import get_session
@@ -589,7 +745,7 @@ def chat(
                                 db_chap = db.query(ChapterRecord).filter_by(id=chap.id).first()
                                 tx_id = db_chap.transcription_id if db_chap else None
                             if tx_id:
-                                chap_record = tx_repo.get_by_id(tx_id)
+                                chap_record = tx_repo.get_by_id(tx_id, session=None)
                                 if chap_record:
                                     chap_record["file_name"] = (
                                         f"{record['file_name']} (Chapter {chapter}: {chap.title})"
@@ -622,7 +778,7 @@ def chat(
                                         db_chap = db.query(ChapterRecord).filter_by(id=chap.id).first()
                                         tx_id = db_chap.transcription_id if db_chap else None
                                     if tx_id:
-                                        chap_record = tx_repo.get_by_id(tx_id)
+                                        chap_record = tx_repo.get_by_id(tx_id, session=None)
                                         if chap_record:
                                             chap_record["file_name"] = f"{record['file_name']} (Chapter {ch_idx}: {chap.title})"
                                             transcripts_to_load.append(chap_record)
@@ -633,9 +789,9 @@ def chat(
 
         # By search
         if search_query:
-            results = tx_repo.search(search_query, limit=5)
+            results = tx_repo.search(search_query, limit=5, session=None)
             for r in results:
-                full = tx_repo.get_by_id(r["id"])
+                full = tx_repo.get_by_id(r["id"], session=None)
                 if full:
                     transcripts_to_load.append(full)
             if not results:
@@ -645,7 +801,8 @@ def chat(
         if recent:
             history_items = tx_repo.get_history(limit=recent)
             for h in history_items:
-                full = tx_repo.get_by_id(h["id"])
+                full = tx_repo.get_by_id(h["id"], session=None)
+
                 if full:
                     transcripts_to_load.append(full)
 
@@ -681,9 +838,12 @@ def chat(
         tx_repo,
         chat_repo,
         settings,
-        session_type="study" if project_id else "chat",
+        session_type="study" if project_id else ("search_followup" if target_search_session_id else "chat"),
+        resume_id=session.conversation_id,
         project_id=project_id,
         current_session_number=current_session_number,
+        start_voice=voice_mode,
+        search_session_id=target_search_session_id,
     )
     repl.run(resume_id=session.conversation_id)
 

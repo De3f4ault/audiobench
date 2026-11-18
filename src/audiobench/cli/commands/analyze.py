@@ -59,7 +59,7 @@ def vocab(
 
     init_db()
     repo = TranscriptionRepository()
-    data = repo.get_by_id(transcription_id)
+    data = repo.get_by_id(transcription_id, session=None)
 
     if not data:
         console.print(error_panel(f"Transcription #{transcription_id} not found"))

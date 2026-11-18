@@ -306,8 +306,8 @@ def test_related_command_with_school_focus(school_test_db, monkeypatch):
     assert "Connected Schools (Macro Coupling)" in output
     assert "School #01: Biblical Psalms and Divine Refuge" in output
 
-    # 3. Section 2: Dialectic Bridge Passages (Two-Column Book Mode)
-    assert "Dialectic Bridge Passages" in output
+    # 3. Section 2: Semantic Bridge Passages (Two-Column Book Mode)
+    assert "Semantic Bridge Passages" in output
     assert "2-column book mode" in output
     assert "│" in output
     assert "School #02 (Inside Core)" in output

@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from rich.table import Table
 
-from audiobench.cli.display.theme import console, DIM
+from audiobench.cli.display.theme import DIM, console
 from audiobench.cli.wizard import prompt_menu
 from audiobench.core.db_session import get_session
 from audiobench.storage.models import StagingCartItem
+
 
 def edit_cart_items() -> None:
     """Prompt the user to edit engine/model/preset for items in the staging cart."""
@@ -16,48 +17,48 @@ def edit_cart_items() -> None:
     except ImportError:
         console.print(f"  [{DIM}]Missing 'questionary' package. Cannot edit cart.[/]")
         return
-        
+
     with get_session() as session:
         items = session.query(StagingCartItem).all()
         if not items:
             console.print(f"  [{DIM}]Cart is empty.[/]")
             return
-            
+
         choices = []
         for i, item in enumerate(items, 1):
             file_name = item.audio_file.file_name if item.audio_file else "Unknown"
             choices.append(
                 questionary.Choice(
-                    f"[{i}] {file_name} ({item.engine} - {item.model_name})", 
+                    f"[{i}] {file_name} ({item.engine} - {item.model_name})",
                     item.id
                 )
             )
-            
+
         selected_ids = questionary.checkbox("Select files to edit:", choices=choices).ask()
         if not selected_ids:
             return
-            
+
         engine = questionary.select(
-            "New Engine:", 
+            "New Engine:",
             choices=["skip (keep current)", "gemini", "whisper", "deepgram"]
         ).ask()
-        
+
         model = questionary.select(
-            "New Model:", 
+            "New Model:",
             choices=["skip (keep current)", "tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"],
             default="large-v3-turbo"
         ).ask()
-        
+
         preset = questionary.select(
-            "New Preset:", 
+            "New Preset:",
             choices=["skip (keep current)", "fast", "balanced", "accurate"]
         ).ask()
-        
+
         strategy = questionary.select(
-            "New Strategy:", 
+            "New Strategy:",
             choices=["skip (keep current)", "batch", "chunk", "concurrent"]
         ).ask()
-        
+
         for item in items:
             if item.id in selected_ids:
                 if engine and engine != "skip (keep current)":
@@ -68,7 +69,7 @@ def edit_cart_items() -> None:
                     item.speed_preset = preset
                 if strategy and strategy != "skip (keep current)":
                     item.strategy = strategy
-        
+
         session.commit()
         console.print(f"  [{DIM}]Updated {len(selected_ids)} items.[/]")
 

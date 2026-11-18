@@ -36,8 +36,9 @@ def _spawn_janitor():
             pending_records = []
             for record in all_records:
                 try:
-                    tags = json.loads(record.tags) if record.tags else []
-                    if "pending_auto_rename" in tags:
+                    data = json.loads(record.tags) if record.tags else []
+                    labels = data.get("_labels", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                    if "pending_auto_rename" in labels:
                         pending_records.append(record)
                 except Exception:
                     pass
@@ -125,12 +126,18 @@ def _spawn_janitor():
                         audio_record.file_path = str(new_path)
 
                         try:
-                            tags_list = json.loads(audio_record.tags) if audio_record.tags else []
+                            data = json.loads(audio_record.tags) if audio_record.tags else []
                         except Exception:
-                            tags_list = []
-                        if "pending_auto_rename" in tags_list:
-                            tags_list.remove("pending_auto_rename")
-                            audio_record.tags = json.dumps(tags_list)
+                            data = []
+                        if isinstance(data, dict):
+                            labels = data.get("_labels", [])
+                            if "pending_auto_rename" in labels:
+                                labels.remove("pending_auto_rename")
+                                audio_record.tags = json.dumps(data)
+                        elif isinstance(data, list):
+                            if "pending_auto_rename" in data:
+                                data.remove("pending_auto_rename")
+                                audio_record.tags = json.dumps(data)
 
                         session.commit()
                         logger.info("Janitor auto-renamed file to %s", new_filename)
@@ -141,19 +148,34 @@ def _spawn_janitor():
     threading.Thread(target=_janitor_sweep, name="janitor", daemon=True).start()
 
 
-@click.command(name="library")
+from audiobench.cli.plugins.custom_group import DefaultGroup
+
+
+@click.group(name="library", cls=DefaultGroup, default_command="center", invoke_without_command=True)
 @click.pass_context
-def library_cmd(ctx):
-    """Launch the interactive Library Command Center."""
+def library_group(ctx):
+    """Launch the interactive Library Command Center or manage library upgrades."""
+    if ctx.invoked_subcommand is None or ctx.invoked_subcommand == "center":
+        console.print(f"  [{BOLD} {ACCENT}]{APP_NAME}[/] — Library Command Center")
+        console.print(f"  [{DIM}]{'─' * 44}[/]")
+        from audiobench.cli.repl.session import ReplSession
+        session = ReplSession(ctx.parent.command if ctx.parent else ctx.command)
+        run_library(session)
+
+
+@library_group.command(name="center", hidden=True)
+@click.pass_context
+def library_center(ctx):
+    """Internal default subcommand to launch the library command center."""
     console.print(f"  [{BOLD} {ACCENT}]{APP_NAME}[/] — Library Command Center")
     console.print(f"  [{DIM}]{'─' * 44}[/]")
-    
-    # If run outside REPL (from bash), there is no session stack.
-    # We create a dummy session or dispatch appropriately if needed.
-    # For now, library is mostly a REPL tool.
     from audiobench.cli.repl.session import ReplSession
     session = ReplSession(ctx.parent.command if ctx.parent else ctx.command)
     run_library(session)
+
+
+# Backward-compatible alias
+library_cmd = library_group
 
 def run_library(session, restore_state=None):
     _spawn_janitor()
@@ -168,8 +190,8 @@ def run_library(session, restore_state=None):
     state_export = result.get("state", {})
 
     if action == "switch_to_import":
-        from audiobench.cli.repl.session import NavigationFrame
         from audiobench.cli.repl.dispatch import dispatch_command
+        from audiobench.cli.repl.session import NavigationFrame
         session.push_frame(NavigationFrame(
             context="library",
             state=state_export,

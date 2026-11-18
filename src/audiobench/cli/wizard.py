@@ -120,33 +120,28 @@ def prompt_string(
 
     if enable_autocomplete:
         try:
-            from prompt_toolkit import PromptSession
-            from prompt_toolkit.completion import Completer, Completion
             import time
-            
+
+            from prompt_toolkit import PromptSession
+            from prompt_toolkit.completion import Completer, Completion, ThreadedCompleter
+
             class DaemonSemanticCompleter(Completer):
                 def __init__(self) -> None:
                     from audiobench.daemon.factory import get_daemon_client
                     self.client = get_daemon_client()
-                    self._last_text = ""
-                    self._last_fire_time = 0.0
-                    
+                    self._latest_text = ""
+
                 def get_completions(self, document, complete_event):
                     text = document.text
+                    self._latest_text = text
+
                     if len(text) < 3:
                         return
-                    
-                    now = time.monotonic()
-                    text_changed = text != self._last_text
-                    self._last_text = text
-                    self._last_fire_time = now
-                    
-                    # Only suppress if text just changed and it's not a manual trigger
-                    # (complete_event.completion_requested means the user explicitly pressed TAB)
-                    if text_changed and not complete_event.completion_requested:
-                        if now - self._last_fire_time < _AUTOCOMPLETE_DEBOUNCE_MS / 1000.0:
-                            return
-                        
+
+                    # Debounce fast typing
+                    time.sleep(_AUTOCOMPLETE_DEBOUNCE_MS / 1000.0)
+                    if self._latest_text != text:
+                        return  # Superseded by newer keystrokes
                     try:
                         # fetch fast-path results
                         results = self.client.autocomplete(text, top_k=7)
@@ -159,15 +154,15 @@ def prompt_string(
                                 display_text = content if len(content) <= 60 else content[:57] + "..."
                                 display_meta = f"[{speaker}]" if speaker else f"[{source_type}]" if source_type else ""
                                 yield Completion(
-                                    content, 
+                                    content,
                                     start_position=-len(text),
                                     display=display_text,
                                     display_meta=display_meta
                                 )
                     except Exception:
                         pass
-                        
-            session = PromptSession(completer=DaemonSemanticCompleter())
+
+            session = PromptSession(completer=ThreadedCompleter(DaemonSemanticCompleter()))
         except ImportError:
             # Fallback to standard input if prompt_toolkit is somehow missing
             enable_autocomplete = False
@@ -178,7 +173,7 @@ def prompt_string(
                 choice = session.prompt("  → ").strip()
             else:
                 choice = input("  → ").strip()
-                
+
             if not choice:
                 choice = default
 
@@ -268,8 +263,8 @@ def print_chapter_table(chapters: list, max_head: int = 15, max_tail: int = 5) -
         max_head:  Max chapters to show at the top of the table.
         max_tail:  Max chapters to show at the bottom of the table.
     """
-    from rich.table import Table
     from rich.box import SIMPLE_HEAVY
+    from rich.table import Table
 
     total = len(chapters)
     fold_threshold = max_head + max_tail

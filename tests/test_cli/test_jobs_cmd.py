@@ -197,3 +197,59 @@ def test_jobs_diff_command(runner, test_db):
     assert "SIMILAR" in result.output
 
 
+def test_jobs_interactive_retry_all_excludes_cancelled_by_default(runner, test_db, monkeypatch):
+    id_failed = enqueue(job_type="transcribe", args=["failed.mp3"])
+    id_cancelled = enqueue(job_type="transcribe", args=["cancelled.mp3"])
+
+    with get_session() as session:
+        jf = session.get(UnifiedJob, id_failed)
+        jf.status = "failed"
+        jc = session.get(UnifiedJob, id_cancelled)
+        jc.status = "cancelled"
+        session.commit()
+
+    monkeypatch.setattr("audiobench.cli.commands.jobs_cmd.ensure_worker", lambda: None)
+
+    # First pass: /retry --all should only retry the failed job, preserving cancelled
+    prompts1 = iter(["/retry --all", "/exit"])
+    class MockPtSession1:
+        def prompt(self, _):
+            return next(prompts1)
+
+    monkeypatch.setattr(
+        "audiobench.cli.shared.repl_shell.make_prompt_session",
+        lambda **kwargs: MockPtSession1(),
+    )
+
+    result = runner.invoke(jobs, ["-i"])
+    assert result.exit_code == 0
+    assert "Re-enqueued 1 job(s) as pending." in result.output
+
+    with get_session() as session:
+        jf = session.get(UnifiedJob, id_failed)
+        jc = session.get(UnifiedJob, id_cancelled)
+        assert jf.status == "pending"
+        assert jc.status == "cancelled"
+
+    # Second pass: /retry --all --include-cancelled should re-enqueue cancelled jobs as well
+    prompts2 = iter(["/retry --all --include-cancelled", "/exit"])
+    class MockPtSession2:
+        def prompt(self, _):
+            return next(prompts2)
+
+    monkeypatch.setattr(
+        "audiobench.cli.shared.repl_shell.make_prompt_session",
+        lambda **kwargs: MockPtSession2(),
+    )
+
+    result2 = runner.invoke(jobs, ["-i"])
+    assert result2.exit_code == 0
+    assert "Re-enqueued 1 job(s) as pending." in result2.output
+
+    with get_session() as session:
+        jc = session.get(UnifiedJob, id_cancelled)
+        assert jc.status == "pending"
+
+
+
+

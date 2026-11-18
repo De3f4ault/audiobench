@@ -34,18 +34,18 @@ from pathlib import Path
 import click
 from prompt_toolkit import PromptSession
 
+import audiobench.cli.repl.backslash_commands as _  # noqa: F401 — registers \handlers
+import audiobench.cli.repl.dot_commands as _dot  # noqa: F401 — registers .handlers
 from audiobench.cli.display.theme import ACCENT, DIM, WARNING, console, error_panel
 from audiobench.cli.repl.banner import print_banner, print_goodbye, print_onboarding
 from audiobench.cli.repl.completion import setup_completion
-from audiobench.cli.repl.dispatch import dispatch_command, dispatch_backslash, print_context_summary
+from audiobench.cli.repl.dispatch import dispatch_backslash, dispatch_command, print_context_summary
+from audiobench.cli.repl.dot_commands import dispatch_dot
 from audiobench.cli.repl.session import ReplSession
 from audiobench.cli.repl.slash_commands import ALIASES, handle_slash_command
-import audiobench.cli.repl.backslash_commands as _  # noqa: F401 — registers \handlers
-import audiobench.cli.repl.dot_commands as _dot  # noqa: F401 — registers .handlers
-from audiobench.cli.repl.dot_commands import dispatch_dot
 
 
-def _dispatch_single(session: "ReplSession", user_input: str) -> bool:
+def _dispatch_single(session: ReplSession, user_input: str) -> bool:
     """Dispatch one command string through the full input pipeline.
 
     Returns True if the REPL should exit (/exit in a chain), False otherwise.
@@ -93,13 +93,12 @@ def _dispatch_single(session: "ReplSession", user_input: str) -> bool:
                 console.print(f"  [{WARNING}]{e}[/]")
         return False
 
-    # /slash commands — also catch accidental /focus instead of \focus
+    # /slash commands — transparently route to \backslash if registered, else meta slash command
     if user_input.startswith("/"):
-        test_cmd = user_input[1:].strip().split()[0].lower()
-        if test_cmd in _BACKSLASH_HANDLERS:
-            console.print(
-                f"  [{WARNING}]Did you mean [{ACCENT}]\\{test_cmd}[/]? (backslash, not slash)[/]"
-            )
+        body = user_input[1:].strip()
+        cmd_name = body.split()[0].lower() if body else ""
+        if cmd_name in _BACKSLASH_HANDLERS:
+            dispatch_backslash(session, body)
             return False
         should_exit = handle_slash_command(user_input, session)
         return should_exit
@@ -128,17 +127,28 @@ def _dispatch_single(session: "ReplSession", user_input: str) -> bool:
         if not SUPPORTS_BACKGROUND_JOBS:
             console.print(f"  [{WARNING}]Background jobs only supported on Linux/macOS.[/]")
             return False
-        from audiobench.jobs.runner import submit_job
+        from audiobench.jobs.scheduler import enqueue, ensure_worker
+
         args = args[:-1]
         if not args:
             return False
         args = session.expand_vars(args)
         args = session.auto_inject_id(args)
-        job_id = submit_job(args)
+
+        slot = "network" if len(args) > 0 and args[0] == "youtube" else "transcription"
+        job_type = args[0] if args else "generic"
+
+        job_id = enqueue(
+            job_type=job_type,
+            slot=slot,
+            args=args,
+            command_display=" ".join(args),
+        )
+        ensure_worker()
         cmd_str = " ".join(args)
         if len(cmd_str) > 40:
             cmd_str = cmd_str[:37] + "..."
-        console.print(f"  [{ACCENT}][{job_id}][/] Job submitted — {cmd_str}")
+        console.print(f"  [{ACCENT}][#{job_id}][/] Job submitted — {cmd_str}")
         return False
 
     # Strip redundant audiobench prefix
@@ -237,8 +247,8 @@ def repl(transcript_id: int | None) -> None:
     # First-run: prompts to set passphrase + recovery key.
     # Returning user: 3-attempt passphrase check; recovery key fallback.
     # If auth fails fatally, exit before touching any data.
-    from audiobench.security.auth import run_startup_gate
     from audiobench.core.settings import get_settings as _get_settings
+    from audiobench.security.auth import run_startup_gate
     if not run_startup_gate():
         raise SystemExit(1)
 
@@ -256,6 +266,7 @@ def repl(transcript_id: int | None) -> None:
     # This runs concurrently with banner + onboarding rendering (~1-2 s),
     # giving the daemon a head start. Completely silent — no status messages.
     import threading as _threading
+
     from audiobench.daemon.factory import ensure_daemon_running as _ensure_daemon
     _threading.Thread(target=_ensure_daemon, daemon=True, name="daemon-warmup").start()
 
@@ -276,17 +287,19 @@ def repl(transcript_id: int | None) -> None:
     print_onboarding(session)
 
     # ── Input loop ────────────────────────────────────────────────────────────
-    from audiobench.cli.repl.completion import AudioBenchCompleter, AudioBenchAutoSuggest
     from prompt_toolkit.completion import FuzzyCompleter
+
+    from audiobench.cli.repl.completion import AudioBenchAutoSuggest, AudioBenchCompleter
 
     prompt_session = PromptSession(
         history=session.get_history(),
-        auto_suggest=AudioBenchAutoSuggest(),
+        auto_suggest=AudioBenchAutoSuggest(session),
         completer=FuzzyCompleter(AudioBenchCompleter(session)),
         complete_while_typing=False,  # only on Tab — never interrupt typing
     )
 
-    from datetime import UTC, datetime as _dt
+    from datetime import UTC
+    from datetime import datetime as _dt
 
     while True:
         try:
@@ -297,11 +310,15 @@ def repl(transcript_id: int | None) -> None:
             print_goodbye(session)
             break
 
-        # ── Security: record keypress + show idle-lock notice ─────────────────
-        session.last_keystroke_at = _dt.now(UTC)
+        # ── Security: check idle-lock BEFORE recording the new keypress ──────
+        # Order matters: if we update last_keystroke_at first, the sync check
+        # in effective_tier() will see idle=0 and never fire, letting an unlocked
+        # session survive a sleep/wake cycle if the user types immediately on wake.
         if session._idle_lock_fired:
             console.print(f"  [{DIM}]● Auto-locked (idle).[/]")
             session._idle_lock_fired = False
+        session.last_keystroke_at = _dt.now(UTC)
+
 
         if not user_input:
             continue

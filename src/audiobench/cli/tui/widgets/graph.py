@@ -10,11 +10,10 @@ from __future__ import annotations
 
 from collections import deque
 
-from textual.widget import Widget
-from textual.strip import Strip
 from rich.segment import Segment
 from rich.style import Style
-
+from textual.strip import Strip
+from textual.widget import Widget
 
 # Eight sub-character block levels (index = eighths filled from bottom)
 _BLOCKS = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]

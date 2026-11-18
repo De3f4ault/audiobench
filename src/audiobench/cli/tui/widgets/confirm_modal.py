@@ -6,7 +6,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
 from textual.screen import ModalScreen
-from textual.widgets import Label, Button
+from textual.widgets import Label
 
 
 class ConfirmModal(ModalScreen[bool]):

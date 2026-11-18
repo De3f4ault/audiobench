@@ -20,7 +20,6 @@ from audiobench.cli.display.theme import (
 from audiobench.cli.plugins.loader import discover_plugins, ensure_plugins_dir, load_plugin
 from audiobench.core.settings import get_settings
 
-
 # ── Plugin command group ───────────────────────────────────────────────────────
 
 

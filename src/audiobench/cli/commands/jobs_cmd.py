@@ -620,14 +620,17 @@ def _interactive_jobs_repl() -> None:
                 console.print(error_panel("Missing Argument", "Usage: /retry <job_id> or /retry --all"))
                 continue
             if "--all" in parts or parts[0] == "all":
+                include_cancelled = "--include-cancelled" in parts or "--cancelled" in parts
+                target_statuses = ["failed", "cancelled"] if include_cancelled else ["failed"]
                 with get_session() as session:
                     failed = (
                         session.query(UnifiedJob)
-                        .filter(UnifiedJob.status.in_(["failed", "cancelled"]))
+                        .filter(UnifiedJob.status.in_(target_statuses))
                         .all()
                     )
                     if not failed:
-                        console.print(f"  [{DIM}]No failed or cancelled jobs found to retry.[/]")
+                        target_label = "failed or cancelled" if include_cancelled else "failed"
+                        console.print(f"  [{DIM}]No {target_label} jobs found to retry.[/]")
                         continue
                     count = 0
                     for j in failed:

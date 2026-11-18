@@ -98,6 +98,9 @@ class SearchSessionState:
     layout: str = "book"       # "book" = two-column (default), "list" = single column
     wrap_cap: int | None = None  # None = fluid (terminal width - 8), int = hard cap
     autocomplete: bool = True    # toggle semantic autocomplete while typing
+    speak_answer: bool = False   # speak synthesis answer aloud via Piper TTS
+    search_results: dict[int, Any] = dataclasses.field(default_factory=dict)  # maps seq_num -> ResearchResult
+    linked_chat_ids: list[int] = dataclasses.field(default_factory=list)  # conversation_ids of chats spawned from this search session
 
     @property
     def mmr_enabled(self) -> bool:
@@ -110,7 +113,7 @@ def _format_hint(state: "SearchSessionState", key: str, message: str) -> str | N
     if key in state.hints_shown:
         return None
     state.hints_shown.add(key)
-    return f"  [dim]💡 {message}[/dim]"
+    return f"  [dim]Hint: {message}[/dim]"
 
 
 def _emit_hint(state: "SearchSessionState", key: str, message: str) -> None:
@@ -208,7 +211,7 @@ def _render_settings_card(state: "SearchSessionState") -> str:
 
     lines = [
         "",
-        "  [bold cyan]⚙ Search & Session Settings[/bold cyan] [dim](persisted to data/search_prefs.json)[/dim]",
+        "  [bold cyan]Search & Session Settings[/bold cyan] [dim](persisted to data/search_prefs.json)[/dim]",
         "  [dim]──────────────────────────────────────────────────────────────────────────[/dim]",
         f"   [bold]Preset[/bold]            [cyan]{state.preset:<16}[/cyan] [dim]fast · balanced · synthesis · deep[/dim]",
         f"   [bold]Layout[/bold]            [cyan]{state.layout:<16}[/cyan] [dim]book (2-column) · list (1-column)[/dim]",
@@ -221,6 +224,31 @@ def _render_settings_card(state: "SearchSessionState") -> str:
         "   [dim]Change any setting: [cyan]/set <option> <value>[/cyan]  (e.g. [cyan]/set deep[/cyan], [cyan]/set layout book[/cyan], [cyan]/set autocomplete off[/cyan])[/dim]",
     ]
     return "\n".join(lines)
+
+
+def _speak_text(text: str, console: Any = console) -> None:
+    """Clean markdown/citations and speak text aloud using Piper TTS."""
+    from audiobench.chat.voice_picker import ensure_voice_downloaded, strip_markdown_for_speech
+    from audiobench.tts.engine import PiperTTSEngine, TTSError
+    from audiobench.core.settings import get_settings
+
+    settings = get_settings()
+    cleaned = strip_markdown_for_speech(text)
+    if not cleaned:
+        return
+    if not ensure_voice_downloaded(settings.tts_voice, console=console):
+        return
+    console.print(f"  [cyan][Voice][/cyan] [dim]Speaking with {settings.tts_voice}... [bold](Space: pause · q: stop)[/bold][/dim]")
+    try:
+        engine = PiperTTSEngine(voices_dir=settings.voices_dir)
+        engine.play(cleaned, voice=settings.tts_voice)
+    except KeyboardInterrupt:
+        PiperTTSEngine.stop()
+        console.print("\n  [dim][Voice] Playback stopped.[/dim]")
+    except TTSError as err:
+        console.print(f"  [yellow]TTS Error: {err}[/yellow]")
+    except Exception as exc:
+        console.print(f"  [yellow]TTS Playback failed: {exc}[/yellow]")
 
 
 def _parse_slash_command(
@@ -246,6 +274,55 @@ def _parse_slash_command(
 
     if cmd in ("/settings", "/config"):
         return _render_settings_card(state)
+
+    if cmd in ("/voice", "/voices"):
+        if len(parts) > 1 and parts[1].lower() in ("picker", "set", "choose", "select"):
+            from audiobench.chat.voice_picker import show_voice_picker
+            show_voice_picker(console)
+            return None
+        elif len(parts) > 1 and parts[1].lower() == "list":
+            from audiobench.tts.engine import PiperTTSEngine
+            from audiobench.core.settings import get_settings
+            s = get_settings()
+            engine = PiperTTSEngine(voices_dir=s.voices_dir)
+            voices = engine.list_voices()
+            names = ", ".join(v.name for v in voices) if voices else "none"
+            return f"[dim]Current voice: [bold]{s.tts_voice}[/bold]. Downloaded voices: {names}[/dim]"
+        elif len(parts) > 1 and parts[1].lower() in ("provider", "engine"):
+            from audiobench.core.settings import get_settings
+            s = get_settings()
+            if len(parts) > 2 and parts[2].lower() in ("auto", "local", "cloud"):
+                s.stt_provider = parts[2].lower()
+                s.save()
+                return f"[green]STT Provider updated to:[/] [bold]{s.stt_provider}[/bold]"
+            return f"[dim]Current STT provider: [bold]{s.stt_provider}[/bold] (options: auto, local, cloud)[/dim]"
+        elif len(parts) > 1 and parts[1].lower() in ("model", "stt-model"):
+            from audiobench.core.settings import get_settings
+            s = get_settings()
+            if len(parts) > 2:
+                m = parts[2].lower()
+                if m == "large-v3-turbo":
+                    m = "turbo"
+                if m in ("tiny", "base", "small", "medium", "turbo"):
+                    s.stt_model = m
+                    s.save()
+                    return f"[green]Whisper STT model updated to:[/] [bold]{s.stt_model}[/bold]"
+            return f"[dim]Current Whisper STT model: [bold]{s.stt_model}[/bold] (options: tiny, base, small, medium, turbo)[/dim]"
+        else:
+            return (
+                "[dim]Voice commands: [cyan]/voice[/cyan] (record query), "
+                "[cyan]/voice set[/cyan] (interactive voice picker), "
+                "[cyan]/voice provider [auto|local|cloud][/cyan], "
+                "[cyan]/voice model [tiny|base|small|medium|turbo][/cyan], "
+                "[cyan]/voice list[/cyan] (list downloaded)[/dim]"
+            )
+
+    if cmd == "/speak":
+        text_to_speak = " ".join(parts[1:]).strip() if len(parts) > 1 else (state.last_synthesis or "")
+        if not text_to_speak:
+            return "[yellow]No synthesis answer or text to speak.[/yellow]"
+        _speak_text(text_to_speak)
+        return None
 
     if cmd == "/set":
         if len(parts) == 1:
@@ -745,7 +822,42 @@ def _parse_slash_command(
             _export_session_markdown(state.session_id, out_path or None)
         except Exception as e:
             return f"[red]Export failed: {e}[/red]"
-        return None  # _export_session_markdown prints its own confirmation
+    elif cmd in ("/similar", "/neighbors"):
+        if len(parts) < 2:
+            return "[red]Usage: /similar <#expression_id | query text>[/red]"
+        arg = " ".join(parts[1:]).strip()
+        try:
+            from audiobench.daemon.index import get_shared_hnsw_index
+            from audiobench.storage.expression_repository import ExpressionRepository
+            idx = get_shared_hnsw_index()
+            if not idx.is_ready():
+                return "[yellow]In-core HNSW index is not initialized or ready yet.[/yellow]"
+
+            repo = ExpressionRepository()
+            if arg.startswith("#") or arg.isdigit():
+                target_eid = int(arg.lstrip("#"))
+                hits = idx.query_similar(target_eid, k=5)
+            else:
+                from audiobench.daemon.factory import get_daemon_client
+                client = get_daemon_client()
+                q_vec = client.embed_query(arg)
+                hits = idx.query(q_vec, k=5)
+
+            if not hits:
+                return f"[dim]No similar expressions found for '{arg}'.[/dim]"
+
+            hit_ids = [h[0] for h in hits]
+            records = repo.get_by_ids(hit_ids)
+            lines = [f"[bold]Similar Expressions for '[cyan]{arg}[/cyan]':[/bold]"]
+            for h_id, dist in hits:
+                sim = 1.0 - dist
+                rec = records.get(h_id)
+                content_preview = rec.content[:100].replace("\n", " ") if rec else "(missing)"
+                spk = f"[{rec.speaker}] " if rec and rec.speaker else ""
+                lines.append(f"  [cyan]#{h_id}[/cyan] [green]{sim:.1%}[/green] [dim]dist={dist:.3f}[/dim] — {spk}{content_preview}...")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"[red]Error computing similarity: {e}[/red]"
 
     elif cmd == "/switch":
         # Resume a prior session by ID: /switch #2  or  /switch 2
@@ -865,6 +977,20 @@ def query_completer(ctx, param, incomplete: str):
     type=int,
     help="Resume a prior session by ID (skips the continue prompt).",
 )
+@click.option(
+    "--voice",
+    "-V",
+    "voice_mode",
+    is_flag=True,
+    help="Capture search query via microphone (5s silence or Enter to send)",
+)
+@click.option(
+    "--speak",
+    "-S",
+    "speak_answer",
+    is_flag=True,
+    help="Speak the synthesis answer aloud using Piper TTS",
+)
 def search(
     query: str | None,
     preset: str,
@@ -875,6 +1001,8 @@ def search(
     model: str | None,
     interactive: bool,
     resume_id: int | None,
+    voice_mode: bool = False,
+    speak_answer: bool = False,
 ) -> None:
     """Search memory for a semantic query."""
 
@@ -884,10 +1012,28 @@ def search(
     except Exception as e:
         console.print(f"[red]Warning: Database initialization failed: {e}[/red]")
 
+    if voice_mode and not query:
+        from audiobench.chat.voice_session import capture_voice_query
+        captured, is_fallback = capture_voice_query(
+            console=console,
+            silence_timeout=5.0,
+            prompt_message="Listening for memory query... (speak now, 5s silence or Enter to submit)",
+        )
+        if captured:
+            query = captured
+            console.print(f"  [cyan][Voice][/cyan] Query: [bold]{query}[/bold]")
+        elif is_fallback:
+            try:
+                query = input("  › Enter search query: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                console.print()
+                return
+
     interactive_mode = interactive or not query
 
     engine = ResearchEngine()
     state = SearchSessionState(preset=preset, model=model)
+    state.speak_answer = speak_answer
 
     # ── Apply persisted preferences ───────────────────────────────────────────
     # Load search_prefs.json and apply to state.  CLI flags (preset, model)
@@ -1153,7 +1299,7 @@ def _render_sessions_dashboard(
                     cid, title, stype, model, msgs, created = row
                     dt = (created or "")[:10]
                     type_label = "follow-up" if stype == "search_followup" else "chat"
-                    clean_title = title.replace("🔍 Search: ", "").replace("🔍 ", "") if title else ""
+                    clean_title = title.replace("\U0001f50d Search: ", "").replace("\U0001f50d ", "").removeprefix("Search: ") if title else ""
                     title_short = _short_source(clean_title, max_len=title_width_chat) if clean_title else "[dim](untitled)[/dim]"
                     model_short = (model or "")[:15]
                     tbl.add_row(f"#{cid}", dt, type_label, title_short, str(msgs), model_short)
@@ -1671,7 +1817,7 @@ def _display_results(result: "ResearchResult", state: SearchSessionState | None 
     # ── HyDE notice ──────────────────────────────────────────────────────────
     if result.hyde_fallback:
         console.print(
-            "[dim yellow]⚠  HyDE unavailable — falling back to direct query embedding[/dim yellow]"
+            "[dim yellow][!] HyDE unavailable — falling back to direct query embedding[/dim yellow]"
         )
     elif getattr(result, "hyde_document", None):
         console.print(
@@ -1740,7 +1886,7 @@ def _display_results(result: "ResearchResult", state: SearchSessionState | None 
         for synth in result.prior_synthesis_hits[:2]:
             label = "summary" if synth.source_type == "search_session_summary" else f"S{synth.sequence_num}"
             title = (
-                f"[bold white]🧠  Recap[/bold white]"
+                f"[bold white]Recap[/bold white]"
                 f"  [dim]· Session #{synth.session_id} · {label}[/dim]"
             )
             md = Markdown(synth.content.strip(), justify="left")
@@ -1822,7 +1968,7 @@ def _display_results(result: "ResearchResult", state: SearchSessionState | None 
 
             pin_badge = ""
             if state and fr.segment_id in state.pinned_fragments:  # type: ignore[union-attr]
-                pin_badge = "  [bold green]📌[/bold green]"
+                pin_badge = "  [bold green][PIN][/bold green]"
 
             overlap_badge = ""
             if state and state.search_count > 1:
@@ -1832,7 +1978,7 @@ def _display_results(result: "ResearchResult", state: SearchSessionState | None 
                 ]
                 if prior_seqs:
                     seq_labels = ",".join(f"S{s}" for s in sorted(prior_seqs))
-                    overlap_badge = f"  [dim yellow]↩{seq_labels}[/dim yellow]"
+                    overlap_badge = f"  [dim yellow]<-{seq_labels}[/dim yellow]"
 
             body.append(
                 f"  [bold cyan]{global_idx}[/bold cyan]  {ts}{rel_dots}{pin_badge}{overlap_badge}"
@@ -2204,6 +2350,29 @@ def _make_search_prompt_session(
             else:
                 event.app.current_buffer.insert_text(digit)
 
+    @kb.add("space")
+    def _key_space(event):
+        if _buffer_is_empty(event):
+            event.app.exit(result="\x00SPACE")
+        else:
+            event.app.current_buffer.insert_text(" ")
+
+    @kb.add("]")
+    @kb.add("right")
+    def _key_next(event):
+        if _buffer_is_empty(event):
+            event.app.exit(result="\x00NEXT")
+        else:
+            event.app.current_buffer.insert_text(event.key_sequence[0].key)
+
+    @kb.add("[")
+    @kb.add("left")
+    def _key_prev(event):
+        if _buffer_is_empty(event):
+            event.app.exit(result="\x00PREV")
+        else:
+            event.app.current_buffer.insert_text(event.key_sequence[0].key)
+
     from audiobench.cli.shared.repl_shell import make_prompt_session
     
     style_overrides = {
@@ -2221,7 +2390,6 @@ def _make_search_prompt_session(
         key_bindings=kb,
         lexer=_SearchLexer(),
         auto_suggest=SearchAutoSuggest(state),
-        complete_while_typing=True,
     )
 
 
@@ -2357,6 +2525,35 @@ def _resolve_audio_file_id(transcription_id: int, _cache: dict = {}) -> int:
             _cache[transcription_id] = rec.audio_file_id
             return rec.audio_file_id
     return 0
+
+
+def _resolve_audio_path(fr_item) -> tuple[str, int]:
+    """Resolve (file_path, audio_file_id) for playback."""
+    from pathlib import Path as _P
+
+    tid = getattr(fr_item, "transcription_id", None)
+    af_id = _resolve_audio_file_id(tid) if tid else 0
+    file_p = getattr(fr_item, "source_file", "") or ""
+
+    if tid:
+        try:
+            from audiobench.storage.repository import TranscriptionRepository
+
+            repo = TranscriptionRepository()
+            data = repo.get_by_id(tid, session=None)
+            if data and data.get("file_path"):
+                fp = data["file_path"]
+                if _P(fp).exists():
+                    return fp, data.get("audio_file_id") or af_id
+                elif not file_p:
+                    file_p = fp
+        except Exception:
+            pass
+
+    if file_p:
+        return file_p, af_id
+
+    return "", af_id
 
 def _get_max_end_time(transcription_id: int, _cache: dict = {}) -> float:
     """Memoized lookup for MAX(end_time) of a transcription."""
@@ -2508,7 +2705,7 @@ def _write_note(console: Console, fr_display: dict, audio_file_id: int, source_n
     # Show a clear message instead of crashing.
     if audio_file_id <= 0:
         console.print(
-            "  [dim yellow]⚠ Cannot save note — this fragment's source file is not "
+            "  [dim yellow][!] Cannot save note — this fragment's source file is not "
             "available in the current library (session replay or deleted file).[/dim yellow]"
         )
         import time
@@ -2663,19 +2860,36 @@ def _show_citation_card(
 
 def _open_fragment_reader(
     console: Console,
-    fragments: list,  # list[FusedResult]
+    fragments: Optional[list] = None,  # list[FusedResult]
     initial_idx: int = 0,
-) -> None:
-    """Interactive fragment reader workspace."""
+    state: Optional[SearchSessionState] = None,
+    active_seq: Optional[int] = None,
+) -> int:
+    """Elevated interactive fragment reader workspace."""
     import shutil
     import textwrap
 
     from audiobench.storage.bookmark_repository import BookmarkRepository
     from audiobench.storage.note_repository import NoteRepository
 
+    available_seqs: list[int] = sorted(state.search_results.keys()) if (state and state.search_results) else []
+    if active_seq is None:
+        if state and state.search_count in state.search_results:
+            active_seq = state.search_count
+        elif available_seqs:
+            active_seq = available_seqs[-1]
+        else:
+            active_seq = 1
+
+    if fragments is None:
+        if state and active_seq in state.search_results:
+            fragments = list(state.search_results[active_seq].sources)
+        else:
+            fragments = []
+
     if not fragments:
         console.print("[dim]No fragments to read.[/dim]")
-        return
+        return active_seq or 1
 
     current_idx = max(0, min(initial_idx, len(fragments) - 1))
     viewport_offset = 0
@@ -2683,6 +2897,36 @@ def _open_fragment_reader(
 
     bookmark_repo = BookmarkRepository()
     note_repo = NoteRepository()
+    status_toast: str = ""
+    show_answer: bool = False
+
+    def _is_playing() -> bool:
+        try:
+            from audiobench.daemon.factory import get_daemon_client
+            client = get_daemon_client()
+            st = client.playback_status()
+            return bool(st and (st.get("playing") or st.get("state") == "playing") and not st.get("paused"))
+        except Exception:
+            return False
+
+    def _play_at(target_time: float, fr_item) -> None:
+        nonlocal status_toast
+        file_p, af_id = _resolve_audio_path(fr_item)
+        if not file_p:
+            status_toast = "[yellow][!] No audio file found for this fragment[/yellow]"
+            return
+        try:
+            from audiobench.daemon.factory import get_daemon_client
+            client = get_daemon_client()
+            client.playback_play(
+                file_p,
+                start_pos=target_time,
+                audio_file_id=af_id,
+                transcription_id=fr_item.transcription_id,
+            )
+            status_toast = f"[green]> Playing from {_fmt_timestamp(target_time)}[/green]"
+        except Exception as exc:
+            status_toast = f"[red][!] Playback error: {exc}[/red]"
 
     while True:
         fr = fragments[current_idx]
@@ -2739,18 +2983,24 @@ def _open_fragment_reader(
         # Header indicators
         has_bookmark = bool(bookmark_repo.get_nearest(audio_file_id, fr_display["start_time"], window=1.0)) if audio_file_id else False
         captures = note_repo.get_captures_for_segment(fr_display.get("id"))
+        is_pinned = bool(state and (fr.segment_id in state.pinned_fragments))
 
         bookmark_ind = "  [yellow]★[/yellow]" if has_bookmark else ""
         note_ind = "  [cyan]✎[/cyan]" if captures else ""
+        pin_ind = "  [yellow][PIN][/yellow]" if is_pinned else ""
+
+        search_badge = ""
+        if state and active_seq in state.search_results:
+            q_text = getattr(state.search_results[active_seq], "query", "")
+            search_badge = f"[bold cyan]S{active_seq}[/bold cyan] [dim]\"{q_text}\" · [/dim]"
 
         src_name = _short_source(fr.source_file)
         ts_range = f"{_fmt_timestamp(fr_display['start_time'])} – {_fmt_timestamp(fr_display['end_time'])}"
         console.print(
-            f"  [bold]Fragment {current_idx + 1}/{total}[/bold]  [dim]·[/dim]  {src_name}  [dim]·[/dim]  {ts_range}{bookmark_ind}{note_ind}"
+            f"  {search_badge}[bold]Fragment {current_idx + 1}/{total}[/bold]  [dim]·[/dim]  {src_name}  [dim]·[/dim]  {ts_range}{bookmark_ind}{note_ind}{pin_ind}"
         )
 
-        # Progress bar — build with rich.text.Text so █░ are treated as plain
-        # chars and Rich never sees them as markup tags.  No [ ] brackets.
+        # Progress bar
         max_end_time = _get_max_end_time(fr.transcription_id)
         if max_end_time > 0:
             progress = min(1.0, max(0.0, fr_display["start_time"] / max_end_time))
@@ -2761,10 +3011,22 @@ def _open_fragment_reader(
             from rich.text import Text as _T
             _bar = _T()
             _bar.append("  ")
-            _bar.append(bar_chars)          # plain — no markup interpretation
+            _bar.append(bar_chars)
             _bar.append("  ")
             _bar.append(pos_str, style="dim")
             console.print(_bar)
+
+        if status_toast:
+            console.print(f"  {status_toast}")
+
+        if show_answer and state and active_seq in state.search_results:
+            ans = getattr(state.search_results[active_seq], "answer", None)
+            if ans:
+                from rich.panel import Panel
+                ans_snippet = ans.strip()
+                if len(ans_snippet.splitlines()) > 8:
+                    ans_snippet = "\n".join(ans_snippet.splitlines()[:8]) + "\n[dim]... (A to toggle)[/dim]"
+                console.print(Panel(ans_snippet, title=f"[bold]S{active_seq} Synthesis[/bold]", border_style="cyan", padding=(0, 1)))
 
         console.print()
         console.rule("earlier", style="dim", characters="\u2500")
@@ -2772,7 +3034,6 @@ def _open_fragment_reader(
 
         cols = shutil.get_terminal_size().columns
         wrap_width = max(40, cols - 8)
-        # Indent for hanging timestamp ("  00:00:00   " = 14 chars)
         ts_prefix_len = 14
         text_wrap_width = max(30, wrap_width - ts_prefix_len)
         hanging_indent = " " * ts_prefix_len
@@ -2786,14 +3047,13 @@ def _open_fragment_reader(
             console.print(first)
             for extra in lines[1:]:
                 console.print(f"  [dim]{hanging_indent}{extra}[/dim]")
-            console.print()  # blank line between each context segment
+            console.print()
 
         console.rule(style="bold white", characters="\u2550")
 
         # ── Active fragment ──────────────────────────────────────────────────
         current_text = textwrap.fill(fr_display["text"], width=wrap_width)
         ts_label     = f"[bold cyan]\u25b6 {_fmt_timestamp(fr_display['start_time'])}[/bold cyan]"
-        # Right-align source name on the same line as the ▶ timestamp
         src_padded   = src_name.rjust(max(0, wrap_width - len(_fmt_timestamp(fr_display['start_time'])) - 4))
         console.print(f"  {ts_label}  [dim]{src_padded}[/dim]")
         console.print(f"{textwrap.indent(current_text, '     ')}\n")
@@ -2815,20 +3075,22 @@ def _open_fragment_reader(
             console.print(f"  [dim]{ts}   {lines[0]}[/dim]")
             for extra in lines[1:]:
                 console.print(f"  [dim]{hanging_indent}{extra}[/dim]")
-            console.print()  # blank line between each context segment
+            console.print()
 
         console.rule("later", style="dim", characters="\u2500")
 
         console.print()
-        # Action bar — key letters dim-highlighted so they stand out against descriptions
         console.print(
             "  [dim]P[/dim] play  [dim]\u00b7[/dim]  "
-            "[dim]B[/dim] bookmark  [dim]\u00b7[/dim]  "
-            "[dim]N[/dim] note  [dim]\u00b7[/dim]  "
-            "[dim]Y[/dim] yank  [dim]\u00b7[/dim]  "
-            "[dim]H/L[/dim] scroll  [dim]\u00b7[/dim]  "
-            "[dim]J/K[/dim] fragments  [dim]\u00b7[/dim]  "
-            "[dim]R[/dim] related  [dim]\u00b7[/dim]  "
+            "[dim]Space[/dim] pause  [dim]\u00b7[/dim]  "
+            "[dim]N/B[/dim] hits  [dim]·[/dim]  "
+            "[dim]H/L[/dim] timeline  [dim]·[/dim]  "
+            "[dim]1–9[/dim] jump  [dim]·[/dim]  "
+            "[dim]Tab[/dim] search  [dim]·[/dim]  "
+            "[dim]B[/dim] mark  [dim]·[/dim]  "
+            "[dim]N[/dim] note  [dim]·[/dim]  "
+            "[dim]*[/dim] pin  [dim]·[/dim]  "
+            "[dim]:[/dim] cmd  [dim]·[/dim]  "
             "[dim]Q[/dim] back"
         )
 
@@ -2837,50 +3099,114 @@ def _open_fragment_reader(
         except (KeyboardInterrupt, EOFError):
             break
 
+        status_toast = ""
+
         if key in ("q", "Q", "\x1b", "\x03"):
-            # \x03 = Ctrl-C in raw mode (termios setraw returns the byte, not an exception)
             break
-        elif key in ("p", "P"):
+        elif key in ("p", "P", "\r", "\n"):
+            _play_at(fr_display["start_time"], fr)
+        elif key == " ":
             try:
                 from audiobench.daemon.factory import get_daemon_client
                 client = get_daemon_client()
-                rec = repo.get_by_id(fr.transcription_id)
-                if rec and rec.get("file_path"):
-                    client.playback_play(
-                        rec["file_path"],
-                        start_pos=fr_display["start_time"],
-                        audio_file_id=rec.get("audio_file_id"),
-                        transcription_id=fr.transcription_id,
-                    )
-            except Exception:
-                pass
-        elif key in ("h", "H", "\x1b[D"):
+                st = client.playback_status()
+                is_active = bool(st and (st.get("playing") or st.get("state") in ("playing", "paused")))
+                is_paused = bool(st and st.get("paused"))
+
+                if is_active and not is_paused:
+                    client.playback_pause()
+                    status_toast = "[yellow][||] Paused[/yellow]"
+                elif is_active and is_paused:
+                    client.playback_resume()
+                    cur_pos = float(st.get("position", 0.0))
+                    status_toast = f"[green]> Resumed @ {_fmt_timestamp(cur_pos)}[/green]"
+                else:
+                    _play_at(fr_display["start_time"], fr)
+            except Exception as exc:
+                status_toast = f"[red][!] Playback error: {exc}[/red]"
+        elif key in ("n", "]", "k"):
+            if current_idx < total - 1:
+                was_playing = _is_playing()
+                current_idx += 1
+                viewport_offset = 0
+                if was_playing:
+                    _play_at(fragments[current_idx].start_time, fragments[current_idx])
+            else:
+                status_toast = "[dim]Already at last fragment[/dim]"
+        elif key in ("b", "[", "j"):
+            if current_idx > 0:
+                was_playing = _is_playing()
+                current_idx -= 1
+                viewport_offset = 0
+                if was_playing:
+                    _play_at(fragments[current_idx].start_time, fragments[current_idx])
+            else:
+                status_toast = "[dim]Already at first fragment[/dim]"
+        elif key.isdigit() and len(key) == 1 and 1 <= int(key) <= total:
+            target_idx = int(key) - 1
+            was_playing = _is_playing()
+            current_idx = target_idx
+            viewport_offset = 0
+            if was_playing:
+                _play_at(fragments[current_idx].start_time, fragments[current_idx])
+            else:
+                status_toast = f"[dim]Jumped to fragment {current_idx + 1}/{total}[/dim]"
+        elif key in ("h", "H", "\x1b[D", "\x1b[A"):
             new_vp = viewport_offset - 1
             if new_vp < 0:
-                # Would we be asking for a prev_seg that doesn't exist?
                 check_idx = abs(new_vp) - 1
                 if not prev_segs or check_idx >= len(prev_segs):
-                    # Already at the earliest segment — nothing to show, skip re-render
                     continue
             viewport_offset = new_vp
-        elif key in ("l", "L", "\x1b[C"):
+        elif key in ("l", "L", "\x1b[C", "\x1b[B"):
             new_vp = viewport_offset + 1
             if new_vp > 0:
                 check_idx = new_vp - 1
                 if not next_segs or check_idx >= len(next_segs):
-                    # Already at the latest segment — nothing to show, skip re-render
                     continue
             viewport_offset = new_vp
-        elif key in ("j", "J"):
-            current_idx = max(0, current_idx - 1)
-            viewport_offset = 0
-        elif key in ("k", "K"):
-            current_idx = min(total - 1, current_idx + 1)
-            viewport_offset = 0
-        elif key in ("n", "N"):
+        elif key in ("\t", "}", ">"):
+            if state and state.search_results and len(available_seqs) > 1:
+                cur_pos = available_seqs.index(active_seq) if active_seq in available_seqs else 0
+                next_seq = available_seqs[(cur_pos + 1) % len(available_seqs)]
+                if next_seq in state.search_results and state.search_results[next_seq].sources:
+                    was_playing = _is_playing()
+                    active_seq = next_seq
+                    fragments = list(state.search_results[active_seq].sources)
+                    total = len(fragments)
+                    current_idx = 0
+                    viewport_offset = 0
+                    status_toast = f"[cyan]Switched to S{active_seq}[/cyan]"
+                    if was_playing and fragments:
+                        _play_at(fragments[0].start_time, fragments[0])
+        elif key in ("\x1b[Z", "{", "<"):
+            if state and state.search_results and len(available_seqs) > 1:
+                cur_pos = available_seqs.index(active_seq) if active_seq in available_seqs else 0
+                prev_seq = available_seqs[(cur_pos - 1) % len(available_seqs)]
+                if prev_seq in state.search_results and state.search_results[prev_seq].sources:
+                    was_playing = _is_playing()
+                    active_seq = prev_seq
+                    fragments = list(state.search_results[active_seq].sources)
+                    total = len(fragments)
+                    current_idx = 0
+                    viewport_offset = 0
+                    status_toast = f"[cyan]Switched to S{active_seq}[/cyan]"
+                    if was_playing and fragments:
+                        _play_at(fragments[0].start_time, fragments[0])
+        elif key == "N":
             _write_note(console, fr_display, audio_file_id, src_name)
-        elif key in ("b", "B"):
+        elif key == "B":
             _toggle_bookmark(fr_display, fr.transcription_id, console)
+        elif key in ("*", "f", "F"):
+            if state:
+                if fr.segment_id in state.pinned_fragments:
+                    del state.pinned_fragments[fr.segment_id]
+                    state.pinned_expr_ids.discard(fr.segment_id)
+                    status_toast = "[dim]Unpinned fragment[/dim]"
+                else:
+                    state.pinned_fragments[fr.segment_id] = fr
+                    state.pinned_expr_ids.add(fr.segment_id)
+                    status_toast = "[yellow][PIN] Pinned fragment for synthesis[/yellow]"
         elif key in ("y", "Y"):
             _yank_to_clipboard(fr_display["text"], console)
         elif key in ("r", "R"):
@@ -2890,6 +3216,72 @@ def _open_fragment_reader(
                 exclude_ids.add(new_hit.segment_id)
                 current_idx = len(fragments) - 1
                 viewport_offset = 0
+        elif key in ("a", "A"):
+            show_answer = not show_answer
+        elif key == ":":
+            console.print()
+            try:
+                cmd_str = input("  :").strip()
+            except (KeyboardInterrupt, EOFError):
+                cmd_str = ""
+            if cmd_str:
+                parts = cmd_str.split()
+                cmd = parts[0].lower()
+                if cmd.startswith("s") and cmd[1:].isdigit():
+                    target_s = int(cmd[1:])
+                    if state and target_s in state.search_results and state.search_results[target_s].sources:
+                        was_playing = _is_playing()
+                        active_seq = target_s
+                        fragments = list(state.search_results[active_seq].sources)
+                        total = len(fragments)
+                        current_idx = 0
+                        viewport_offset = 0
+                        status_toast = f"[cyan]Switched to S{active_seq}[/cyan]"
+                        if was_playing and fragments:
+                            _play_at(fragments[0].start_time, fragments[0])
+                    else:
+                        status_toast = f"[yellow]Search S{target_s} not found[/yellow]"
+                elif cmd in ("play", "p"):
+                    if len(parts) > 1:
+                        from audiobench.playback.controls import _parse_timestamp
+                        ts_sec = _parse_timestamp(parts[1])
+                        if ts_sec is not None:
+                            _play_at(ts_sec, fr)
+                    else:
+                        _play_at(fr_display["start_time"], fr)
+                elif cmd in ("pause", "stop"):
+                    try:
+                        from audiobench.daemon.factory import get_daemon_client
+                        client = get_daemon_client()
+                        client.playback_pause()
+                        status_toast = "[yellow][||] Paused[/yellow]"
+                    except Exception as e:
+                        status_toast = f"[red]Error: {e}[/red]"
+                elif cmd in ("speed", "sp") and len(parts) > 1:
+                    try:
+                        spd = float(parts[1])
+                        from audiobench.daemon.factory import get_daemon_client
+                        client = get_daemon_client()
+                        client.playback_speed(spd)
+                        status_toast = f"[green]Speed set to {spd}x[/green]"
+                    except Exception as e:
+                        status_toast = f"[red]Speed error: {e}[/red]"
+                elif cmd in ("pin", "star"):
+                    if state:
+                        if fr.segment_id in state.pinned_fragments:
+                            del state.pinned_fragments[fr.segment_id]
+                            state.pinned_expr_ids.discard(fr.segment_id)
+                            status_toast = "[dim]Unpinned fragment[/dim]"
+                        else:
+                            state.pinned_fragments[fr.segment_id] = fr
+                            state.pinned_expr_ids.add(fr.segment_id)
+                            status_toast = "[yellow][PIN] Pinned fragment[/yellow]"
+                elif cmd in ("help", "?"):
+                    status_toast = "[dim]Commands: :s<n>, :play [ts], :pause, :speed <x>, :pin, :help[/dim]"
+                else:
+                    status_toast = f"[yellow]Unknown command: {cmd_str}[/yellow]"
+
+    return active_seq or 1
 
 def _replay_session_history(state: SearchSessionState) -> Optional["ResearchResult"]:
     """Replay all prior searches exactly as they appeared — full results, full synthesis.
@@ -3035,6 +3427,7 @@ def _replay_session_history(state: SearchSessionState) -> Optional["ResearchResu
         console.print()
 
         _display_results(result, state)
+        state.search_results[q.sequence_num] = result
 
         state.search_count = real_count  # restore
 
@@ -3049,6 +3442,182 @@ def _replay_session_history(state: SearchSessionState) -> Optional["ResearchResu
     console.print()
     
     return result if 'result' in locals() else None
+
+
+def _show_search_thread_navigator(
+    console: Console,
+    threads: list[dict],
+    query_title: str | None = None,
+    current_seq: int | None = None,
+    session_id: int | None = None,
+    repo: Any | None = None,
+) -> int | None | tuple[None, str] | str:
+    """Show interactive thread navigator for a search session.
+
+    Returns:
+        int: Conversation ID to resume.
+        None: Start a new thread (auto-named).
+        tuple[None, str]: Start a new thread with custom title.
+        'CANCEL': User cancelled / Ctrl+C.
+    """
+    while True:
+        console.print()
+        session_label = f"Session #{session_id}" if session_id else "Search Session"
+        console.print(f"  [bold]Chat threads · {session_label}[/bold]")
+        console.print(f"  [dim]{'─' * 56}[/dim]")
+        for i, th in enumerate(threads, 1):
+            ts = th.get("updated_at", "")
+            ts_str = ts[:16].replace("T", " ") if ts else ""
+
+            # Format step tag: if title already has [S#], use it; else if sequence_num is known, prepend [S{seq}]
+            seq_num = th.get("sequence_num")
+            title = th.get("title", "Untitled Chat")
+            if seq_num and not title.startswith("[S"):
+                display_title = f"[S{seq_num}] {title}"
+            else:
+                display_title = title
+
+            console.print(
+                f"    [cyan][{i}][/cyan]  [dim]#{th['id']}[/dim]  [bold]{display_title}[/bold]  "
+                f"[dim]· {th.get('message_count', 0)} msgs · {ts_str}[/dim]"
+            )
+            q_text = th.get("query_text")
+            if q_text:
+                preview = q_text[:70] + ("…" if len(q_text) > 70 else "")
+                console.print(f"        [dim]↳ from: \"{preview}\"[/dim]")
+
+        new_label = f"for S{current_seq}" if current_seq else ""
+        console.print(f"    [cyan][N][/cyan]  Start a new thread {new_label} [dim](or N <title>)[/dim]")
+        console.print()
+
+        try:
+            raw_input = input(f"  Choose [1-{len(threads)} or N] (default: 1): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print()
+            return "CANCEL"
+
+        if not raw_input:
+            return threads[0]["id"]
+
+        choice_upper = raw_input.upper()
+        if choice_upper == "1":
+            return threads[0]["id"]
+        if choice_upper == "N":
+            return None
+        if choice_upper.startswith("N ") or choice_upper.startswith("N:"):
+            custom_title = raw_input[2:].strip()
+            return (None, custom_title) if custom_title else None
+
+        # Inline renaming: R <idx> [new title]
+        if choice_upper.startswith("R"):
+            r_parts = raw_input.split(maxsplit=2)
+            target_idx = None
+            if len(r_parts) >= 2 and r_parts[1].isdigit():
+                idx_val = int(r_parts[1])
+                if 1 <= idx_val <= len(threads):
+                    target_idx = idx_val - 1
+            elif len(r_parts) == 1 and len(threads) == 1:
+                target_idx = 0
+
+            if target_idx is not None:
+                th_to_rename = threads[target_idx]
+                if len(r_parts) >= 3:
+                    new_title = r_parts[2].strip()
+                else:
+                    try:
+                        new_title = input(f"  New title for thread #{th_to_rename['id']} [{th_to_rename['title']}]: ").strip()
+                    except (KeyboardInterrupt, EOFError):
+                        return "CANCEL"
+                if new_title:
+                    th_to_rename["title"] = new_title
+                    if repo:
+                        try:
+                            repo.update_title(th_to_rename["id"], new_title)
+                            console.print(f"  [green]✓ Renamed thread #{th_to_rename['id']} to: {new_title}[/green]")
+                        except Exception as e:
+                            console.print(f"  [red]Failed to rename: {e}[/red]")
+                    continue
+
+        if choice_upper.isdigit() and 1 <= int(choice_upper) <= len(threads):
+            return threads[int(choice_upper) - 1]["id"]
+        if choice_upper.startswith("#") and choice_upper[1:].isdigit():
+            target_id = int(choice_upper[1:])
+            match = next((t for t in threads if t["id"] == target_id), None)
+            if match:
+                return match["id"]
+        return None
+
+
+def _open_search_chat(
+    console: Console,
+    result: "ResearchResult",
+    state: SearchSessionState,
+) -> None:
+    """Open a chat session from search results with thread navigator support."""
+    from audiobench.chat.chat_repl import ChatREPL
+    from audiobench.chat.chat_store import ChatRepository
+
+    repo = ChatRepository()
+    threads = (
+        repo.get_threads_for_search_session(state.session_id)
+        if state.session_id > 0
+        else []
+    )
+
+    resume_id = None
+    custom_title = None
+    fragments_to_inject = result.sources
+    preloaded_answer = result.answer
+    current_seq = state.search_count if state.search_count > 0 else 1
+
+    if threads:
+        nav_choice = _show_search_thread_navigator(
+            console,
+            threads,
+            query_title=result.query,
+            current_seq=current_seq,
+            session_id=state.session_id if state.session_id > 0 else None,
+            repo=repo,
+        )
+        if nav_choice == "CANCEL":
+            return
+        if isinstance(nav_choice, tuple):
+            resume_id = None
+            custom_title = nav_choice[1]
+        elif nav_choice is not None:
+            # Resuming an existing thread
+            resume_id = nav_choice
+            fragments_to_inject = None
+            preloaded_answer = None
+
+    # Step-tagged title
+    seq_tag = f"[S{current_seq}] " if current_seq else ""
+    if custom_title:
+        init_title = f"{seq_tag}{custom_title}" if not custom_title.startswith("[S") else custom_title
+        has_custom_title = True
+    else:
+        init_title = f"{seq_tag}{result.query}"
+        has_custom_title = False
+
+    query_id = getattr(result, "query_id", None)
+
+    repl = ChatREPL(
+        session_type="search_followup",
+        preloaded_fragments=fragments_to_inject,
+        preloaded_query=result.query,
+        preloaded_title=init_title,
+        preloaded_answer=preloaded_answer,
+        resume_id=resume_id,
+        search_session_id=state.session_id if state.session_id > 0 else None,
+        search_query_id=query_id if resume_id is None else None,
+        custom_title=has_custom_title,
+    )
+    repl.run()
+
+    if repl.session and repl.session.conversation_id:
+        conv_id = repl.session.conversation_id
+        if conv_id not in state.linked_chat_ids:
+            state.linked_chat_ids.append(conv_id)
 
 
 def _run_search_loop(
@@ -3107,8 +3676,10 @@ def _run_search_loop(
                     return
 
                 # ── Sentinel from keybinding (buffer was empty when key pressed) ─
-                if choice.startswith("\x00"):
-                    sentinel = choice[1:].upper()
+                is_sentinel = choice.startswith("\x00")
+                is_single_cmd = len(choice) == 1 and choice.upper() in ("Q", "S", "V")
+                if is_sentinel or is_single_cmd:
+                    sentinel = choice[1:].upper() if is_sentinel else choice.upper()
                     if sentinel == "Q":
                         if state.session_id >= 0:
                             try:
@@ -3117,11 +3688,36 @@ def _run_search_loop(
                             except Exception:
                                 pass
                         return
+                    if sentinel == "V":
+                        from audiobench.chat.voice_session import capture_voice_query
+                        captured, is_fallback = capture_voice_query(
+                            console=console,
+                            silence_timeout=5.0,
+                            prompt_message="Listening for memory query... (speak now, 5s silence or Enter to submit)",
+                        )
+                        if captured:
+                            query = captured
+                            console.print(f"  [cyan][Voice][/cyan] Query: [bold]{query}[/bold]")
+                            break
+                        continue
                     # S in outer loop: user wants to start a new search — just
                     # fall through to the next prompt iteration (buffer empty)
                     continue
 
                 if not choice:
+                    continue
+
+                if choice.lower() in ("/voice", "/v"):
+                    from audiobench.chat.voice_session import capture_voice_query
+                    captured, is_fallback = capture_voice_query(
+                        console=console,
+                        silence_timeout=5.0,
+                        prompt_message="Listening for memory query... (speak now, 5s silence or Enter to submit)",
+                    )
+                    if captured:
+                        query = captured
+                        console.print(f"  [cyan][Voice][/cyan] Query: [bold]{query}[/bold]")
+                        break
                     continue
 
                 if choice.startswith("/"):
@@ -3215,6 +3811,10 @@ def _run_search_loop(
                     logger.warning("Failed to persist search query: %s", e)
 
             _display_results(result, state)
+            state.search_results[seq] = result
+
+            if getattr(state, "speak_answer", False) and result.answer and not result.synthesis_failed:
+                _speak_text(result.answer)
 
         if not result.sources:
             result = None
@@ -3231,24 +3831,42 @@ def _run_search_loop(
                 _layout_badge = f" · {getattr(state, 'layout', 'book')}"
                 session_tag = f"S{state.search_count} · #{state.session_id} · {state.preset}{_layout_badge}"
 
+            chat_count = len(state.linked_chat_ids)
+            if not chat_count and state.session_id > 0:
+                try:
+                    from audiobench.chat.chat_store import ChatRepository
+                    threads = ChatRepository().get_threads_for_search_session(state.session_id)
+                    chat_count = len(threads)
+                    state.linked_chat_ids = [t["id"] for t in threads]
+                except Exception:
+                    pass
+            c_tag = f"[bold]C[/bold] chat ({chat_count})" if chat_count else "[bold]C[/bold] chat"
+            c_plain = f"C chat ({chat_count})" if chat_count else "C chat"
+
             bar_left = (
                 f"  [bold white]{session_tag}[/bold white]  "
-                "[dim]·  [bold]1–9[/bold] peek  ·  "
+                "[dim]·  [bold]1–9[/bold] play  ·  "
+                "[bold]A[/bold] speak answer  ·  "
+                "[bold]V[/bold] voice  ·  "
+                "[bold]Space[/bold] pause  ·  "
                 "[bold]E[/bold] reader  ·  "
                 "[bold]S[/bold] search  ·  "
-                "[bold]C[/bold] chat  ·  "
+                f"{c_tag}  ·  "
                 "[bold]Q[/bold] quit[/dim]"
             ) if session_tag else (
-                "  [dim][bold]1–9[/bold] peek  ·  "
+                "  [dim][bold]1–9[/bold] play  ·  "
+                "[bold]A[/bold] speak answer  ·  "
+                "[bold]V[/bold] voice  ·  "
+                "[bold]Space[/bold] pause  ·  "
                 "[bold]E[/bold] reader  ·  "
                 "[bold]S[/bold] search  ·  "
-                "[bold]C[/bold] chat  ·  "
+                f"{c_tag}  ·  "
                 "[bold]Q[/bold] quit[/dim]"
             )
             bar_left_plain = (
-                f"  {session_tag}  ·  1–9 peek  ·  E reader  ·  S search  ·  C chat  ·  Q quit"
+                f"  {session_tag}  ·  1–9 play  ·  A speak answer  ·  V voice  ·  Space pause  ·  E reader  ·  S search  ·  {c_plain}  ·  Q quit"
                 if session_tag else
-                "  1–9 peek  ·  E reader  ·  S search  ·  C chat  ·  Q quit"
+                f"  1–9 play  ·  A speak answer  ·  V voice  ·  Space pause  ·  E reader  ·  S search  ·  {c_plain}  ·  Q quit"
             )
 
             last_q = state.search_query_texts.get(state.search_count, "")
@@ -3269,9 +3887,13 @@ def _run_search_loop(
                 console.print()
                 return
 
-            # ── Sentinel dispatch (buffer was empty, keybinding fired) ─────────
-            if choice.startswith("\x00"):
-                sentinel = choice[1:].upper()
+            # ── Sentinel dispatch (keybinding fired or single-letter action) ─────────
+            is_sentinel = choice.startswith("\x00")
+            is_single_action = len(choice) == 1 and choice.upper() in (
+                "Q", "E", "C", "S", "A", "V", "1", "2", "3", "4", "5", "6", "7", "8", "9"
+            )
+            if is_sentinel or is_single_action:
+                sentinel = choice[1:].upper() if is_sentinel else choice.upper()
 
                 if sentinel == "Q":
                     if state.session_id >= 0:
@@ -3282,19 +3904,43 @@ def _run_search_loop(
                             pass
                     return
 
+                if sentinel == "A":
+                    if result and result.answer:
+                        _speak_text(result.answer)
+                    elif state and state.last_synthesis:
+                        _speak_text(state.last_synthesis)
+                    else:
+                        console.print("  [yellow]No synthesis answer to speak.[/yellow]")
+                    continue
+
+                if sentinel == "V":
+                    from audiobench.chat.voice_session import capture_voice_query
+                    captured, is_fallback = capture_voice_query(
+                        console=console,
+                        silence_timeout=5.0,
+                        prompt_message="Listening for memory query... (speak now, 5s silence or Enter to submit)",
+                    )
+                    if captured:
+                        query = captured
+                        console.print(f"  [cyan][Voice][/cyan] Query: [bold]{query}[/bold]")
+                        result = None
+                        break
+                    continue
+
                 if sentinel == "E":
-                    _open_fragment_reader(console, result.sources, initial_idx=0)
+                    chosen_seq = _open_fragment_reader(console, state=state, active_seq=state.search_count, initial_idx=0)
+                    if chosen_seq and state and chosen_seq in state.search_results:
+                        result = state.search_results[chosen_seq]
+                        query = result.query
+                    console.clear()
+                    _display_results(result, state)
                     continue
 
                 if sentinel == "C":
-                    from audiobench.chat.chat_repl import ChatREPL
-                    repl = ChatREPL(
-                        session_type="search_followup",
-                        preloaded_fragments=result.sources,
-                        preloaded_title=f"🔍 Search: {result.query}",
-                    )
-                    repl.run()
-                    return
+                    _open_search_chat(console, result, state)
+                    console.clear()
+                    _display_results(result, state)
+                    continue
 
                 if sentinel == "S":
                     # S with empty buffer → start a fresh new search
@@ -3302,21 +3948,97 @@ def _run_search_loop(
                     result = None
                     break
 
-                if sentinel.isdigit():
-                    n_str = sentinel
-                    # peek for a second digit already in the sentinel (shouldn't
-                    # happen with current keybindings but defensive)
+                if sentinel == "SPACE":
                     try:
-                        n = int(n_str)
+                        from audiobench.daemon.factory import get_daemon_client
+                        client = get_daemon_client()
+                        st = client.playback_status()
+                        is_active = bool(st and (st.get("playing") or st.get("state") in ("playing", "paused")))
+                        is_paused = bool(st and st.get("paused"))
+
+                        if is_active and not is_paused:
+                            client.playback_pause()
+                            console.print("  [yellow][||] Playback paused[/yellow]")
+                        elif is_active and is_paused:
+                            client.playback_resume()
+                            cur_pos = float(st.get("position", 0.0))
+                            console.print(f"  [green]> Resumed playback at {_fmt_timestamp(cur_pos)}[/green]")
+                        elif result and result.sources:
+                            fr = result.sources[0]
+                            file_p, af_id = _resolve_audio_path(fr)
+                            client.playback_play(
+                                file_p,
+                                start_pos=fr.start_time,
+                                audio_file_id=af_id,
+                                transcription_id=fr.transcription_id,
+                            )
+                            src_lbl = _short_source(fr.source_file)
+                            console.print(
+                                f"  [green]> Playing citation [1][/green] {src_lbl} "
+                                f"({_fmt_timestamp(fr.start_time)})  [dim]· Space:pause · E:reader[/dim]"
+                            )
+                        else:
+                            console.print("  [dim]No audio to play[/dim]")
+                    except Exception as exc:
+                        console.print(f"  [yellow]Playback error: {exc}[/yellow]")
+                    continue
+
+                if sentinel in ("NEXT", "PREV"):
+                    if result and result.sources:
+                        try:
+                            from audiobench.daemon.factory import get_daemon_client
+                            from audiobench.playback.controls import find_next_timestamp, find_prev_timestamp
+                            client = get_daemon_client()
+                            st = client.playback_status() or {}
+                            cur_pos = float(st.get("position") or 0.0)
+                            ts_list = [(f"[{i+1}]", s.start_time) for i, s in enumerate(result.sources)]
+                            target = find_next_timestamp(ts_list, cur_pos) if sentinel == "NEXT" else find_prev_timestamp(ts_list, cur_pos)
+                            if target:
+                                lbl, target_pos = target
+                                match_fr = next((s for s in result.sources if abs(s.start_time - target_pos) < 0.1), result.sources[0])
+                                file_p, af_id = _resolve_audio_path(match_fr)
+                                client.playback_play(
+                                    file_p,
+                                    start_pos=target_pos,
+                                    audio_file_id=af_id,
+                                    transcription_id=match_fr.transcription_id,
+                                    )
+                                console.print(f"  [green]> Seek to {lbl} ({_fmt_timestamp(target_pos)})[/green]")
+                            else:
+                                console.print("[dim]No more citations in this direction[/dim]")
+                        except Exception as exc:
+                            console.print(f"  [yellow]Playback error: {exc}[/yellow]")
+                    continue
+
+                if sentinel.isdigit():
+                    try:
+                        n = int(sentinel)
                     except ValueError:
                         n = -1
                     if 1 <= n <= len(result.sources):
-                        _show_citation_card(n, result.sources[n - 1], result.sources)
+                        fr = result.sources[n - 1]
+                        file_p, af_id = _resolve_audio_path(fr)
+                        try:
+                            from audiobench.daemon.factory import get_daemon_client
+                            client = get_daemon_client()
+                            client.playback_play(
+                                file_p,
+                                start_pos=fr.start_time,
+                                audio_file_id=af_id,
+                                transcription_id=fr.transcription_id,
+                            )
+                            src_lbl = _short_source(fr.source_file)
+                            console.print(
+                                f"  [green]> Playing citation [{n}][/green] {src_lbl} "
+                                f"({_fmt_timestamp(fr.start_time)})  [dim]· Space:pause · E:reader[/dim]"
+                            )
+                        except Exception as exc:
+                            console.print(f"  [yellow]Playback error: {exc}[/yellow]")
                     else:
                         hi = len(result.sources)
                         console.print(
-                            f"[dim]Fragment {n} out of range — "
-                            f"{hi} fragment{'s' if hi != 1 else ''} available (1–{hi}).[/dim]"
+                            f"[dim]Citation {n} out of range — "
+                            f"{hi} citation{'s' if hi != 1 else ''} available (1–{hi}).[/dim]"
                         )
                     continue
 
@@ -3329,6 +4051,20 @@ def _run_search_loop(
                 continue
 
             # ── Slash commands ────────────────────────────────────────────────
+            if choice.lower() in ("/voice", "/v"):
+                from audiobench.chat.voice_session import capture_voice_query
+                captured, is_fallback = capture_voice_query(
+                    console=console,
+                    silence_timeout=5.0,
+                    prompt_message="Listening for memory query... (speak now, 5s silence or Enter to submit)",
+                )
+                if captured:
+                    query = captured
+                    console.print(f"  [cyan][Voice][/cyan] Query: [bold]{query}[/bold]")
+                    result = None
+                    break
+                continue
+
             if choice.startswith("/"):
                 query_parts = choice.split(maxsplit=1)
                 if (
@@ -3495,6 +4231,7 @@ def _run_search_loop(
                     logger.warning("Failed to persist search query: %s", e)
 
             _display_results(result, state)
+            state.search_results[seq] = result
 
         if not result.sources:
             result = None
@@ -3503,7 +4240,7 @@ def _run_search_loop(
 
         # Inner loop — single-key dispatch.
         # _read_single_key() captures one keystroke without waiting for Enter,
-        # so digit presses (citation peek), E, S, C, Q all fire immediately.
+        # so digit presses (citation play), Space, E, S, C, Q all fire immediately.
         # When the user starts typing a query or slash command the first char is
         while True:
             # ── Action Bar Dock ──────────────────────────────────────────────
@@ -3517,22 +4254,24 @@ def _run_search_loop(
 
             bar_left = (
                 f"  [bold white]{session_tag}[/bold white]  "
-                "[dim]·  [bold]1–9[/bold] peek  ·  "
+                "[dim]·  [bold]1–9[/bold] play  ·  "
+                "[bold]Space[/bold] pause  ·  "
                 "[bold]E[/bold] reader  ·  "
                 "[bold]S[/bold] search  ·  "
                 "[bold]C[/bold] chat  ·  "
                 "[bold]Q[/bold] quit[/dim]"
             ) if session_tag else (
-                "  [dim][bold]1–9[/bold] peek  ·  "
+                "  [dim][bold]1–9[/bold] play  ·  "
+                "[bold]Space[/bold] pause  ·  "
                 "[bold]E[/bold] reader  ·  "
                 "[bold]S[/bold] search  ·  "
                 "[bold]C[/bold] chat  ·  "
                 "[bold]Q[/bold] quit[/dim]"
             )
             bar_left_plain = (
-                f"  {session_tag}  ·  1–9 peek  ·  E reader  ·  S search  ·  C chat  ·  Q quit"
+                f"  {session_tag}  ·  1–9 play  ·  Space pause  ·  E reader  ·  S search  ·  C chat  ·  Q quit"
                 if session_tag else
-                "  1–9 peek  ·  E reader  ·  S search  ·  C chat  ·  Q quit"
+                "  1–9 play  ·  Space pause  ·  E reader  ·  S search  ·  C chat  ·  Q quit"
             )
 
             last_q = state.search_query_texts.get(state.search_count, "")
@@ -3546,15 +4285,9 @@ def _run_search_loop(
             else:
                 bar_content = bar_left
 
-            # ── Measure rendered height to survive scrolling ──────────────────
-            # If the terminal is at the bottom, printing the citation card causes
-            # the screen to scroll up. Absolute save/restore (\033[s / \033[u)
-            # fails because the saved row is now wrong.
-            # Instead, we measure exactly how many lines the bar + prompt take,
-            # and use relative cursor-up (\033[{N}A) which is immune to scrolling.
             with console.capture() as _cap:
                 console.print(bar_content)
-                console.print("  › 1")  # Simulate prompt + a typed digit
+                console.print("  › 1")
             _prompt_lines = _cap.get().count("\n")
 
             console.print(bar_content)
@@ -3579,18 +4312,48 @@ def _run_search_loop(
                     _display_results(result, state)
                 continue
 
+            # ── Space (toggle pause/resume) ───────────────────────────────────
+            if first == " ":
+                try:
+                    from audiobench.daemon.factory import get_daemon_client
+                    client = get_daemon_client()
+                    st = client.playback_status()
+                    is_active = bool(st and (st.get("playing") or st.get("state") in ("playing", "paused")))
+                    is_paused = bool(st and st.get("paused"))
+
+                    if is_active and not is_paused:
+                        client.playback_pause()
+                        console.print("  [yellow][||] Playback paused[/yellow]")
+                    elif is_active and is_paused:
+                        client.playback_resume()
+                        cur_pos = float(st.get("position", 0.0))
+                        console.print(f"  [green]> Resumed playback at {_fmt_timestamp(cur_pos)}[/green]")
+                    elif result and result.sources:
+                        fr = result.sources[0]
+                        file_p, af_id = _resolve_audio_path(fr)
+                        client.playback_play(
+                            file_p,
+                            start_pos=fr.start_time,
+                            audio_file_id=af_id,
+                            transcription_id=fr.transcription_id,
+                        )
+                        src_lbl = _short_source(fr.source_file)
+                        console.print(
+                            f"  [green]> Playing citation [1][/green] {src_lbl} "
+                            f"({_fmt_timestamp(fr.start_time)})  [dim]· Space:pause · E:reader[/dim]"
+                        )
+                    else:
+                        console.print("  [dim]No audio to play[/dim]")
+                except Exception as exc:
+                    console.print(f"  [yellow]Playback error: {exc}[/yellow]")
+                continue
+
             # ── Paste detection ───────────────────────────────────────────────
-            # _read_single_key() drains any burst of buffered bytes after the
-            # first char (paste protection).  If `first` is longer than 1 char
-            # the user pasted text; skip single-char command dispatch entirely
-            # and treat the whole string as a query or slash command directly.
             is_paste = len(first) > 1
 
             if not is_paste:
-                # ── Digit → instant citation card, zero Enter needed ──────────
+                # ── Digit → instant citation play, zero Enter needed ──────────
                 if first.isdigit():
-                    # Consume any additional digits (e.g. "10") by trying to peek
-                    # one more raw char; fall back gracefully if not possible.
                     second = ""
                     try:
                         import sys, termios, tty, select
@@ -3603,11 +4366,8 @@ def _run_search_loop(
                                 if c2.isdigit():
                                     second = c2
                                 else:
-                                    # Put it back via the next loop iteration isn't
-                                    # possible, so handle it: if it's Enter, ignore;
-                                    # otherwise treat as a new key next loop.
                                     if c2 not in ("\r", "\n"):
-                                        second = ""   # discard non-digit, non-Enter
+                                        second = ""
                             finally:
                                 termios.tcsetattr(fd, termios.TCSADRAIN, old)
                     except Exception:
@@ -3621,17 +4381,29 @@ def _run_search_loop(
                         n = -1
 
                     if 1 <= n <= len(result.sources):
-                        _show_citation_card(n, result.sources[n - 1], result.sources)
-                        # The card cleanly erased itself and left the cursor on
-                        # the line right after the echoed digit. We move up by
-                        # exactly the measured height of the bar+prompt and clear.
-                        console.file.write(f"\033[{_prompt_lines}A\033[J")
-                        console.file.flush()
+                        fr = result.sources[n - 1]
+                        file_p, af_id = _resolve_audio_path(fr)
+                        try:
+                            from audiobench.daemon.factory import get_daemon_client
+                            client = get_daemon_client()
+                            client.playback_play(
+                                file_p,
+                                start_pos=fr.start_time,
+                                audio_file_id=af_id,
+                                transcription_id=fr.transcription_id,
+                            )
+                            src_lbl = _short_source(fr.source_file)
+                            console.print(
+                                f"  [green]> Playing citation [{n}][/green] {src_lbl} "
+                                f"({_fmt_timestamp(fr.start_time)})  [dim]· Space:pause · E:reader[/dim]"
+                            )
+                        except Exception as exc:
+                            console.print(f"  [yellow]Playback error: {exc}[/yellow]")
                     else:
                         hi = len(result.sources)
                         console.print(
-                            f"[dim]Fragment {n} out of range — "
-                            f"{hi} fragment{'s' if hi != 1 else ''} available (1–{hi}).[/dim]"
+                            f"[dim]Citation {n} out of range — "
+                            f"{hi} citation{'s' if hi != 1 else ''} available (1–{hi}).[/dim]"
                         )
                     continue
 
@@ -3650,19 +4422,20 @@ def _run_search_loop(
 
                 if upper == "E":
                     console.print(first)   # echo before acting
-                    _open_fragment_reader(console, result.sources, initial_idx=0)
+                    chosen_seq = _open_fragment_reader(console, state=state, active_seq=state.search_count, initial_idx=0)
+                    if chosen_seq and state and chosen_seq in state.search_results:
+                        result = state.search_results[chosen_seq]
+                        query = result.query
+                    console.clear()
+                    _display_results(result, state)
                     continue
 
                 if upper == "C":
                     console.print(first)   # echo before acting
-                    from audiobench.chat.chat_repl import ChatREPL
-                    repl = ChatREPL(
-                        session_type="search_followup",
-                        preloaded_fragments=result.sources,
-                        preloaded_title=f"🔍 Search: {result.query}",
-                    )
-                    repl.run()
-                    return
+                    _open_search_chat(console, result, state)
+                    console.clear()
+                    _display_results(result, state)
+                    continue
 
                 if upper == "S":
                     console.print(first)   # echo before acting

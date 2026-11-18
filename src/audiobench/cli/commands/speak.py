@@ -63,7 +63,7 @@ def speak(
 
         init_db()
         repo = TranscriptionRepository()
-        record = repo.get_by_id(transcript_id)
+        record = repo.get_by_id(transcript_id, session=None)
         if not record:
             console.print(error_panel("Not found", f"Transcript #{transcript_id} not found"))
             return

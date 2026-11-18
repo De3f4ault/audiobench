@@ -1,14 +1,14 @@
-from typing import List
 
-def pick_chapters(audio_file_id: int) -> List[int]:
+
+def pick_chapters(audio_file_id: int) -> list[int]:
     """Interactively prompt the user to pick chapters from an audio file.
 
     Returns a list of chapter IDs selected by the user.
     """
+
+    from audiobench.cli.display.theme import console
     from audiobench.core.db_session import get_session
     from audiobench.storage.models import ChapterRecord
-    from audiobench.cli.display.theme import console
-    import re
 
     with get_session() as session:
         chapters = session.query(ChapterRecord).filter_by(audio_file_id=audio_file_id).order_by(ChapterRecord.start_time).all()
@@ -57,9 +57,9 @@ def pick_chapters(audio_file_id: int) -> List[int]:
                         valid = False
                 except ValueError:
                     valid = False
-        
+
         if valid and selected_indices:
             # return the actual chapter DB IDs
             return [chapters[i-1].id for i in sorted(list(selected_indices))]
-        
+
         console.print("[red]Invalid selection. Please try again.[/red]")

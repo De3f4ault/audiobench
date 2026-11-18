@@ -138,7 +138,7 @@ def summarize(
     from audiobench.storage.chapter_repository import get_chapter_repo
 
     chap_repo = get_chapter_repo()
-    record = repo.get_by_id(transcript_id)
+    record = repo.get_by_id(transcript_id, session=None)
     if not record:
         console.print(error_panel("Not found", f"Transcript #{transcript_id} not found"))
         sys.exit(1)
@@ -177,7 +177,7 @@ def summarize(
             )
             sys.exit(1)
 
-        chap_record = repo.get_by_id(chap["transcription_id"])
+        chap_record = repo.get_by_id(chap["transcription_id"], session=None)
         if not chap_record:
             console.print(error_panel("Chapter Not Found", "Chapter transcript is missing."))
             sys.exit(1)
@@ -230,7 +230,7 @@ def summarize(
                 console.print(f"  [{DIM}]Skipping Chapter {i} ({chap.title}) — Not transcribed.[/]")
                 continue
 
-            chap_record = repo.get_by_id(tx_id)
+            chap_record = repo.get_by_id(tx_id, session=None)
             if chap_record:
                 console.print(f"  [{ACCENT}]Summarizing Chapter {i}: {chap.title}[/]")
                 summary_text = _generate_summary(
@@ -289,7 +289,7 @@ def _save_report(
 ) -> None:
     from pathlib import Path
 
-    reports_dir = settings.data_dir / "reports"
+    reports_dir = settings.data_dir / "exports" / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     base_name = Path(record["file_name"]).stem
     report_path = reports_dir / f"{base_name}_summary{suffix}.md"

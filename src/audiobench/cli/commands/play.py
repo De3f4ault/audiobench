@@ -13,7 +13,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import click
@@ -28,23 +27,6 @@ from audiobench.cli.display.theme import (
     console,
     error_panel,
 )
-
-@dataclass
-class PlayState:
-    mode: str                     # 'default' or 'enhanced'
-    karaoke: bool
-    focus_gradient: bool
-    center_lock: bool
-    speaker_badges: bool
-    timestamps: bool
-    show_remaining: bool
-    show_help: bool = False       # True while ? overlay is visible
-    settings_dirty: bool = False  # True when any toggle changed — triggers save on exit
-
-    @property
-    def enhanced(self) -> bool:
-        """True when Enhanced mode is active."""
-        return self.mode == "enhanced"
 
 # ── Engine priority for smart transcript selection ──
 # Higher = preferred. Google transcripts are generally more accurate.
@@ -179,7 +161,31 @@ def _srt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-# ── Lyrics mode (interactive terminal follow) ──────────────
+def _build_atempo_filter(speed: float) -> str:
+    """Build an ffplay -af atempo filter string for the given speed.
+
+    FFmpeg's atempo filter accepts values in [0.5, 2.0] per instance.
+    For speeds outside that range, filters are chained:
+      - Speed < 0.5 → clamped to 0.5 (ffplay lower bound)
+      - Speed > 2.0 → atempo=2.0 repeated, remainder as final filter
+        e.g. 3.0x → "atempo=2.0,atempo=1.500000"
+             4.0x → "atempo=2.0,atempo=2.000000"
+             5.0x → "atempo=2.0,atempo=2.000000,atempo=1.250000"
+
+    Returns the complete comma-joined filter string ready for -af.
+    """
+    clamped = max(0.5, speed)
+    filters: list[str] = []
+    remaining = clamped
+    while remaining > 2.0:
+        filters.append("atempo=2.0")
+        remaining /= 2.0
+    filters.append(f"atempo={remaining:.6f}")
+    return ",".join(filters)
+
+
+
+# ── Lyrics mode → ChapterReaderApp ────────────────────────
 
 
 def _play_with_lyrics(
@@ -193,558 +199,66 @@ def _play_with_lyrics(
     audio_file_id: int | None = None,
     transcription_id: int | None = None,
 ) -> None:
-    """Play audio with interactive controls and synchronized transcript."""
-    import select
-    import termios
-    import tty
+    """Launch ChapterReaderApp for an audio file with synchronized transcript.
 
-    from rich.live import Live
-    from rich.panel import Panel
-    from rich.text import Text
+    Routes through the daemon if available; falls back to an in-process
+    PlaybackService otherwise.  Audio keeps playing after the reader exits.
+    """
+    service = None
 
-    from audiobench.playback import MpvController
-
-    mpv = MpvController()
-
+    # ── Try daemon first ──
     try:
-        mpv.start(
+        from audiobench.daemon.factory import get_daemon_client
+
+        service = get_daemon_client()
+        service.playback_play(  # type: ignore[union-attr]
             str(file_path),
             start_pos=start_seconds,
             speed=speed or 1.0,
-            save_position=resume,  # Only save/restore position with --resume
+            audio_file_id=audio_file_id,
+            transcription_id=transcription_id,
         )
-    except FileNotFoundError:
-        console.print(
-            error_panel(
-                "mpv not found",
-                "Install mpv for interactive lyrics mode:\n"
-                "  Arch: sudo pacman -S mpv\n"
-                "  Ubuntu: sudo apt install mpv\n"
-                "  macOS: brew install mpv",
-            )
+    except Exception:
+        service = None
+
+    # ── Fall back to in-process PlaybackService ──
+    if service is None:
+        from audiobench.playback.service import PlaybackService
+
+        svc = PlaybackService()
+        svc.play(
+            str(file_path),
+            start_pos=start_seconds,
+            speed=speed or 1.0,
+            audio_file_id=audio_file_id,
+            transcription_id=transcription_id,
         )
-        sys.exit(1)
-    except RuntimeError as e:
-        console.print(error_panel("mpv failed to start", str(e)))
-        sys.exit(1)
+        service = svc
 
-    # Wait for mpv to report duration (definitive source of truth)
-    time.sleep(0.3)
-    for _ in range(10):
-        mpv_duration = mpv.get_duration()
-        if mpv_duration > 0:
-            total_duration = mpv_duration
-            break
-        time.sleep(0.1)
-
-    # Track listening for stats
+    # ── Launch reader ──
     listen_start = time.monotonic()
-    listen_start_pos = mpv.get_position()
 
-    # ── Bookmark support ──────────────────────────────────
-    bookmark_repo = None
-    bookmark_flash: str | None = None
-    bookmark_flash_until: float = 0.0
-    region_start: float | None = None
-    last_bookmark_id: int | None = None
+    from audiobench.cli.tui.chapter_reader import open_reader
 
-    if audio_file_id is not None:
-        from audiobench.storage.bookmark_repository import (
-            BOOKMARK_TYPES,
-            BookmarkRepository,
-        )
-        from audiobench.storage.bookmark_repository import (
-            _format_timestamp as _bfmt,
-        )
-
-        bookmark_repo = BookmarkRepository()
-
-    def _set_flash(msg: str) -> None:
-        nonlocal bookmark_flash, bookmark_flash_until
-        bookmark_flash = msg
-        bookmark_flash_until = time.monotonic() + 2.0  # show for 2s
-
-    # cbreak mode: read individual keypresses while preserving output processing
-    # (setraw breaks ANSI escape handling needed by Rich Live)
-    from audiobench.core.settings import get_settings
-    _s = get_settings()
-    state = PlayState(
-        mode=_s.play_mode,
-        karaoke=_s.play_karaoke,
-        focus_gradient=_s.play_focus_gradient,
-        center_lock=_s.play_center_lock,
-        speaker_badges=_s.play_speaker_badges,
-        timestamps=_s.play_timestamps,
-        show_remaining=_s.play_show_remaining,
+    open_reader(
+        service,
+        title=record_name,
+        transcription_id=transcription_id,
+        audio_file_id=audio_file_id,
+        raw_segments=segments,
     )
 
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-
+    # ── Post-exit listen stats ──
     try:
-        tty.setcbreak(fd)
+        st = service.status()
+        end_pos = float(st.get("position", start_seconds))
+        dur = float(st.get("duration", total_duration)) or total_duration
+    except Exception:
+        end_pos = start_seconds
+        dur = total_duration
 
-        with Live(console=console, refresh_per_second=4, transient=True) as live:
-            current_idx = -1  # track segment index across loop iterations
-            import bisect
-            segment_starts = [seg.get("start", 0) for seg in segments]
-            while mpv.is_running():
-                # ── Handle keypresses (non-blocking) ──
-                # Keybindings follow mpv defaults
-                while select.select([sys.stdin], [], [], 0)[0]:
-                    key = sys.stdin.read(1)
-
-                    if key == "q":
-                        mpv.quit()
-                        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-                        console.print(f"\n  [{DIM}]Playback stopped[/]")
-                        console.print()
-                        return
-
-                    elif key == " ":
-                        mpv.toggle_pause()
-
-                    # Speed: [ ] = ±10%, { } = half/double
-                    elif key == "[":
-                        mpv.set_speed(max(0.25, mpv.get_speed() * 0.9))
-                    elif key == "]":
-                        mpv.set_speed(min(4.0, mpv.get_speed() * 1.1))
-                    elif key == "{":
-                        mpv.set_speed(max(0.25, mpv.get_speed() * 0.5))
-                    elif key == "}":
-                        mpv.set_speed(min(4.0, mpv.get_speed() * 2.0))
-
-                    # Reset speed
-                    elif key == "\x7f" or key == "\x08":  # Backspace
-                        mpv.set_speed(1.0)
-
-                    # Volume: 9/0
-                    elif key == "9":
-                        vol = mpv.get_property("volume")
-                        mpv.set_property("volume", max(0, (float(vol) if vol else 100) - 10))
-                    elif key == "0":
-                        vol = mpv.get_property("volume")
-                        mpv.set_property("volume", min(150, (float(vol) if vol else 100) + 10))
-
-                    # Mute
-                    elif key == "m":
-                        muted = mpv.get_property("mute")
-                        mpv.set_property("mute", not bool(muted))
-
-                    # Arrow keys (escape sequences)
-                    elif key == "\x1b":
-                        if select.select([sys.stdin], [], [], 0.05)[0]:
-                            seq = sys.stdin.read(1)
-                            if seq == "[":
-                                arrow = sys.stdin.read(1)
-                                if arrow == "C":  # → seek +5s
-                                    mpv.seek(5)
-                                elif arrow == "D":  # ← seek -5s
-                                    mpv.seek(-5)
-                                elif arrow == "A":  # ↑ seek +60s
-                                    mpv.seek(60)
-                                elif arrow == "B":  # ↓ seek -60s
-                                    mpv.seek(-60)
-
-                    # ── Bookmark keybindings ──
-                    elif key == "b" and bookmark_repo and audio_file_id:
-                        # Instant point bookmark — auto-name from transcript
-                        pos = mpv.get_position()
-                        auto_name = f"Bookmark @ {_bfmt(pos)}"
-                        if segments and current_idx >= 0:
-                            seg_text = (segments[current_idx].get("text", "") or "").strip()
-                            if seg_text:
-                                auto_name = seg_text[:80]
-                        bid = bookmark_repo.add(
-                            audio_file_id,
-                            pos,
-                            name=auto_name,
-                            transcription_id=transcription_id,
-                        )
-                        last_bookmark_id = bid
-                        _set_flash(f'🔖 {_bfmt(pos)} "{auto_name[:40]}"')
-
-                    elif key == "B" and bookmark_repo and audio_file_id:
-                        # Region start/end toggle
-                        pos = mpv.get_position()
-                        if region_start is None:
-                            region_start = pos
-                            _set_flash(f"▶ Region start @ {_bfmt(pos)}")
-                        else:
-                            auto_name = f"Region {_bfmt(region_start)}→{_bfmt(pos)}"
-                            bid = bookmark_repo.add_region(
-                                audio_file_id,
-                                region_start,
-                                pos,
-                                name=auto_name,
-                                transcription_id=transcription_id,
-                            )
-                            last_bookmark_id = bid
-                            _set_flash(f"■ Region saved: {_bfmt(region_start)}→{_bfmt(pos)}")
-                            region_start = None
-
-                    elif key == "n" and bookmark_repo and audio_file_id:
-                        # Jump to next bookmark
-                        pos = mpv.get_position()
-                        nxt = bookmark_repo.get_nearest(audio_file_id, pos, "next")
-                        if nxt:
-                            mpv.seek_absolute(nxt["timestamp"])
-                            emoji = BOOKMARK_TYPES.get(nxt["bookmark_type"], "🔖")
-                            _set_flash(f"→ {emoji} {_bfmt(nxt['timestamp'])} {nxt['name'][:30]}")
-                        else:
-                            _set_flash("→ No more bookmarks")
-
-                    elif key == "p" and bookmark_repo and audio_file_id:
-                        # Jump to previous bookmark
-                        pos = mpv.get_position()
-                        prev = bookmark_repo.get_nearest(audio_file_id, pos, "prev")
-                        if prev:
-                            mpv.seek_absolute(prev["timestamp"])
-                            emoji = BOOKMARK_TYPES.get(prev["bookmark_type"], "🔖")
-                            _set_flash(f"← {emoji} {_bfmt(prev['timestamp'])} {prev['name'][:30]}")
-                        else:
-                            _set_flash("← No earlier bookmarks")
-
-                    elif key == "l" and bookmark_repo and last_bookmark_id:
-                        # Cycle type of last-created bookmark
-                        new_type = bookmark_repo.cycle_type(last_bookmark_id)
-                        if new_type:
-                            emoji = BOOKMARK_TYPES.get(new_type, "🔖")
-                            _set_flash(f"{emoji} Type → {new_type}")
-
-                    # ── Mode & display toggles ──
-                    elif key == "\t":  # Tab — cycle mode
-                        state.mode = "enhanced" if state.mode == "default" else "default"
-                        state.settings_dirty = True
-                    elif key == "k":
-                        state.karaoke = not state.karaoke
-                        state.settings_dirty = True
-                    elif key == "f":
-                        state.focus_gradient = not state.focus_gradient
-                        state.settings_dirty = True
-                    elif key == "c":
-                        state.center_lock = not state.center_lock
-                        state.settings_dirty = True
-                    elif key == "d":
-                        state.speaker_badges = not state.speaker_badges
-                        state.settings_dirty = True
-                    elif key == "t":
-                        state.timestamps = not state.timestamps
-                        state.settings_dirty = True
-                    elif key == "r":
-                        state.show_remaining = not state.show_remaining
-                        state.settings_dirty = True
-                    elif key == "?":
-                        state.show_help = not state.show_help
-
-                # ── Read state from mpv (batch for low latency) ──
-                current_time, current_speed, paused = mpv.get_playback_state()
-
-                # Find current segment using binary search (O(log N))
-                if segment_starts:
-                    idx = bisect.bisect_right(segment_starts, current_time) - 1
-                    current_idx = max(0, idx)
-                else:
-                    current_idx = -1
-
-                # ── Build display ──
-                from rich.align import Align
-                from rich.console import Group
-
-                parts = []  # renderable parts for Group
-
-                # Helper for consistent MM:SS / HH:MM:SS formatting
-                def _fmt(secs: float) -> str:
-                    s = int(secs)
-                    if s >= 3600:
-                        return f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
-                    return f"{s // 60:02d}:{s % 60:02d}"
-
-                def _build_progress_bar() -> Text:
-                    pause_icon = "⏸" if paused else "▶"
-                    bar_width = 28
-                    pct = min(current_time / total_duration, 1.0) if total_duration > 0 else 0
-                    filled = int(pct * bar_width)
-                    # Playhead dot sits at the fill boundary
-                    if filled < bar_width:
-                        bar = "━" * filled + "●" + "─" * (bar_width - filled - 1)
-                    else:
-                        bar = "━" * bar_width
-
-                    time_str = f"{pause_icon}  {_fmt(current_time)} / {_fmt(total_duration)}"
-
-                    if state.show_remaining and total_duration > 0:
-                        remaining = total_duration - current_time
-                        time_str += f"  -{_fmt(remaining)}"
-
-                    speed_str = ""
-                    if current_speed != 1.0:
-                        speed_str = f"  {current_speed:.2g}×"
-
-                    line = f"{time_str}   {bar}{speed_str}"
-                    t = Text(line)
-                    t.stylize("bold cyan" if paused else "white")
-                    # Amber tint for the speed indicator when non-1x
-                    if current_speed != 1.0:
-                        start = len(line) - len(speed_str)
-                        t.stylize("yellow", start=start)
-                    return t
-
-                def _estimate_word_times(seg: dict) -> list[tuple[str, str]]:
-                    raw_words = (seg.get("text") or "").strip().split()
-                    n = len(raw_words)
-                    if n == 0:
-                        return []
-                    seg_start = seg.get("start", 0.0)
-                    seg_end   = seg.get("end", seg_start + 0.01)
-                    seg_dur   = max(seg_end - seg_start, 0.01)
-                    word_dur  = seg_dur / n
-                    result = []
-                    for i, w in enumerate(raw_words):
-                        w_start = seg_start + i * word_dur
-                        w_end   = w_start + word_dur
-                        if current_time < w_start:
-                            style = "dim"
-                        elif current_time > w_end:
-                            style = "white"
-                        else:
-                            style = "bold cyan on grey11"
-                        result.append((w + " ", style))
-                    return result
-
-                def _build_segment_window() -> Text:
-                    # ── Default mode: exact original behavior, zero changes ──
-                    if not state.enhanced:
-                        out = Text()
-                        win_start = max(0, current_idx - 3)
-                        win_end   = min(len(segments), current_idx + 4)
-                        if win_start > 0:
-                            out.append("⋮\n", style="dim")
-                        for i in range(win_start, win_end):
-                            seg  = segments[i]
-                            text = (seg.get("text") or "").strip()
-                            if not text:
-                                continue
-                            if i == current_idx:
-                                out.append(f"▸ {text}\n", style="bold")
-                            elif i < current_idx:
-                                out.append(f"  {text}\n", style="dim")
-                            else:
-                                out.append(f"  {text}\n", style="dim italic")
-                        if win_end < len(segments):
-                            out.append("⋮\n", style="dim")
-                        return out
-
-                    # ── Enhanced mode: all feature toggles apply ──
-                    term_h = console.size.height
-                    # How many lines we can show (leave room for progress bar + hints)
-                    visible_lines = max(5, term_h - 8)
-
-                    if state.center_lock:
-                        half = visible_lines // 2
-                        win_start = max(0, current_idx - half)
-                        win_end   = min(len(segments), current_idx + half + 1)
-                    else:
-                        win_start = max(0, current_idx - 3)
-                        win_end   = min(len(segments), current_idx + 4)
-
-                    out = Text()
-
-                    if win_start > 0:
-                        out.append("  ⋮\n", style="dim color(240)")
-
-                    prev_speaker = None
-
-                    for i in range(win_start, win_end):
-                        seg     = segments[i]
-                        text    = (seg.get("text") or "").strip()
-                        speaker = seg.get("speaker")
-                        if not text:
-                            continue
-
-                        # ── Speaker badge ──
-                        if state.speaker_badges and speaker and speaker != prev_speaker:
-                            badge = f"  ── {speaker} " + "─" * max(0, 28 - len(speaker))
-                            out.append(badge + "\n", style="bold magenta")
-                        prev_speaker = speaker
-
-                        # ── Distance-based style ──
-                        distance = abs(i - current_idx)
-                        if i == current_idx:
-                            line_style = "bold cyan"
-                        elif state.focus_gradient:
-                            if distance == 1:
-                                line_style = "white"
-                            elif distance == 2:
-                                line_style = "dim"
-                            else:
-                                line_style = "dim italic color(240)"
-                        else:
-                            if i < current_idx:
-                                line_style = "dim"
-                            else:
-                                line_style = "dim italic"
-
-                        # ── Timestamp gutter ──
-                        prefix = ""
-                        if state.timestamps:
-                            ts = _fmt(seg.get("start", 0.0))
-                            prefix = f"[{ts}] "
-
-                        # ── Karaoke word rendering (active segment only) ──
-                        if i == current_idx and state.karaoke:
-                            if prefix:
-                                out.append("  " + prefix, style="dim cyan")
-                            else:
-                                out.append("▸ ", style="bold cyan")
-                            for word_text, word_style in _estimate_word_times(seg):
-                                out.append(word_text, style=word_style)
-                            out.append("\n")
-                        else:
-                            # Normal line rendering
-                            indicator = "▸ " if i == current_idx else "  "
-                            out.append(f"{indicator}{prefix}{text}\n", style=line_style)
-
-                    if win_end < len(segments):
-                        out.append("  ⋮\n", style="dim color(240)")
-
-                    return out
-
-                def _build_help_overlay() -> Text:
-                    def _row(key: str, label: str, on: bool, dim: bool = False) -> str:
-                        indicator = "[bold green]  ON [/]" if on else "[dim]  OFF[/]"
-                        row = f"  {key}  {label:<34} {indicator}\n"
-                        return f"[dim]{row}[/]" if dim else row
-
-                    mode_indicator = "[bold cyan]ENHANCED[/]" if state.enhanced else "[bold]DEFAULT[/]"
-
-                    out = Text.from_markup(
-                        "\n"
-                        f"  [bold]Player Settings[/]  ·  Mode: {mode_indicator}  "
-                        "[dim]Tab to switch · ? to close[/]\n"
-                        "  [dim]" + "─" * 52 + "[/]\n"
-                        "  [dim]Tab  Switch Default ↔ Enhanced mode[/]\n"
-                        "  [dim]" + "─" * 52 + "[/]\n"
-                    )
-                    # Individual toggles shown dimmed when in Default mode (they have no effect)
-                    in_default = not state.enhanced
-                    rows = [
-                        ("k", "Karaoke word highlight",   state.karaoke),
-                        ("f", "Focus gradient",           state.focus_gradient),
-                        ("c", "Center-lock scroll",       state.center_lock),
-                        ("d", "Speaker badges",           state.speaker_badges),
-                        ("t", "Timestamps in gutter",     state.timestamps),
-                        ("r", "Show remaining time",      state.show_remaining),
-                    ]
-                    for key, label, enabled in rows:
-                        out.append_text(Text.from_markup(_row(key, label, enabled, dim=in_default)))
-                    if in_default:
-                        out.append_text(Text.from_markup(
-                            "  [dim italic]  (switch to Enhanced to activate these)[/]\n"
-                        ))
-                    return out
-
-                if total_duration > 0:
-                    parts.append(Text(""))
-                    parts.append(Align.center(_build_progress_bar()))
-                    parts.append(Text(""))
-
-                if state.show_help:
-                    parts.append(_build_help_overlay())
-                else:
-                    parts.append(_build_segment_window())
-
-                # ── Bookmark flash / region indicator ──
-                flash_text = None
-                if region_start is not None:
-                    elapsed = mpv.get_position() - region_start
-                    flash_text = Text(
-                        f"  ● Recording region ({_bfmt(elapsed)})...",
-                        style="bold red",
-                    )
-                elif bookmark_flash and time.monotonic() < bookmark_flash_until:
-                    flash_text = Text(f"  {bookmark_flash}", style="bold green")
-
-                if flash_text:
-                    parts.append(Text(""))
-                    parts.append(Align.center(flash_text))
-
-                # ── Bookmark indicator bar ──
-                if bookmark_repo and audio_file_id and total_duration > 0:
-                    file_bookmarks = bookmark_repo.list_for_file(audio_file_id)
-                    if file_bookmarks:
-                        bar_width = 30
-                        indicator = list("─" * bar_width)
-                        for bm in file_bookmarks:
-                            pos_frac = min(bm["timestamp"] / total_duration, 1.0)
-                            idx = min(int(pos_frac * bar_width), bar_width - 1)
-                            emoji = BOOKMARK_TYPES.get(bm["bookmark_type"], "│")
-                            # Use a simple marker character for the bar
-                            indicator[idx] = "┃"
-                        marker_line = Text("  " + "".join(indicator), style="dim cyan")
-                        parts.append(Align.center(marker_line))
-
-                # Controls hint (centered)
-                mode_label = "ENHANCED" if state.enhanced else "DEFAULT"
-                if bookmark_repo:
-                    ctrl_str = (
-                        f"[{mode_label}]  Tab mode  ␣ pause  ←→ ±5s  ↑↓ ±60s  "
-                        "b mark  B region  n/p jump  [ ]speed  9/0vol  ? settings  q quit"
-                    )
-                else:
-                    ctrl_str = (
-                        f"[{mode_label}]  Tab mode  ␣ pause  ←→ ±5s  ↑↓ ±60s  "
-                        "[ ]speed  9/0vol  m mute  ⌫ reset  ? settings  q quit"
-                    )
-                controls = Text(ctrl_str, style="dim")
-                parts.append(Text(""))
-                parts.append(Align.center(controls))
-
-                live.update(
-                    Panel(
-                        Group(*parts),
-                        border_style="dim",
-                        expand=True,
-                        padding=(0, 1),
-                    )
-                )
-                time.sleep(0.1)  # 10fps for smooth sync
-
-        # Playback finished naturally
-        _show_listen_stats(listen_start, mpv.get_position(), listen_start_pos, total_duration)
-
-    except KeyboardInterrupt:
-        mpv.terminate()
-        _show_listen_stats(listen_start, current_time, listen_start_pos, total_duration)
-    finally:
-        if state.settings_dirty:
-            from audiobench.core.settings import get_settings
-            s = get_settings()
-            updated = s.model_copy(update={
-                "play_mode":           state.mode,
-                "play_karaoke":        state.karaoke,
-                "play_focus_gradient": state.focus_gradient,
-                "play_center_lock":    state.center_lock,
-                "play_speaker_badges": state.speaker_badges,
-                "play_timestamps":     state.timestamps,
-                "play_show_remaining": state.show_remaining,
-            })
-            updated.save()
-            get_settings.cache_clear()
-
-        # Restore terminal
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-
-
-def _show_listen_stats(
-    listen_start: float,
-    end_pos: float,
-    start_pos: float,
-    total_duration: float,
-) -> None:
-    """Show listening stats after playback ends."""
     wall_time = time.monotonic() - listen_start
-    listened = end_pos - start_pos
+    listened = end_pos - start_seconds
 
     def _sfmt(secs: float) -> str:
         s = int(abs(secs))
@@ -756,10 +270,10 @@ def _show_listen_stats(
 
     console.print()
     console.print(f"  [{DIM}]{'─' * 44}[/]")
-    if total_duration > 0:
-        pct = min(end_pos / total_duration * 100, 100)
+    if dur > 0:
+        pct = min(end_pos / dur * 100, 100)
         console.print(
-            f"  [{DIM}]Listened:  {_sfmt(listened)} ({pct:.0f}% of {_sfmt(total_duration)})[/]"
+            f"  [{DIM}]Listened:  {_sfmt(listened)} ({pct:.0f}% of {_sfmt(dur)})[/]"
         )
     else:
         console.print(f"  [{DIM}]Listened:  {_sfmt(listened)}[/]")
@@ -769,6 +283,7 @@ def _show_listen_stats(
 
 
 # ── Watch mode (mpv with subtitles) ────────────────────────
+
 
 
 def _play_with_subtitles(
@@ -807,7 +322,7 @@ def _play_with_subtitles(
     if speed and speed != 1.0:
         cmd.append(f"--speed={speed}")
 
-    console.print(f"  [{ACCENT}]▶[/] Opening in mpv: {record_name}")
+    console.print(f"  [{ACCENT}]>[/] Opening in mpv: {record_name}")
     console.print(f"  [{DIM}]Controls: space=pause, ←→=seek, []=speed, q=quit[/]")
     console.print()
 
@@ -930,7 +445,7 @@ def play(
 
     if target.isdigit():
         # Treat as transcript ID
-        record = repo.get_by_id(int(target))
+        record = repo.get_by_id(int(target), session=None)
         if not record:
             console.print(error_panel("Not found", f"Transcript #{target} not found"))
             sys.exit(1)
@@ -961,7 +476,7 @@ def play(
         if lyrics or watch:
             best_id = _find_best_transcript_for_file(repo, str(file_path))
             if best_id:
-                record = repo.get_by_id(best_id)
+                record = repo.get_by_id(best_id, session=None)
                 if record:
                     console.print(
                         f"  [{DIM}]Using transcript #{record['id']} "
@@ -1058,7 +573,7 @@ def play(
         transcription_id = record.get("id")  # transcription record ID
 
     # If no audio_file_id yet (playing by file path), try to resolve from DB
-    if audio_file_id is None and file_path:
+    if not audio_file_id and file_path:
         from audiobench.storage.bookmark_repository import BookmarkRepository
 
         _bm_repo = BookmarkRepository()
@@ -1081,7 +596,7 @@ def play(
         if file_bms:
             console.print(f"\n  [{ACCENT}]Bookmarks ({len(file_bms)})[/]")
             for bm in file_bms:
-                emoji = _BM_TYPES.get(bm["bookmark_type"], "🔖")
+                emoji = _BM_TYPES.get(bm["bookmark_type"], "[BM]")
                 t = _bfmt(bm["timestamp"])
                 if bm.get("is_region") and bm.get("end_timestamp"):
                     t += f"→{_bfmt(bm['end_timestamp'])}"
@@ -1116,7 +631,7 @@ def play(
                     _format_timestamp as _bfmt,
                 )
 
-                emoji = BOOKMARK_TYPES.get(bm["bookmark_type"], "🔖")
+                emoji = BOOKMARK_TYPES.get(bm["bookmark_type"], "[BM]")
                 console.print(
                     f'    From:   {emoji} #{bm["id"]} {_bfmt(start_seconds)} "{bm["name"][:40]}"'
                 )
@@ -1146,7 +661,25 @@ def play(
             speed,
         )
     else:
-        # Plain playback
+        # Plain playback: route to daemon if available
+        try:
+            from audiobench.daemon.factory import get_daemon_client
+            client = get_daemon_client()
+            client.playback_play(
+                str(file_path),
+                start_pos=start_seconds,
+                speed=speed or 1.0,
+                audio_file_id=audio_file_id,
+                transcription_id=transcription_id,
+            )
+            if not quiet:
+                console.print(f"  [{ACCENT}]>[/] Playing: {record_name}")
+                console.print(f"  [{DIM}]Controls available in Chat (/pause, /seek) or REPL (\\pause, \\seek)[/]\n")
+            return
+        except Exception:
+            pass
+
+        # Fallback to ffplay
         cmd = [
             "ffplay",
             "-autoexit",
@@ -1163,11 +696,14 @@ def play(
         if start_seconds > 0:
             cmd.extend(["-ss", str(start_seconds)])
         if speed and speed != 1.0:
-            tempo = max(0.5, min(speed, 2.0))
-            cmd.extend(["-af", f"atempo={tempo}"])
+            if speed < 0.5 and not quiet:
+                console.print(
+                    f"  [{WARNING}]Speed {speed}x is below ffplay minimum (0.5x); using 0.5x[/]"
+                )
+            cmd.extend(["-af", _build_atempo_filter(speed)])
 
         if not quiet:
-            console.print(f"  [{ACCENT}]▶[/] Playing: {record_name}")
+            console.print(f"  [{ACCENT}]>[/] Playing: {record_name}")
             console.print(f"  [{DIM}]Press 'q' in the popup window to stop, or Ctrl+C here[/]")
             console.print()
 

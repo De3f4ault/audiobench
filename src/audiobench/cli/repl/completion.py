@@ -117,6 +117,98 @@ def _index_command(cmd_name: str, cmd_obj: click.BaseCommand) -> None:
         _FLAG_MAP[cmd_name] = flags
 
 
+# ── Backslash Metadata & Subcommand Definitions ──────────────────────────────
+
+_BACKSLASH_METAS: dict[str, tuple[str, str]] = {
+    "\\synthesize": ("\\synthesize <thematic query>", "Dialectic synthesis across library via Graph MMR"),
+    "\\synth":      ("\\synth <thematic query>", "Alias for \\synthesize"),
+    "\\bookmark":   ("\\bookmark [id|cite <n>|list]", "Two-tiered smart contextual bookmark cards"),
+    "\\bm":         ("\\bm [id|cite <n>|list]", "Alias for \\bookmark"),
+    "\\related":    ("\\related", "Explore cross-work semantic bridges & HNSW connections"),
+    "\\suggest":    ("\\suggest [commands|history]", "Next Listen recommendations & triadic consensus"),
+    "\\graph":      ("\\graph [seed [limit]|days]", "Seed unlinked islands or show command stats"),
+    "\\play":       ("\\play [file|id|cite <n>|pause|resume]", "Audio playback controls & citation seeking"),
+    "\\library":    ("\\library", "Interactive Library Command Center"),
+    "\\workflow":   ("\\workflow <save|list|run|delete|show>", "Manage and replay command workflows"),
+    "\\focus":      ("\\focus <id>", "Focus on audio file, transcript, or work"),
+    "\\unfocus":    ("\\unfocus", "Clear active focus"),
+    "\\show":       ("\\show [id]", "Print transcript with timestamps"),
+    "\\ls":         ("\\ls [n]", "List recent audio files"),
+    "\\search":     ("\\search <query>", "FTS5 full-text transcript search"),
+    "\\chat":       ("\\chat", "Conversational AI chat over active transcript"),
+    "\\ask":        ("\\ask <question>", "Ask AI about active transcript"),
+    "\\summarize":  ("\\summarize", "Structured chapter summary"),
+    "\\capture":    ("\\capture <note>", "Quick-capture thought or note"),
+    "\\info":       ("\\info", "Metadata and stats for active focus"),
+    "\\help":       ("\\help [command]", "Show command documentation & syntax"),
+    "\\name":       ("\\name <spk> <name>", "Rename speaker globally across transcript"),
+    "\\schools":    ("\\schools", "List all emergent intellectual schools of thought"),
+    "\\school":     ("\\school <id>", "Inspect school medoid, authors, and core works"),
+    "\\scope":      ("\\scope [school:<id>|work:<id>|clear]", "Scope REPL retrieval to a school or work"),
+    "\\next":       ("\\next", "Advance to next track in school queue or citation"),
+    "\\prev":       ("\\prev", "Return to previous track in school queue or citation"),
+    "\\lyrics":     ("\\lyrics", "Interactive live lyrics / karaoke follow HUD"),
+    "\\karaoke":    ("\\karaoke", "Alias for \\lyrics"),
+    "\\follow":     ("\\follow", "Alias for \\lyrics"),
+    "\\lock":       ("\\lock", "Lock privacy tiers"),
+    "\\unlock":     ("\\unlock", "Unlock relational privacy tier"),
+    "\\proposals":  ("\\proposals [show <id>|all|authorize <id>|defer <id>|reject <id>]", "Review and authorize knowledge gap proposals"),
+    "\\prop":       ("\\prop [show <id>|all|authorize <id>|defer <id>|reject <id>]", "Alias for \\proposals"),
+    "\\context":    ("\\context", "Display active entity focus and navigation context"),
+}
+
+_BACKSLASH_SUBCOMMANDS: dict[str, list[str]] = {
+    "\\bookmark": ["cite", "list"],
+    "\\bm": ["cite", "list"],
+    "\\graph": ["seed"],
+    "\\suggest": ["commands", "history"],
+    "\\workflow": ["save", "list", "run", "delete", "show"],
+    "\\play": ["cite", "school", "pause", "resume", "stop", "next", "prev"],
+    "\\scope": ["school:", "work:", "clear"],
+    "\\related": ["schools", "works"],
+    "\\proposals": ["show", "all", "list", "authorize", "defer", "reject"],
+    "\\prop": ["show", "all", "list", "authorize", "defer", "reject"],
+}
+
+
+_BACKSLASH_SUBCOMMAND_TEMPLATES: dict[str, str] = {
+    "\\bookmark cite": "\\bookmark cite <n>",
+    "\\bookmark list": "\\bookmark list",
+    "\\bm cite": "\\bm cite <n>",
+    "\\bm list": "\\bm list",
+    "\\graph seed": "\\graph seed [limit]",
+    "\\suggest commands": "\\suggest commands",
+    "\\suggest history": "\\suggest history",
+    "\\workflow save": "\\workflow save <name>",
+    "\\workflow list": "\\workflow list",
+    "\\workflow run": "\\workflow run <name>",
+    "\\workflow delete": "\\workflow delete <name>",
+    "\\workflow show": "\\workflow show <name>",
+    "\\play cite": "\\play cite <n>",
+    "\\play school": "\\play school <id>",
+    "\\play pause": "\\play pause",
+    "\\play resume": "\\play resume",
+    "\\play stop": "\\play stop",
+    "\\play next": "\\play next",
+    "\\play prev": "\\play prev",
+    "\\scope school": "\\scope school:<id>",
+    "\\scope work": "\\scope work:<id>",
+    "\\scope clear": "\\scope clear",
+    "\\proposals show": "\\proposals show <id>",
+    "\\proposals all": "\\proposals all",
+    "\\proposals list": "\\proposals list",
+    "\\proposals authorize": "\\proposals authorize <id>",
+    "\\proposals defer": "\\proposals defer <id>",
+    "\\proposals reject": "\\proposals reject <id>",
+    "\\prop show": "\\prop show <id>",
+    "\\prop all": "\\prop all",
+    "\\prop list": "\\prop list",
+    "\\prop authorize": "\\prop authorize <id>",
+    "\\prop defer": "\\prop defer <id>",
+    "\\prop reject": "\\prop reject <id>",
+}
+
+
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
 def setup_completion(session: ReplSession) -> None:
@@ -128,6 +220,14 @@ def setup_completion(session: ReplSession) -> None:
 
     for cmd_name, cmd_obj in session.cli_group.commands.items():
         _index_command(cmd_name, cmd_obj)
+
+    # Index backslash commands and subcommands
+    for bcmd, (synopsis, _) in _BACKSLASH_METAS.items():
+        _TEMPLATE_MAP[bcmd] = synopsis
+    for bcmd, subs in _BACKSLASH_SUBCOMMANDS.items():
+        _SUBCOMMAND_MAP[bcmd] = subs
+    for full_key, tmpl in _BACKSLASH_SUBCOMMAND_TEMPLATES.items():
+        _TEMPLATE_MAP[full_key] = tmpl
 
     _load_transcript_cache(session)
     _load_transition_matrix()
@@ -186,6 +286,13 @@ from audiobench.transcribe.audio_converter import ALL_SUPPORTED_FORMATS
 _AUDIO_EXTS = tuple(f".{ext}" for ext in ALL_SUPPORTED_FORMATS)
 
 
+def _pad_meta(meta: str) -> str:
+    """Pad metadata string with leading spaces for visual separation."""
+    if not meta:
+        return ""
+    return f"   {meta}"
+
+
 class AudioBenchCompleter(Completer):
     """Context-aware multi-token completer.
 
@@ -223,16 +330,41 @@ class AudioBenchCompleter(Completer):
                 for sub in _SUBCOMMAND_MAP[cmd]:
                     full_key = f"{cmd} {sub}"
                     meta = _TEMPLATE_MAP.get(full_key, "")
-                    yield Completion(sub, start_position=0, display_meta=meta)
+                    yield Completion(sub, start_position=0, display_meta=_pad_meta(meta))
+                if cmd in ("\\proposals", "\\prop"):
+                    try:
+                        from audiobench.cli.repl.backslash_commands import _fetch_daemon_proposals, _parse_proposal_payload
+                        for p in _fetch_daemon_proposals(include_all=False):
+                            pid = str(p["id"])
+                            status = p.get("inference_status", "")
+                            _, title, _ = _parse_proposal_payload(p.get("content", ""))
+                            meta = f"[{status}] {title[:40]}" if status else title[:40]
+                            yield Completion(pid, start_position=0, display_meta=_pad_meta(meta))
+                    except Exception:
+                        pass
                 return
             elif len(tokens) == 2 and not text_before.endswith(" "):
                 partial = tokens[1]
-                for sub in _SUBCOMMAND_MAP[cmd]:
-                    if sub.startswith(partial):
-                        full_key = f"{cmd} {sub}"
-                        meta = _TEMPLATE_MAP.get(full_key, "")
-                        yield Completion(sub, start_position=-len(partial), display_meta=meta)
-                return
+                if not (cmd in ("\\scope", "scope") and (partial.startswith("school:") or partial.startswith("work:"))):
+                    for sub in _SUBCOMMAND_MAP[cmd]:
+                        if sub.startswith(partial):
+                            full_key = f"{cmd} {sub}"
+                            meta = _TEMPLATE_MAP.get(full_key, "")
+                            yield Completion(sub, start_position=-len(partial), display_meta=_pad_meta(meta))
+                    if cmd in ("\\proposals", "\\prop"):
+                        try:
+                            from audiobench.cli.repl.backslash_commands import _fetch_daemon_proposals, _parse_proposal_payload
+                            clean_partial = partial.lstrip("#")
+                            for p in _fetch_daemon_proposals(include_all=True):
+                                pid = str(p["id"])
+                                if pid.startswith(clean_partial) or f"#{pid}".startswith(partial):
+                                    status = p.get("inference_status", "")
+                                    _, title, _ = _parse_proposal_payload(p.get("content", ""))
+                                    meta = f"[{status}] {title[:40]}" if status else title[:40]
+                                    yield Completion(pid, start_position=-len(partial), display_meta=_pad_meta(meta))
+                        except Exception:
+                            pass
+                    return
             elif len(tokens) >= 2:
                 # Subcommand already typed — complete its args/flags
                 sub = tokens[1]
@@ -258,15 +390,46 @@ class AudioBenchCompleter(Completer):
         )
         for cmd in all_cmds:
             if cmd.startswith(word):
-                # Prefer Click short_help; fall back to template
+                # Prefer Click short_help; fall back to backslash meta or template
                 if cmd in self.session.cli_group.commands:
                     meta = self.session.cli_group.commands[cmd].short_help or _TEMPLATE_MAP.get(cmd, "")
+                elif cmd in _BACKSLASH_METAS:
+                    meta = _BACKSLASH_METAS[cmd][1]
                 else:
                     meta = _TEMPLATE_MAP.get(cmd, "")
-                yield Completion(cmd, start_position=-len(word), display_meta=meta)
+                yield Completion(cmd, start_position=-len(word), display_meta=_pad_meta(meta))
 
     def _complete_args(self, cmd: str, used_tokens: list[str], last_token: str):
         """Complete after a space — offer flags, choices, IDs, files."""
+
+        # ── Citation completions for \bookmark cite <n> and \play cite <n> ────
+        is_cite_cmd = (
+            cmd in ("\\bookmark cite", "\\bm cite", "\\play cite")
+            or (cmd in ("\\bookmark", "\\bm", "\\play") and used_tokens and used_tokens[0] == "cite")
+        )
+        if is_cite_cmd:
+            citations = getattr(self.session, "last_synthesis_citations", {})
+            if citations:
+                for c_num, expr_id in citations.items():
+                    yield Completion(str(c_num), start_position=0, display_meta=_pad_meta(f"Citation [{c_num}] (Expr #{expr_id})"))
+            else:
+                for c_num in ("1", "2", "3", "4"):
+                    yield Completion(str(c_num), start_position=0, display_meta=_pad_meta(f"Citation [{c_num}]"))
+            return
+
+        # ── Command completions for \help <cmd> ───────────────────────────────
+        if cmd in ("\\help", "help", "/help"):
+            candidates = [k.lstrip("\\") for k in self.backslash_cmds] + list(self.session.cli_group.commands.keys())
+            for c in sorted(set(candidates)):
+                bcmd = f"\\{c}"
+                if bcmd in _BACKSLASH_METAS:
+                    meta = _BACKSLASH_METAS[bcmd][1]
+                elif c in self.session.cli_group.commands:
+                    meta = self.session.cli_group.commands[c].short_help or ""
+                else:
+                    meta = ""
+                yield Completion(c, start_position=0, display_meta=_pad_meta(meta) if meta else None)
+            return
 
         # ── If previous token was a flag that expects a value, complete the value ──
         if last_token.startswith("-") and cmd in _FLAG_MAP:
@@ -274,7 +437,7 @@ class AudioBenchCompleter(Completer):
                 if last_token in opts:
                     if choices:
                         for choice in choices:
-                            yield Completion(choice, start_position=0, display_meta=help_text)
+                            yield Completion(choice, start_position=0, display_meta=_pad_meta(help_text))
                         return
                     elif isinstance(val_type, click.Path):
                         files = glob.glob("*")
@@ -293,12 +456,12 @@ class AudioBenchCompleter(Completer):
                         meta = f"{help_text} [{','.join(choices)}]" if help_text else f"[{','.join(choices)}]"
                     else:
                         meta = help_text
-                    yield Completion(main_opt, start_position=0, display_meta=meta)
+                    yield Completion(main_opt, start_position=0, display_meta=_pad_meta(meta))
 
         # ── Transcript IDs ────────────────────────────────────────────────────
         if cmd in _TX_ID_CMDS:
             for t in _TRANSCRIPT_CACHE:
-                yield Completion(str(t["id"]), start_position=0, display_meta=t["file_name"])
+                yield Completion(str(t["id"]), start_position=0, display_meta=_pad_meta(t["file_name"]))
 
         # ── Audio files ───────────────────────────────────────────────────────
         if cmd in _AUDIO_FILE_CMDS:
@@ -317,19 +480,104 @@ class AudioBenchCompleter(Completer):
                         .all()
                     )
                     for n in notes:
-                        yield Completion(str(n.id), start_position=0, display_meta=n.title)
+                        yield Completion(str(n.id), start_position=0, display_meta=_pad_meta(n.title))
             except Exception:
                 pass
 
+        # ── School IDs ────────────────────────────────────────────────────────
+        is_school_target = (
+            cmd in ("\\school", "school", "\\play school")
+            or (cmd == "\\play" and used_tokens and used_tokens[0] == "school")
+        )
+        if is_school_target:
+            try:
+                import sqlite3
+                from pathlib import Path
+                from audiobench.community.community_service import get_active_school_ids
+                from audiobench.core.settings import get_settings
+
+                settings = get_settings()
+                db_path = Path(settings.database_url.replace("sqlite:///", "")).resolve()
+                with sqlite3.connect(str(db_path)) as conn:
+                    for cid, name in get_active_school_ids(conn):
+                        yield Completion(str(cid), start_position=0, display_meta=_pad_meta(f"#{cid:02d} {name}"))
+            except Exception:
+                pass
+
+        # ── Scope subcommands ─────────────────────────────────────────────────
+        if cmd in ("\\scope", "scope"):
+            yield Completion("school:", start_position=0, display_meta=_pad_meta("Scope to school"))
+            yield Completion("work:", start_position=0, display_meta=_pad_meta("Scope to work"))
+            yield Completion("clear", start_position=0, display_meta=_pad_meta("Clear scope"))
+
+        # ── Proposal IDs ──────────────────────────────────────────────────────
+        is_proposal_target = (
+            cmd in (
+                "\\proposals show", "\\proposals authorize", "\\proposals defer", "\\proposals reject",
+                "\\prop show", "\\prop authorize", "\\prop defer", "\\prop reject",
+            )
+            or (
+                cmd in ("\\proposals", "\\prop")
+                and used_tokens
+                and used_tokens[0] in ("show", "authorize", "defer", "reject", "auth", "confirm", "accept", "pause", "dismiss", "info", "view", "dossier")
+            )
+        )
+        if is_proposal_target:
+            try:
+                from audiobench.cli.repl.backslash_commands import _fetch_daemon_proposals, _parse_proposal_payload
+                proposals = _fetch_daemon_proposals(include_all=True)
+                for p in proposals:
+                    pid = str(p["id"])
+                    status = p.get("inference_status", "")
+                    _, title, _ = _parse_proposal_payload(p.get("content", ""))
+                    meta = f"[{status}] {title[:40]}" if status else title[:40]
+                    yield Completion(pid, start_position=0, display_meta=_pad_meta(meta))
+            except Exception:
+                pass
+            return
+
+
     def _complete_partial(self, cmd: str, used_tokens: list[str], word: str):
         """Complete a partially-typed token."""
+
+        # ── Partial citation number ───────────────────────────────────────────
+        is_cite_cmd = (
+            cmd in ("\\bookmark cite", "\\bm cite", "\\play cite")
+            or (cmd in ("\\bookmark", "\\bm", "\\play") and used_tokens and used_tokens[0] == "cite")
+        )
+        if is_cite_cmd:
+            citations = getattr(self.session, "last_synthesis_citations", {})
+            c_keys = [str(k) for k in citations.keys()] if citations else ["1", "2", "3", "4"]
+            for c in c_keys:
+                if c.startswith(word):
+                    if citations and c.isdigit() and int(c) in citations:
+                        meta = f"Citation [{c}] (Expr #{citations[int(c)]})"
+                    else:
+                        meta = f"Citation [{c}]"
+                    yield Completion(c, start_position=-len(word), display_meta=_pad_meta(meta))
+            return
+
+        # ── Partial help command target ───────────────────────────────────────
+        if cmd in ("\\help", "help", "/help"):
+            candidates = [k.lstrip("\\") for k in self.backslash_cmds] + list(self.session.cli_group.commands.keys())
+            for c in sorted(set(candidates)):
+                if c.startswith(word):
+                    bcmd = f"\\{c}"
+                    if bcmd in _BACKSLASH_METAS:
+                        meta = _BACKSLASH_METAS[bcmd][1]
+                    elif c in self.session.cli_group.commands:
+                        meta = self.session.cli_group.commands[c].short_help or ""
+                    else:
+                        meta = ""
+                    yield Completion(c, start_position=-len(word), display_meta=_pad_meta(meta) if meta else None)
+            return
 
         # ── Partial flag ─────────────────────────────────────────────────────
         if word.startswith("-") and cmd in _FLAG_MAP:
             for opts, val_type, help_text, choices in _FLAG_MAP[cmd]:
                 for opt in opts:
                     if opt.startswith(word):
-                        yield Completion(opt, start_position=-len(word), display_meta=help_text)
+                        yield Completion(opt, start_position=-len(word), display_meta=_pad_meta(help_text))
             return
 
         # ── Partial transcript ID ─────────────────────────────────────────────
@@ -337,7 +585,7 @@ class AudioBenchCompleter(Completer):
             for t in _TRANSCRIPT_CACHE:
                 if str(t["id"]).startswith(word):
                     yield Completion(
-                        str(t["id"]), start_position=-len(word), display_meta=t["file_name"]
+                        str(t["id"]), start_position=-len(word), display_meta=_pad_meta(t["file_name"])
                     )
 
         # ── Partial audio filename ────────────────────────────────────────────
@@ -345,6 +593,106 @@ class AudioBenchCompleter(Completer):
             for f in glob.glob(word + "*"):
                 if f.endswith(_AUDIO_EXTS):
                     yield Completion(f, start_position=-len(word))
+
+        # ── Partial school ID ─────────────────────────────────────────────────
+        is_school_target = (
+            cmd in ("\\school", "school", "\\play school")
+            or (cmd == "\\play" and used_tokens and used_tokens[0] == "school")
+        )
+        if is_school_target:
+            try:
+                import sqlite3
+                from pathlib import Path
+                from audiobench.community.community_service import get_active_school_ids
+                from audiobench.core.settings import get_settings
+
+                settings = get_settings()
+                db_path = Path(settings.database_url.replace("sqlite:///", "")).resolve()
+                clean_word = word.lstrip("#")
+                with sqlite3.connect(str(db_path)) as conn:
+                    for cid, name in get_active_school_ids(conn):
+                        if str(cid).startswith(clean_word) or f"#{cid}".startswith(word):
+                            yield Completion(
+                                str(cid),
+                                start_position=-len(word),
+                                display_meta=_pad_meta(f"#{cid:02d} {name}"),
+                            )
+            except Exception:
+                pass
+            return
+
+        # ── Partial scope or focus targets (school:<id>, s<id>, w<id>) ────────
+        if cmd in ("\\scope", "scope", "\\focus", "focus"):
+            if word.startswith("school:") or word.startswith("s"):
+                prefix = "school:" if word.startswith("school:") else "s"
+                val = word[len(prefix):]
+                try:
+                    import sqlite3
+                    from pathlib import Path
+                    from audiobench.community.community_service import get_active_school_ids
+                    from audiobench.core.settings import get_settings
+
+                    settings = get_settings()
+                    db_path = Path(settings.database_url.replace("sqlite:///", "")).resolve()
+                    with sqlite3.connect(str(db_path)) as conn:
+                        for cid, name in get_active_school_ids(conn):
+                            if str(cid).startswith(val):
+                                yield Completion(
+                                    f"{prefix}{cid}",
+                                    start_position=-len(word),
+                                    display_meta=_pad_meta(f"#{cid:02d} {name}"),
+                                )
+                except Exception:
+                    pass
+                return
+
+            if word.startswith("work:") or word.startswith("w"):
+                prefix = "work:" if word.startswith("work:") else "w"
+                val = word[len(prefix):]
+                try:
+                    with get_session() as sdb:
+                        from audiobench.storage.models import WorkRecord
+                        works = sdb.query(WorkRecord).limit(20).all()
+                        for w in works:
+                            if str(w.id).startswith(val):
+                                yield Completion(
+                                    f"{prefix}{w.id}",
+                                    start_position=-len(word),
+                                    display_meta=_pad_meta(w.title[:30]),
+                                )
+                except Exception:
+                    pass
+                return
+
+        # ── Partial proposal ID ───────────────────────────────────────────────
+        is_proposal_target = (
+            cmd in (
+                "\\proposals show", "\\proposals authorize", "\\proposals defer", "\\proposals reject",
+                "\\prop show", "\\prop authorize", "\\prop defer", "\\prop reject",
+            )
+            or (
+                cmd in ("\\proposals", "\\prop")
+                and used_tokens
+                and used_tokens[0] in ("show", "authorize", "defer", "reject", "auth", "confirm", "accept", "pause", "dismiss", "info", "view", "dossier")
+            )
+        )
+        if is_proposal_target:
+            try:
+                from audiobench.cli.repl.backslash_commands import _fetch_daemon_proposals, _parse_proposal_payload
+                clean_word = word.lstrip("#")
+                proposals = _fetch_daemon_proposals(include_all=True)
+                for p in proposals:
+                    pid = str(p["id"])
+                    if pid.startswith(clean_word) or f"#{pid}".startswith(word):
+                        status = p.get("inference_status", "")
+                        _, title, _ = _parse_proposal_payload(p.get("content", ""))
+                        meta = f"[{status}] {title[:40]}" if status else title[:40]
+                        yield Completion(pid, start_position=-len(word), display_meta=_pad_meta(meta))
+            except Exception:
+                pass
+            return
+
+
 
 
 # ── Ghost Suggestion ──────────────────────────────────────────────────────────
@@ -356,9 +704,10 @@ class AudioBenchAutoSuggest(AutoSuggest):
       3. Sequential prediction — when starting a new command, predict from transition matrix
     """
 
-    def __init__(self):
+    def __init__(self, session: ReplSession | None = None):
         from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
         self._history = AutoSuggestFromHistory()
+        self.session = session
 
     def get_suggestion(self, buffer, document):
         text = document.text
@@ -390,6 +739,18 @@ class AudioBenchAutoSuggest(AutoSuggest):
             subs = _SUBCOMMAND_MAP[tokens[0]]
             if subs:
                 return Suggestion(subs[0])  # ghost the first subcommand
+
+        # For subcommands with args: "\bookmark cite " → ghost "1" or "<n>"
+        if text.endswith(" ") and len(tokens) == 2:
+            full_key = f"{tokens[0]} {tokens[1]}"
+            if full_key in ("\\bookmark cite", "\\bm cite", "\\play cite"):
+                if self.session and getattr(self.session, "last_synthesis_citations", None):
+                    return Suggestion("1")
+            template = _TEMPLATE_MAP.get(full_key, "")
+            if template and template.startswith(full_key):
+                rest = template[len(full_key):].strip()
+                if rest:
+                    return Suggestion(rest)
 
         # ── Tier 3: sequential prediction ────────────────────────────────────
         # When typing the start of a new command, check if the previous command

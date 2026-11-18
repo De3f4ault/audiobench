@@ -186,7 +186,7 @@ class PhaseTracker:
             # Static fallback for environments without Live
             if not self._live and not self._streaming:
                 label = self.LABELS.get(phase, phase)
-                console.print(f"  [{ACCENT}]▶[/]  {label}...")
+                console.print(f"  [{ACCENT}]>[/]  {label}...")
                 if _FORCE_FLUSH:
                     sys.stdout.flush()
 
