@@ -307,3 +307,24 @@ def test_restore_from_db_resolves_legacy_search_query_fallback(monkeypatch):
     assert "Gregor Samsa woke up" in session._system_prompt
 
 
+def test_switch_model_with_router_client():
+    """switch_model should cleanly handle router client with set_primary_model without UnboundLocalError."""
+    router_mock = MagicMock()
+    repo = MagicMock()
+    session = ChatSession(
+        client=router_mock,
+        chat_repo=repo,
+        conversation_id=42,
+    )
+
+    session.switch_model("gpt-oss:120b-cloud")
+    assert session.model == "gpt-oss:120b-cloud"
+    router_mock.set_primary_model.assert_called_once_with("gpt-oss:120b-cloud")
+    repo.update_model.assert_called_once_with(42, "gpt-oss:120b-cloud", engine="ollama")
+
+    session.switch_model("gemini-2.5-flash")
+    assert session.model == "gemini-2.5-flash"
+    repo.update_model.assert_called_with(42, "gemini-2.5-flash", engine="gemini")
+
+
+

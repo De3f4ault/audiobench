@@ -767,11 +767,11 @@ class ChatSession:
             model = settings.gemini_model or "gemini-2.5-flash"
 
         self._model = model
+        _is_gemini = model.lower().startswith("gemini")
 
         if hasattr(self._client, "set_primary_model"):
             self._client.set_primary_model(model)
         else:
-            _is_gemini = model.lower().startswith("gemini")
             _current_is_gemini = type(self._client).__name__ == "GeminiClient"
 
             if _is_gemini:
