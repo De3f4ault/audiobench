@@ -80,6 +80,8 @@ def test_extractive_digest_byte_identical_parity():
     # Byte-identical parity check
     assert router_helper_output == legacy_output
     assert router_helper_output.encode("utf-8") == legacy_output.encode("utf-8")
+    assert f"### Dialectic Digest: {query}" in router_helper_output
+    assert not router_helper_output.startswith("### Dialectic Digest\n")
 
 
 def test_router_extractive_digest_outcome_parity():
@@ -123,3 +125,5 @@ def test_router_extractive_digest_outcome_parity():
     expected = legacy_synthesis_engine_digest(fragments, query)
     assert outcome.content == expected
     assert outcome.content.encode("utf-8") == expected.encode("utf-8")
+    assert f"### Dialectic Digest: {query}" in outcome.content
+    assert not outcome.content.startswith("### Dialectic Digest\n")
