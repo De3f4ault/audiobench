@@ -597,34 +597,34 @@ def _parse_slash_command(
         from rich.markdown import Markdown
         from rich.panel import Panel
 
-        from audiobench.chat.providers.ollama_provider import OllamaClient
+        from audiobench.chat.providers.provider_outcome import OutcomeType
+        from audiobench.chat.providers.router import router_for_settings
         from audiobench.core.settings import get_settings
-        from audiobench.memory.query_engine import Ok, _call_llm
 
         settings = get_settings()
-        llm = OllamaClient(base_url=settings.ollama_base_url, model=settings.ollama_model)
+        router = router_for_settings(settings)
 
         console.print("  [dim]Generating AI summary…[/dim]")
-        match _call_llm(prompt, 0.3, llm, settings.gemini_api_key):
-            case Ok(value=summary_text):
-                summary_text = summary_text.strip()
-                # Save to DB
-                save_session_summary(state.session_id, summary_text)
-                title = detail.title or f"Session #{state.session_id}"
-                ts = (detail.created_at or "")[:10]
-                console.print(
-                    Panel(
-                        Markdown(summary_text),
-                        title=f"[bold cyan]{title}[/bold cyan]  [dim]{ts} · {state.search_count} searches[/dim]",
-                        border_style="cyan",
-                        expand=True,
-                    )
+        outcome = router.generate(messages=[{"role": "user", "content": prompt}], temperature=0.3)
+        if outcome.type == OutcomeType.OK and outcome.content:
+            summary_text = outcome.content.strip()
+            # Save to DB
+            save_session_summary(state.session_id, summary_text)
+            title = detail.title or f"Session #{state.session_id}"
+            ts = (detail.created_at or "")[:10]
+            console.print(
+                Panel(
+                    Markdown(summary_text),
+                    title=f"[bold cyan]{title}[/bold cyan]  [dim]{ts} · {state.search_count} searches[/dim]",
+                    border_style="cyan",
+                    expand=True,
                 )
-                _emit_hint(state, "summary_to_export",
-                           "Run [cyan]/export[/cyan] to produce a Markdown file with this summary embedded at the top")
-                return None
-            case _:
-                return "[red]Summary generation failed. Check Ollama/Gemini is available.[/red]"
+            )
+            _emit_hint(state, "summary_to_export",
+                       "Run [cyan]/export[/cyan] to produce a Markdown file with this summary embedded at the top")
+            return None
+        else:
+            return "[red]Summary generation failed. Check Ollama/Gemini is available.[/red]"
 
     elif cmd == "/show":
         # Peek at any session without switching into it: /show #N | /show #N summary
@@ -708,32 +708,32 @@ def _parse_slash_command(
             from audiobench.core.prompts import SESSION_SUMMARY_PROMPT
             prompt = SESSION_SUMMARY_PROMPT.format(transcript=session_material)
 
-            from audiobench.chat.providers.ollama_provider import OllamaClient
+            from audiobench.chat.providers.provider_outcome import OutcomeType
+            from audiobench.chat.providers.router import router_for_settings
             from audiobench.core.settings import get_settings
-            from audiobench.memory.query_engine import Ok, _call_llm
             from audiobench.memory.session_store import save_session_summary
 
             settings = get_settings()
-            llm = OllamaClient(base_url=settings.ollama_base_url, model=settings.ollama_model)
+            router = router_for_settings(settings)
 
             console.print(f"  [dim]Generating summary for session #{target_id}…[/dim]")
-            match _call_llm(prompt, 0.3, llm, settings.gemini_api_key):
-                case Ok(value=summary_text):
-                    summary_text = summary_text.strip()
-                    save_session_summary(target_id, summary_text)
-                    console.print(
-                        Panel(
-                            Markdown(summary_text),
-                            title=f"[bold cyan]{title}[/bold cyan]  [dim]{ts} · {detail.query_count} searches[/dim]",
-                            border_style="cyan",
-                            expand=True,
-                        )
+            outcome = router.generate(messages=[{"role": "user", "content": prompt}], temperature=0.3)
+            if outcome.type == OutcomeType.OK and outcome.content:
+                summary_text = outcome.content.strip()
+                save_session_summary(target_id, summary_text)
+                console.print(
+                    Panel(
+                        Markdown(summary_text),
+                        title=f"[bold cyan]{title}[/bold cyan]  [dim]{ts} · {detail.query_count} searches[/dim]",
+                        border_style="cyan",
+                        expand=True,
                     )
-                    _emit_hint(state, f"show_summary_export_{target_id}",
-                               f"Run [cyan]/export[/cyan] after switching to session #{target_id} to produce a file with this summary embedded")
-                    return None
-                case _:
-                    return "[red]Summary generation failed. Check Ollama/Gemini is available.[/red]"
+                )
+                _emit_hint(state, f"show_summary_export_{target_id}",
+                           f"Run [cyan]/export[/cyan] after switching to session #{target_id} to produce a file with this summary embedded")
+                return None
+            else:
+                return "[red]Summary generation failed. Check Ollama/Gemini is available.[/red]"
         else:
             # Structural view: fast, no LLM, shows queries + recurring sources
             lines = [f"[bold]Session #{target_id}[/bold]  [dim]{ts} · {title} · {detail.query_count} searches[/dim]"]
@@ -789,19 +789,19 @@ def _parse_slash_command(
                 f"{queries}"
             )
 
-            from audiobench.chat.providers.ollama_provider import OllamaClient
+            from audiobench.chat.providers.provider_outcome import OutcomeType
+            from audiobench.chat.providers.router import router_for_settings
             from audiobench.core.settings import get_settings
-            from audiobench.memory.query_engine import Ok, _call_llm
 
             settings = get_settings()
-            llm = OllamaClient(base_url=settings.ollama_base_url, model=settings.ollama_model)
+            router = router_for_settings(settings)
 
             # Using low temperature for predictable short titles
-            match _call_llm(prompt, 0.2, llm, settings.gemini_api_key):
-                case Ok(value=ans):
-                    new_title = ans.strip().strip('"').strip("'")
-                case _:
-                    return "[red]Auto-rename LLM call failed.[/red]"
+            outcome = router.generate(messages=[{"role": "user", "content": prompt}], temperature=0.2)
+            if outcome.type == OutcomeType.OK and outcome.content:
+                new_title = outcome.content.strip().strip('"').strip("'")
+            else:
+                return "[red]Auto-rename LLM call failed.[/red]"
 
         if not new_title:
             return "[red]Usage: /rename <new title> | /rename auto[/red]"

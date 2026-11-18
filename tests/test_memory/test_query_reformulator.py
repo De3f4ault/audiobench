@@ -2,41 +2,56 @@
 
 import dataclasses
 import json
+from unittest.mock import MagicMock
 
 import pytest
 
-from audiobench.memory.query_engine import Err, Ok
+from audiobench.chat.providers.provider_outcome import LlmOutcome, OutcomeType
 from audiobench.memory.query_reformulator import QueryReformulator, ReformulatedQuery
 
 
 @pytest.fixture
 def mock_llm_returns_valid_json(monkeypatch):
-    """Mocks _call_llm to return a valid JSON payload with sufficient lengths."""
-    def mock_call(*args, **kwargs):
-        payload = {
-            "bm25_keywords": "bike incident lesson safety road injury",
-            "semantic_query": "The user is looking for reflections or lessons learned from a past incident involving a bicycle.",
-            "hyde_anchor": "When I look back at the bike incident, I realize the importance of safety gear. " * 15 # Ensure it's long enough
-        }
-        return Ok(value=json.dumps(payload))
-    monkeypatch.setattr("audiobench.memory.query_reformulator._call_llm", mock_call)
-    monkeypatch.setattr("audiobench.memory.query_reformulator._call_llm_for_model", mock_call)
+    """Mocks router to return a valid JSON payload with sufficient lengths."""
+    payload = {
+        "bm25_keywords": "bike incident lesson safety road injury",
+        "semantic_query": "The user is looking for reflections or lessons learned from a past incident involving a bicycle.",
+        "hyde_anchor": "When I look back at the bike incident, I realize the importance of safety gear. " * 15 # Ensure it's long enough
+    }
+    mock_router = MagicMock()
+    mock_router.generate.return_value = LlmOutcome(
+        type=OutcomeType.OK,
+        content=json.dumps(payload),
+        provider="ollama",
+    )
+    monkeypatch.setattr("audiobench.memory.query_reformulator.router_for_settings", lambda *a, **kw: mock_router)
+    return mock_router
+
 
 @pytest.fixture
 def mock_llm_fails(monkeypatch):
-    """Mocks _call_llm to return an Err."""
-    def mock_call(*args, **kwargs):
-        return Err(error="Connection refused")
-    monkeypatch.setattr("audiobench.memory.query_reformulator._call_llm", mock_call)
-    monkeypatch.setattr("audiobench.memory.query_reformulator._call_llm_for_model", mock_call)
+    """Mocks router to return a FAILED outcome."""
+    mock_router = MagicMock()
+    mock_router.generate.return_value = LlmOutcome(
+        type=OutcomeType.FAILED,
+        content="",
+        error=Exception("Connection refused"),
+    )
+    monkeypatch.setattr("audiobench.memory.query_reformulator.router_for_settings", lambda *a, **kw: mock_router)
+    return mock_router
+
 
 @pytest.fixture
 def mock_llm_returns_garbage(monkeypatch):
-    """Mocks _call_llm to return invalid JSON."""
-    def mock_call(*args, **kwargs):
-        return Ok(value="This is definitely not json!")
-    monkeypatch.setattr("audiobench.memory.query_reformulator._call_llm", mock_call)
-    monkeypatch.setattr("audiobench.memory.query_reformulator._call_llm_for_model", mock_call)
+    """Mocks router to return invalid JSON."""
+    mock_router = MagicMock()
+    mock_router.generate.return_value = LlmOutcome(
+        type=OutcomeType.OK,
+        content="This is definitely not json!",
+        provider="ollama",
+    )
+    monkeypatch.setattr("audiobench.memory.query_reformulator.router_for_settings", lambda *a, **kw: mock_router)
+    return mock_router
 
 
 def test_reformulated_query_is_frozen_dataclass():
@@ -75,3 +90,19 @@ def test_reformulator_fallback_on_invalid_json(mock_llm_returns_garbage):
     assert isinstance(rq.bm25_keywords, str)
     assert len(rq.bm25_keywords) > 0
     assert rq.bm25_keywords == "any query"
+
+
+def test_reformulator_fallback_on_degraded_outcome(monkeypatch):
+    """Gate 2: DEGRADED outcome must trigger fallback to original query, NOT parse digest as JSON."""
+    mock_router = MagicMock()
+    mock_router.generate.return_value = LlmOutcome(
+        type=OutcomeType.DEGRADED,
+        content="### Dialectic Digest: test query\n\n*(LLM service unavailable)*\n\n**[1] Author** — *Work*",
+        degraded_mode="extractive",
+    )
+    monkeypatch.setattr("audiobench.memory.query_reformulator.router_for_settings", lambda *a, **kw: mock_router)
+    rq = QueryReformulator().reformulate("test query")
+    assert rq.original == "test query"
+    assert rq.bm25_keywords == "test query"
+    assert rq.semantic_query == "test query"
+    assert rq.hyde_anchor == "Hypothetical answer to the query: test query"

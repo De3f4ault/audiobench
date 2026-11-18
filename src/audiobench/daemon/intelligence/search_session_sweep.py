@@ -299,31 +299,27 @@ class SearchSessionSweep(IntelligenceTask):
             if not transcript:
                 return
 
-            from audiobench.chat.providers.ollama_provider import OllamaClient
-
+            from audiobench.chat.providers.provider_outcome import OutcomeType
+            from audiobench.chat.providers.router import router_for_settings
             from audiobench.core.prompts import SESSION_SUMMARY_PROMPT
             from audiobench.core.settings import get_settings
-            from audiobench.memory.query_engine import Ok, _call_llm
 
             prompt = SESSION_SUMMARY_PROMPT.format(transcript=transcript)
             settings = get_settings()
-            llm = OllamaClient(
-                base_url=settings.ollama_base_url,
-                model=settings.ollama_model,
-            )
+            router = router_for_settings(settings)
 
-            match _call_llm(prompt, 0.3, llm, settings.gemini_api_key):
-                case Ok(value=summary_text):
-                    summary_text = summary_text.strip()
-                    if summary_text:
-                        ss_mod.save_session_summary(session_id, summary_text)
-                        logger.info(
-                            "SearchSessionSweep: auto-summary saved for session %d", session_id
-                        )
+            outcome = router.generate(messages=[{"role": "user", "content": prompt}], temperature=0.3)
+            if outcome.type == OutcomeType.OK and outcome.content:
+                summary_text = outcome.content.strip()
+                if summary_text:
+                    ss_mod.save_session_summary(session_id, summary_text)
+                    logger.info(
+                        "SearchSessionSweep: auto-summary saved for session %d", session_id
+                    )
 
-                        # Push to sweep deque so next RAG sweep ingests it as an expression
-                        from audiobench.daemon.sweep_state import get_sweep_state
-                        get_sweep_state().push_summary_session(session_id)
+                    # Push to sweep deque so next RAG sweep ingests it as an expression
+                    from audiobench.daemon.sweep_state import get_sweep_state
+                    get_sweep_state().push_summary_session(session_id)
 
         except Exception as exc:
             logger.error(

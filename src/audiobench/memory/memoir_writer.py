@@ -219,15 +219,16 @@ class MemoirWriter:
     def _call_llm(self, user_prompt: str, title: str) -> Memoir:
         """Try to call the LLM; fall back to a minimal default on failure."""
         try:
-            from audiobench.memory.llm_caller import _call_llm
-            from audiobench.memory.query_engine import Ok
+            from audiobench.chat.providers.provider_outcome import OutcomeType
+            from audiobench.chat.providers.router import router_for_settings
 
-            result = _call_llm(
-                prompt=f"{_MEMOIR_SYSTEM}\n\n{user_prompt}",
+            router = router_for_settings()
+            outcome = router.generate(
+                messages=[{"role": "user", "content": f"{_MEMOIR_SYSTEM}\n\n{user_prompt}"}],
                 temperature=0.3,
             )
-            if isinstance(result, Ok) and result.value:
-                return self._parse_llm_response(result.value, title)
+            if outcome.type == OutcomeType.OK and outcome.content:
+                return self._parse_llm_response(outcome.content, title)
         except Exception:
             logger.warning("LLM call failed during memoir generation", exc_info=True)
 
