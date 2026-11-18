@@ -11,7 +11,7 @@ import pytest
 
 from audiobench.chat.providers.llm_providers import _render_extractive_digest
 from audiobench.chat.providers.provider_outcome import OutcomeType
-from audiobench.chat.providers.router import ProviderRouter
+from audiobench.chat.providers.router import FallbackPolicy, ProviderRouter
 from audiobench.core.settings import AudioBenchSettings
 from audiobench.memory.synthesis_retriever import SynthesisFragment
 
@@ -118,6 +118,10 @@ def test_router_extractive_digest_outcome_parity():
         context_fragments=fragments,
         query=query,
         digest_mode="extractive",
+        # NO_LOCAL_CPU: test is verifying the digest degradation path specifically;
+        # we don't want a live Ollama server to intercept with a local model and
+        # mask whether the digest path is reached.
+        fallback_policy=FallbackPolicy.NO_LOCAL_CPU,
     )
 
     assert outcome.type == OutcomeType.DEGRADED

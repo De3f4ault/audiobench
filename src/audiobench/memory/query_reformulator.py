@@ -4,7 +4,7 @@ import json
 from typing import Any
 
 from audiobench.chat.providers.provider_outcome import OutcomeType
-from audiobench.chat.providers.router import ProviderRouter, router_for_settings
+from audiobench.chat.providers.router import FallbackPolicy, ProviderRouter, router_for_settings
 from audiobench.core.logger_factory import get_logger
 from audiobench.core.settings import get_settings
 from audiobench.memory.query_types import ReformulatedQuery
@@ -45,6 +45,7 @@ class QueryReformulator:
         outcome = self.router.generate(
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
+            fallback_policy=FallbackPolicy.NO_LOCAL_CPU,
         )
 
         if outcome.type == OutcomeType.OK and outcome.content:

@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
 from audiobench.chat.chat_store import ChatRepository
 from audiobench.chat.providers.provider_outcome import LlmOutcome, OutcomeType
-from audiobench.chat.providers.router import ProviderRouter, router_for_settings
+from audiobench.chat.providers.router import FallbackPolicy, ProviderRouter, router_for_settings
 from audiobench.core.db_session import get_session
 from audiobench.core.logger_factory import get_logger
 from audiobench.core.settings import get_settings
@@ -503,6 +503,17 @@ class ResearchEngine:
         # ── Stage 1: Query reformulation ─────────────────────────────────────
         # When skip_synthesis=True (e.g. /search in chat), skip the LLM reformulation
         # entirely — use the raw query as keywords. This makes /search fully offline-capable.
+        #
+        # Shared router — built ONCE and reused for Stage 1 (reformulation), Stage 1b
+        # (HyDE), and Stage 4 (synthesis).  Using three independent router_for_settings()
+        # calls caused Flaw D: each had its own circuit-breaker state so a 402 on Stage 1
+        # triggered a fresh local swap on Stage 1b and again on Stage 4, multiplying the
+        # freeze.  A single instance shares breaker state across all stages.
+        settings = get_settings()
+        _search_router = router_for_settings(settings)
+        if model:
+            _search_router.set_primary_model(model)
+
         t_reform = time.perf_counter()
         if skip_synthesis:
             from audiobench.memory.query_types import ReformulatedQuery
@@ -515,7 +526,7 @@ class ResearchEngine:
             )
         else:
             from audiobench.memory.query_reformulator import QueryReformulator
-            reformulator = QueryReformulator(model=model)
+            reformulator = QueryReformulator(model=model, router=_search_router)
             rq = reformulator.reformulate(query)
         reform_ms = (time.perf_counter() - t_reform) * 1000
         log_event(
@@ -536,14 +547,10 @@ class ResearchEngine:
                 "Limit to 100-150 words. Raw transcript only — no preamble.\n\n"
                 f"Query: {query}"
             )
-            settings = get_settings()
-            router = router_for_settings(settings)
-            if model:
-                router.set_primary_model(model)
-
-            outcome = router.generate(
+            outcome = _search_router.generate(
                 messages=[{"role": "user", "content": hyde_prompt}],
                 temperature=0.7,
+                fallback_policy=FallbackPolicy.NO_LOCAL_CPU,
             )
             if outcome.type == OutcomeType.OK and outcome.content:
                 doc = outcome.content
@@ -843,13 +850,14 @@ class ResearchEngine:
 
         t_synth = time.perf_counter()
 
-        router = router_for_settings(settings)
-        if model_name:
-            router.set_primary_model(model_name)
-
-        outcome = router.generate(
+        # Reuse the shared _search_router (created at Stage 1) so circuit-breaker
+        # state accumulated during reformulation and HyDE carries into synthesis.
+        # This prevents Flaw D: a fresh router on a 402 would rediscover and
+        # attempt the failed cloud model, triggering a redundant local swap.
+        outcome = _search_router.generate(
             messages=[{"role": "user", "content": synthesis_prompt}],
             temperature=0.2,
+            fallback_policy=FallbackPolicy.NO_LOCAL_CPU,
         )
 
         if outcome.type == OutcomeType.OK and outcome.content:

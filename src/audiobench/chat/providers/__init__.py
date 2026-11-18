@@ -26,6 +26,7 @@ from audiobench.chat.providers.provider_errors import (
 )
 from audiobench.chat.providers.provider_outcome import LlmOutcome, OutcomeType
 from audiobench.chat.providers.router import (
+    FallbackPolicy,
     ProviderRouter,
     ProviderSlot,
     invalidate_router,
@@ -36,6 +37,7 @@ __all__ = [
     "AIError",
     "AllProvidersFailedError",
     "DigestProvider",
+    "FallbackPolicy",
     "GeminiError",
     "GeminiFatalError",
     "GeminiLLMProvider",

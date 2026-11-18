@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable, Iterator
 
 from audiobench.chat.providers.llm_providers import (
@@ -25,6 +26,22 @@ from audiobench.core.settings import AudioBenchSettings
 from audiobench.memory.llm_caller import CircuitBreaker
 
 logger = logging.getLogger(__name__)
+
+
+class FallbackPolicy(str, Enum):
+    """Controls whether the router may fall back to a local CPU model after all cloud slots fail.
+
+    ``ALLOW_LOCAL`` (default) — after exhausting all configured slots, attempt a local Ollama
+    model as a last resort before the Digest degradation path.  Appropriate for interactive
+    *chat* where the user expects a response even if it is slow.
+
+    ``NO_LOCAL_CPU`` — skip the local-last-resort step entirely.  Use for search pipeline
+    callers (QueryReformulator, HyDE, synthesis) where a 2-minute CPU inference is worse
+    than an honest failure: the pipeline has its own graceful degradation path.
+    """
+
+    ALLOW_LOCAL = "allow_local"
+    NO_LOCAL_CPU = "no_local_cpu"
 
 
 @dataclass
@@ -233,6 +250,7 @@ class ProviderRouter:
         context_fragments: list[Any] | None = None,
         digest_mode: str = "silent",
         disclosure_fn: Callable[[str], None] | None = None,
+        fallback_policy: FallbackPolicy = FallbackPolicy.ALLOW_LOCAL,
         **kw,
     ) -> LlmOutcome:
         """Always returns LlmOutcome. Never raises on provider failure."""
@@ -300,26 +318,16 @@ class ProviderRouter:
                         fallback_reason=prev_err,
                         error=result,
                     )
-                if isinstance(result, ProviderQuotaError):
-                    slot.breaker.record_failure()
-                    prev_name, prev_err = slot.name, str(result)
-                    if isinstance(result, OllamaQuotaError) and slot.provider.is_cloud:
-                        local = self._discover_local_ollama()
-                        if local:
-                            self._swap_ollama_slot(slot, local_model=local)
-                            retry_this_slot = True
-                else:
-                    slot.breaker.record_failure()
-                    prev_name, prev_err = slot.name, "rate_limit (retries exhausted)"
+                # quota or generic rate-limit exhaustion — advance to next slot
+                slot.breaker.record_failure()
+                prev_name, prev_err = slot.name, str(result) if isinstance(result, ProviderQuotaError) else "rate_limit (retries exhausted)"
 
             except ProviderQuotaError as e:
+                # Record the failure and let the loop advance to the next slot
+                # (e.g. Gemini). Local CPU discovery is deferred to post-loop so
+                # cloud alternatives are always tried first.
                 slot.breaker.record_failure()
                 prev_name, prev_err = slot.name, str(e)
-                if isinstance(e, OllamaQuotaError) and slot.provider.is_cloud:
-                    local = self._discover_local_ollama()
-                    if local:
-                        self._swap_ollama_slot(slot, local_model=local)
-                        retry_this_slot = True
 
             except (ProviderUnavailableError, ProviderTimeoutError) as e:
                 slot.breaker.record_failure()
@@ -345,7 +353,42 @@ class ProviderRouter:
             if not retry_this_slot:
                 idx += 1
 
-        # All slots exhausted — degrade
+        # ── All configured slots exhausted ────────────────────────────────────
+        # Last resort: try a small local Ollama model — but ONLY when the caller
+        # permits it AND the failure was quota exhaustion (not a network outage or fatal error).
+        # Search-pipeline callers pass NO_LOCAL_CPU because a 2-minute CPU inference
+        # is worse than an honest degradation; interactive chat passes ALLOW_LOCAL (the default).
+        if (
+            fallback_policy == FallbackPolicy.ALLOW_LOCAL
+            and prev_err
+            and "quota" in prev_err.lower()
+        ):
+            local = self._discover_local_ollama()
+            if local:
+                try:
+                    from audiobench.chat.providers.ollama_provider import OllamaClient
+                    local_client = OllamaClient(
+                        base_url=self._settings.ollama_base_url, model=local
+                    )
+                    # Force think=False — local CPU models with thinking tokens can
+                    # stall for minutes; better to get a fast answer without CoT.
+                    result = local_client.chat(messages, temperature=temperature, think=False)
+                    content = result.get("content", "") if isinstance(result, dict) else str(result)
+                    if disclosure_fn:
+                        disclosure_fn(
+                            f"ⓘ All cloud providers unavailable — using local fallback {local}"
+                        )
+                    return LlmOutcome(
+                        type=OutcomeType.OK,
+                        content=content,
+                        provider=f"ollama-local:{local}",
+                        fallback_from=prev_name,
+                        fallback_reason=prev_err,
+                    )
+                except Exception as e:
+                    logger.warning("Local fallback %s also failed: %s", local, e)
+
+        # All slots and local fallback exhausted — degrade
         digest_content = self._digest.generate(
             messages, digest_mode=digest_mode, context_fragments=context_fragments, **kw
         )
@@ -478,11 +521,7 @@ class ProviderRouter:
                             "content": "",
                             "done": False,
                         }
-                    if isinstance(result, OllamaQuotaError) and slot.provider.is_cloud:
-                        local = self._discover_local_ollama()
-                        if local:
-                            self._swap_ollama_slot(slot, local_model=local)
-                            retry_this_slot = True
+                    # Advance to next slot (e.g. Gemini). Local swap is deferred to post-loop.
                 else:
                     slot.breaker.record_failure()
                     prev_name, prev_err = slot.name, "rate_limit (retries exhausted)"
@@ -502,11 +541,7 @@ class ProviderRouter:
                         "content": "",
                         "done": False,
                     }
-                if isinstance(e, OllamaQuotaError) and slot.provider.is_cloud:
-                    local = self._discover_local_ollama()
-                    if local:
-                        self._swap_ollama_slot(slot, local_model=local)
-                        retry_this_slot = True
+                # Advance to next slot. Local swap deferred to post-loop.
 
             except Exception as e:
                 slot.breaker.record_failure()

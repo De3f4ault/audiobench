@@ -281,34 +281,32 @@ def test_chain_disabled_returns_failed_outcome():
     assert isinstance(outcome.error, ProviderFatalError)
 
 
-def test_quota_swaps_to_local_and_retries():
+def test_quota_swaps_to_local_and_retries(monkeypatch):
     router = _make_test_router()
     cloud_ollama = MagicMock()
     cloud_ollama.generate.side_effect = OllamaQuotaError("Quota")
     cloud_ollama.is_cloud = True
 
     gemini_mock = MagicMock()
+    gemini_mock.generate.side_effect = ProviderQuotaError("Gemini Quota")
 
     slot = ProviderSlot("ollama", cloud_ollama, CircuitBreaker())
     router._slots = [slot, ProviderSlot("gemini", gemini_mock, CircuitBreaker())]
 
-    # Mock discovery to return local model and mock swap
+    # Mock discovery to return local model
     router._discover_local_ollama = MagicMock(return_value="phi3:3b")  # type: ignore[method-assign]
-    local_ollama = MagicMock()
-    local_ollama.generate.return_value = "local phi3 output"
-    local_ollama.is_cloud = False
-
-    def fake_swap(s, local_model):
-        s.provider = local_ollama
-        s.breaker.reset()
-
-    router._swap_ollama_slot = fake_swap  # type: ignore[method-assign]
+    fake_client = MagicMock()
+    fake_client.chat.return_value = {"content": "local phi3 output"}
+    monkeypatch.setattr(
+        "audiobench.chat.providers.ollama_provider.OllamaClient",
+        lambda **kw: fake_client,
+    )
 
     outcome = router.generate([{"role": "user", "content": "test"}])
     assert outcome.type == OutcomeType.OK
     assert outcome.content == "local phi3 output"
-    assert outcome.provider == "ollama"
-    gemini_mock.generate.assert_not_called()
+    assert outcome.provider == "ollama-local:phi3:3b"
+    gemini_mock.generate.assert_called_once()
 
 
 def test_local_discovery_prefers_smallest(monkeypatch):
