@@ -15,7 +15,6 @@ from unittest.mock import MagicMock, patch
 
 from audiobench.daemon.server import _dispatch
 
-
 # ---------------------------------------------------------------------------
 # Helper: drain an async generator, return all frames
 # ---------------------------------------------------------------------------
@@ -121,3 +120,94 @@ def test_daemon_search_contract() -> None:
         use_dense=True,
         use_colbert=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# 4. Whisper STT Lifecycle and Transcription
+# ---------------------------------------------------------------------------
+
+def test_daemon_whisper_acquire_release_lifecycle() -> None:
+    """_dispatch handles whisper_acquire and whisper_release with reference counting."""
+    import audiobench.daemon.server as srv
+
+    # Reset any state
+    srv._stt_sessions.clear()
+    srv._warm_whisper_model = None
+    srv._warm_whisper_key = None
+
+    mock_model = MagicMock()
+    with patch("faster_whisper.WhisperModel", return_value=mock_model):
+        # 1. Acquire session 1 (chat)
+        req1 = {
+            "cmd": "whisper_acquire",
+            "args": {"session_id": "chat_session_1", "model": "base"},
+            "request_id": "req-acq-1",
+        }
+        resp1 = _terminal(_run(json.dumps(req1)))
+        assert resp1["success"] is True
+        assert resp1["data"]["ok"] is True
+        assert resp1["data"]["active_sessions"] == 1
+        assert srv._warm_whisper_model is mock_model
+
+        # 2. Acquire session 2 (search) with same model -> shared
+        req2 = {
+            "cmd": "whisper_acquire",
+            "args": {"session_id": "search_session_2", "model": "base"},
+            "request_id": "req-acq-2",
+        }
+        resp2 = _terminal(_run(json.dumps(req2)))
+        assert resp2["success"] is True
+        assert resp2["data"]["active_sessions"] == 2
+        assert srv._warm_whisper_model is mock_model
+
+        # 3. Release session 1 -> model remains warm
+        req3 = {
+            "cmd": "whisper_release",
+            "args": {"session_id": "chat_session_1"},
+            "request_id": "req-rel-1",
+        }
+        resp3 = _terminal(_run(json.dumps(req3)))
+        assert resp3["success"] is True
+        assert resp3["data"]["active_sessions"] == 1
+        assert srv._warm_whisper_model is mock_model
+
+        # 4. Release session 2 -> last session exits, model is purged from RAM
+        req4 = {
+            "cmd": "whisper_release",
+            "args": {"session_id": "search_session_2"},
+            "request_id": "req-rel-2",
+        }
+        resp4 = _terminal(_run(json.dumps(req4)))
+        assert resp4["success"] is True
+        assert resp4["data"]["active_sessions"] == 0
+        assert srv._warm_whisper_model is None
+
+
+def test_daemon_whisper_transcribe() -> None:
+    """_dispatch('whisper_transcribe') transcribes audio file using warm model."""
+    import audiobench.daemon.server as srv
+
+    mock_segment = MagicMock()
+    mock_segment.text = "Hello from warm daemon Whisper"
+    mock_info = MagicMock()
+    mock_info.language = "en"
+
+    mock_model = MagicMock()
+    mock_model.transcribe.return_value = ([mock_segment], mock_info)
+
+    srv._warm_whisper_model = mock_model
+    srv._warm_whisper_key = "base:cpu:int8"
+
+    with patch("os.path.exists", return_value=True), \
+         patch("audiobench.daemon.server._ensure_whisper_loaded", return_value=mock_model):
+        req = {
+            "cmd": "whisper_transcribe",
+            "args": {"file_path": "/tmp/test_voice.wav", "model": "base", "language": "en"},
+            "request_id": "req-tx-1",
+        }
+        resp = _terminal(_run(json.dumps(req)))
+        assert resp["success"] is True
+        assert resp["data"]["ok"] is True
+        assert resp["data"]["text"] == "Hello from warm daemon Whisper"
+        assert resp["data"]["language"] == "en"
+        mock_model.transcribe.assert_called_once_with("/tmp/test_voice.wav", language="en")

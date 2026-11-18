@@ -80,13 +80,13 @@ class LiveDisplay:
         elapsed_str = self._format_time(self.elapsed)
 
         if self._state == "listening":
-            display.append("  🎤 Listening...  ", style="bold green")
+            display.append("  * Listening...   ", style="bold green")
         elif self._state == "recording":
-            display.append("  🔴 Recording...  ", style="bold red")
+            display.append("  [REC] Recording... ", style="bold red")
         elif self._state == "processing":
-            display.append("  ⏳ Processing... ", style="bold yellow")
+            display.append("  [...] Processing...", style="bold yellow")
         else:
-            display.append("  ⏸  Initializing...", style="dim")
+            display.append("  [--] Initializing...", style="dim")
 
         display.append(f"[{elapsed_str}]\n", style="dim")
         display.append("\n")

@@ -43,9 +43,10 @@ class LightweightDiarizer:
         if not transcript.segments:
             return transcript
 
-        from audiobench.diarization.verification import SpeakerVerificationEngine
-        from sklearn.cluster import AgglomerativeClustering
         import numpy as np
+        from sklearn.cluster import AgglomerativeClustering
+
+        from audiobench.diarization.verification import SpeakerVerificationEngine
 
         engine = SpeakerVerificationEngine(device=self.device)
         embeddings = []
@@ -104,8 +105,9 @@ class LightweightDiarizer:
         speaker_map = {}
 
         try:
-            from audiobench.memory.memory_store import SpeakerProfileStore
             import uuid
+
+            from audiobench.memory.memory_store import SpeakerProfileStore
 
             profile_store = SpeakerProfileStore()
 
@@ -304,22 +306,23 @@ class PyannoteDiarizer:
         # Simplify speaker labels (SPEAKER_00 → Speaker 1) or Global Identity
         speakers = sorted({s.speaker for s in transcript.segments if s.speaker})
         speaker_map = {}
-        
+
         if audio_path:
             try:
+                import uuid
+
                 from audiobench.diarization.verification import SpeakerVerificationEngine
                 from audiobench.memory.memory_store import SpeakerProfileStore
-                import uuid
-                
+
                 verification_engine = SpeakerVerificationEngine()
                 profile_store = SpeakerProfileStore()
-                
+
                 for i, spk in enumerate(speakers):
                     spk_turns = [(t.start, t.end) for t in sorted_turns if t.speaker == spk]
                     try:
                         vector = verification_engine.extract_mean_voice_print(audio_path, spk_turns)
                         global_name = profile_store.identify_speaker(vector)
-                        
+
                         if global_name:
                             speaker_map[spk] = global_name
                         else:

@@ -98,3 +98,55 @@ class OptimizeResult(TypedDict):
     duration_seconds: float
     last_optimized_at: str
     bytes_freed: NotRequired[int]
+
+
+class PlaybackPlayArgs(TypedDict):
+    file_path: str
+    start_pos: NotRequired[float]
+    speed: NotRequired[float]
+    audio_file_id: NotRequired[int | None]
+    transcription_id: NotRequired[int | None]
+    segments: NotRequired[list[dict[str, Any]]]
+    auto_resume: NotRequired[bool]
+
+
+class PlaybackSeekArgs(TypedDict):
+    position: float
+
+
+class PlaybackSpeedArgs(TypedDict):
+    speed: float
+
+
+class PlaybackStatus(TypedDict):
+    playing: bool
+    paused: NotRequired[bool]
+    position: NotRequired[float]
+    duration: NotRequired[float]
+    speed: NotRequired[float]
+    file: NotRequired[str | None]
+    audio_file_id: NotRequired[int | None]
+    transcription_id: NotRequired[int | None]
+
+
+class PlaybackSyncSessionArgs(TypedDict):
+    file_path: str
+    transcription_id: NotRequired[int | None]
+    position: NotRequired[float]
+    audio_file_id: NotRequired[int | None]
+
+
+class WhisperAcquireArgs(TypedDict):
+    session_id: str
+    model: NotRequired[str]
+
+
+class WhisperReleaseArgs(TypedDict):
+    session_id: str
+
+
+class WhisperTranscribeArgs(TypedDict):
+    file_path: str
+    language: NotRequired[str]
+    model: NotRequired[str]
+

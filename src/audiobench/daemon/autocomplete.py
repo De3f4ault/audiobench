@@ -18,6 +18,7 @@ Design:
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import threading
 from typing import Any
 
@@ -35,7 +36,7 @@ _MAX_ELEMENTS: int = 1_000_000  # Upper bound on corpus size
 
 
 class AutocompleteIndex:
-    """In-memory HNSW index (via hnswlib) over expression summary vectors.
+    """In-memory HNSW index (via InCoreHNSWIndex) over expression summary vectors.
 
     Built at daemon startup from LanceDB. Refreshed incrementally as the
     RAG sweep writes new expressions.
@@ -44,12 +45,20 @@ class AutocompleteIndex:
     expressions from the corpus.
     """
 
-    def __init__(self) -> None:
-        self.ready: bool = False
-        self._index: hnswlib.Index | None = None
-        self._id_map: list[int] = []   # hnswlib label → expression_id
-        self._text_map: list[str] = [] # hnswlib label → expression content
+    def __init__(self, shared_index: Any | None = None) -> None:
+        self._shared_index = shared_index
+        self._text_cache: dict[int, str] = {}
         self._lock = threading.Lock()
+
+    @property
+    def ready(self) -> bool:
+        if self._shared_index is not None:
+            return self._shared_index.is_ready()
+        return False
+
+    @ready.setter
+    def ready(self, value: bool) -> None:
+        pass  # compatibility
 
     # ------------------------------------------------------------------
     # Public API
@@ -64,41 +73,27 @@ class AutocompleteIndex:
         logger.info("Building AutocompleteIndex from LanceDB...")
         rows = self._load_vectors()  # list of (expression_id, vector, content)
 
+        if self._shared_index is None:
+            from audiobench.daemon.index import InCoreHNSWIndex
+            import tempfile
+            self._shared_index = InCoreHNSWIndex(data_dir=Path(tempfile.mkdtemp()))
+
         if not rows:
             logger.warning("AutocompleteIndex: no expression vectors found — index empty.")
-            self.ready = True
+            self._shared_index.load_or_build([])
             return
 
-        ids = [r[0] for r in rows]
-        texts = [r[2] for r in rows]
-        matrix = np.array([r[1] for r in rows], dtype=np.float32)
-
-        # Normalise for cosine similarity (hnswlib ip space == dot product on
-        # normalised vectors == cosine similarity)
-        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        matrix /= norms
-
-        n = len(ids)
-        index = hnswlib.Index(space="ip", dim=_DIM)
-        index.init_index(
-            max_elements=max(n, _MAX_ELEMENTS),
-            ef_construction=_EF_CONSTRUCTION,
-            M=_M,
-        )
-        index.set_ef(_EF_SEARCH)
-        labels = list(range(n))
-        index.add_items(matrix, labels)
-
         with self._lock:
-            self._index = index
-            self._id_map = ids
-            self._text_map = texts
-            self.ready = True
+            self._text_cache = {int(r[0]): str(r[2]) for r in rows}
 
-        logger.info("AutocompleteIndex ready — %d expressions indexed.", n)
+        embeddable_tuples = [(int(r[0]), np.array(r[1], dtype=np.float32)) for r in rows]
+        self._shared_index.load_or_build(embeddable_tuples)
+        # Persist snapshot
+        self._shared_index.save()
 
-    def lookup(self, query_vector: list[float], k: int = 5) -> list[dict[str, Any]]:
+        logger.info("AutocompleteIndex ready — %d expressions indexed.", self._shared_index.item_count())
+
+    def lookup(self, query_vector: list[float] | np.ndarray, k: int = 5) -> list[dict[str, Any]]:
         """Return up to k nearest expressions for the given query vector.
 
         Args:
@@ -113,35 +108,34 @@ class AutocompleteIndex:
         Raises:
             RuntimeError: if called before :meth:`build`.
         """
-        if not self.ready or self._index is None:
+        if self._shared_index is None or not self._shared_index.is_ready():
             raise RuntimeError("INDEX_NOT_READY")
 
-        v = np.array(query_vector, dtype=np.float32)
-        norm = np.linalg.norm(v)
-        if norm > 0:
-            v /= norm
-
+        hits = self._shared_index.query(query_vector, k=k)
+        results = []
         with self._lock:
-            # Clamp k to the actual number of indexed items
-            actual_k = min(k, self._index.get_current_count())
-            if actual_k == 0:
-                return []
-            labels, _distances = self._index.knn_query(v, k=actual_k)
-            results = [
-                {
-                    "expression_id": self._id_map[label],
-                    "text": self._text_map[label],
-                }
-                for label in labels[0]
-            ]
+            missing_ids = [eid for eid, _ in hits if eid not in self._text_cache]
+            if missing_ids:
+                try:
+                    from audiobench.storage.expression_repository import ExpressionRepository
+                    repo = ExpressionRepository()
+                    records = repo.get_by_ids(missing_ids)
+                    for mid, rec in records.items():
+                        self._text_cache[mid] = rec.content
+                except Exception:
+                    pass
+
+            for eid, dist in hits:
+                text = self._text_cache.get(eid, "")
+                results.append({"expression_id": eid, "text": text})
 
         return results
 
     def item_count(self) -> int:
         """Return the number of items currently in the index."""
-        if self._index is None:
+        if self._shared_index is None:
             return 0
-        return self._index.get_current_count()
+        return self._shared_index.item_count()
 
     # ------------------------------------------------------------------
     # Internal — isolated for test patching
@@ -154,10 +148,14 @@ class AutocompleteIndex:
         Override / patch in tests to inject fake data without touching LanceDB.
         """
         try:
-            from audiobench.memory.memory_store import MemoryStore
+            from audiobench.memory.memory_store import MemoryStore, EMBEDDABLE_SOURCE_TYPES
             store = MemoryStore()
-            rows = store.table.search().select(["expression_id", "vector", "content"]).to_list()
-            return [(int(r["expression_id"]), r["vector"], r.get("content", "")) for r in rows]
+            rows = store.table.search().select(["expression_id", "vector", "content", "source_type"]).to_list()
+            return [
+                (int(r["expression_id"]), r["vector"], r.get("content", ""))
+                for r in rows
+                if r.get("source_type") in EMBEDDABLE_SOURCE_TYPES
+            ]
         except Exception as exc:
             logger.warning("AutocompleteIndex._load_vectors failed: %s", exc)
             return []
@@ -177,5 +175,6 @@ def get_autocomplete_index() -> AutocompleteIndex:
     if _index is None:
         with _index_lock:
             if _index is None:
-                _index = AutocompleteIndex()
+                from audiobench.daemon.index import get_shared_hnsw_index
+                _index = AutocompleteIndex(shared_index=get_shared_hnsw_index())
     return _index

@@ -11,7 +11,8 @@ Verb dispatch:
 - challenge:  generate adversarial alternative interpretations
 """
 import logging
-from typing import Any, AsyncGenerator
+from collections.abc import AsyncGenerator
+from typing import Any
 
 from audiobench.memory.memory_store import MemoryStore
 

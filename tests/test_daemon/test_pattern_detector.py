@@ -1,10 +1,11 @@
-import pytest
 import json
-import time
 from unittest.mock import MagicMock, patch
+
+import pytest
+
 from audiobench.daemon.intelligence.pattern_detector import PatternDetector
-from audiobench.storage.models import ExpressionRecord
 from audiobench.memory.enums import SourceType
+
 
 @pytest.fixture
 def mock_store():
@@ -15,10 +16,10 @@ def mock_store():
         2: [1.0, 0.0, 0.0], # high sim to 1
         3: [0.0, 1.0, 0.0], # low sim
     }
-    
+
     # Mock search for seen_pairs deduplication
     store.search.return_value = []
-    
+
     # Track written expressions
     store.written = []
     def mock_add(source_type, content, inference_status, **kwargs):
@@ -31,13 +32,13 @@ def mock_store():
         })
         return expr
     store.add_expression.side_effect = mock_add
-    
+
     return store
 
 @pytest.fixture
 def mock_session():
     session = MagicMock()
-    
+
     def create_mock_execute(mappings_list, calib_content=json.dumps({"seen_pairs": []})):
         def mock_execute(*args, **kwargs):
             query = str(args[0])
@@ -50,7 +51,7 @@ def mock_session():
                 res.mappings.return_value = map_res
             return res
         return mock_execute
-        
+
     mappings_list = [
         {"id": 1, "audio_file_id": 10, "work_id": 100, "source_title": "File A", "author_name": "Author X"},
         {"id": 2, "audio_file_id": 20, "work_id": 200, "source_title": "File B", "author_name": "Author Y"},
@@ -58,7 +59,7 @@ def mock_session():
     ]
     session.execute.side_effect = create_mock_execute(mappings_list)
     session.create_mock_execute = create_mock_execute
-    
+
     ctx = MagicMock()
     ctx.__enter__.return_value = session
     return ctx
@@ -69,16 +70,16 @@ def mock_session():
 async def test_high_similarity_pair_produces_inference(mock_get_store, mock_get_session, mock_store, mock_session):
     mock_get_store.return_value = mock_store
     mock_get_session.return_value = mock_session
-    
+
     detector = PatternDetector()
     await detector.run()
-    
+
     assert len(mock_store.written) == 2  # One inference + one calibration
     inf = mock_store.written[0]
     assert inf["source_type"] == SourceType.SYSTEM_INFERENCE.value
     assert inf["inference_status"] == "proposed"
     assert "Topic convergence detected" in inf["content"]
-    
+
 @pytest.mark.asyncio
 @patch("audiobench.daemon.intelligence.pattern_detector.get_session")
 @patch("audiobench.daemon.intelligence.pattern_detector._get_store")
@@ -89,10 +90,10 @@ async def test_low_similarity_pair_produces_no_inference(mock_get_store, mock_ge
     }
     mock_get_store.return_value = mock_store
     mock_get_session.return_value = mock_session
-    
+
     detector = PatternDetector()
     await detector.run()
-    
+
     inferences = [x for x in mock_store.written if x["source_type"] == SourceType.SYSTEM_INFERENCE.value]
     assert len(inferences) == 0
 
@@ -106,13 +107,13 @@ async def test_already_surfaced_pair_not_duplicated(mock_get_store, mock_get_ses
         {"id": 2, "audio_file_id": 20, "work_id": 200, "source_title": "File B", "author_name": "Author Y"},
     ]
     session.execute.side_effect = session.create_mock_execute(mappings, calib_content=json.dumps({"seen_pairs": [[1, 2]]}))
-    
+
     mock_get_store.return_value = mock_store
     mock_get_session.return_value = mock_session
-    
+
     detector = PatternDetector()
     await detector.run()
-    
+
     inferences = [x for x in mock_store.written if x["source_type"] == SourceType.SYSTEM_INFERENCE.value]
     assert len(inferences) == 0
 
@@ -126,13 +127,13 @@ async def test_cross_file_requirement_enforced(mock_get_store, mock_get_session,
         {"id": 2, "audio_file_id": 10, "work_id": 200, "source_title": "File A", "author_name": "Author Y"},
     ]
     session.execute.side_effect = session.create_mock_execute(mappings)
-    
+
     mock_get_store.return_value = mock_store
     mock_get_session.return_value = mock_session
-    
+
     detector = PatternDetector()
     await detector.run()
-    
+
     inferences = [x for x in mock_store.written if x["source_type"] == SourceType.SYSTEM_INFERENCE.value]
     assert len(inferences) == 0
 
@@ -142,10 +143,10 @@ async def test_cross_file_requirement_enforced(mock_get_store, mock_get_session,
 async def test_cross_work_inference_names_both_authors(mock_get_store, mock_get_session, mock_store, mock_session):
     mock_get_store.return_value = mock_store
     mock_get_session.return_value = mock_session
-    
+
     detector = PatternDetector()
     await detector.run()
-    
+
     inf = [x for x in mock_store.written if x["source_type"] == SourceType.SYSTEM_INFERENCE.value][0]
     assert "Author X" in inf["content"] or "Author Y" in inf["content"]
     assert "File A" in inf["content"] or "File B" in inf["content"]
@@ -160,13 +161,13 @@ async def test_cross_work_inference_not_written_when_work_id_null(mock_get_store
         {"id": 2, "audio_file_id": 20, "work_id": 200, "source_title": "File B", "author_name": "Author Y"},
     ]
     session.execute.side_effect = session.create_mock_execute(mappings)
-    
+
     mock_get_store.return_value = mock_store
     mock_get_session.return_value = mock_session
-    
+
     detector = PatternDetector()
     await detector.run()
-    
+
     inferences = [x for x in mock_store.written if x["source_type"] == SourceType.SYSTEM_INFERENCE.value]
     assert len(inferences) == 0
 

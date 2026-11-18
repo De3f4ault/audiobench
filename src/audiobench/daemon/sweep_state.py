@@ -68,6 +68,16 @@ class SweepState:
     # cumulative memory growth across batches 1 → N in a single run.
     seg_batch_count: int = 0
 
+    # O(1) search query queue: search_queries.id values that have not yet been
+    # ingested as expressions.  Populated from DB on startup and incrementally
+    # refreshed every sweep tick.  The first sweep tick processes the full
+    # backlog of all existing sessions retroactively.
+    uningested_query_ids: deque[int] = field(default_factory=deque)
+
+    # Session IDs whose session_summary is not yet an expression.
+    # Populated on startup and refreshed incrementally.
+    uningested_summary_session_ids: deque[int] = field(default_factory=deque)
+
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     # ------------------------------------------------------------------
@@ -116,12 +126,49 @@ class SweepState:
             self.pending_segment_ids = deque(seg_ids)
             self.unindexed_transcript_ids = deque(tx_ids)
 
+        # 4. Uningested search queries: search_queries that have no corresponding
+        #    expression with source_type='search_query' AND source_id=search_queries.id
+        from sqlalchemy import text as sql_text
+
+        from audiobench.core.db_session import get_session
+        with get_session() as session:
+            query_ids = session.execute(
+                sql_text(
+                    "SELECT sq.id FROM search_queries sq "
+                    "WHERE NOT EXISTS ( "
+                    "    SELECT 1 FROM expressions e "
+                    "    WHERE e.source_type = 'search_query' "
+                    "      AND e.source_id = sq.id "
+                    ") ORDER BY sq.id"
+                )
+            ).scalars().all()
+
+            # 5. Sessions with summaries not yet ingested as expressions
+            summary_ids = session.execute(
+                sql_text(
+                    "SELECT ss.id FROM search_sessions ss "
+                    "WHERE ss.session_summary IS NOT NULL "
+                    "  AND NOT EXISTS ( "
+                    "      SELECT 1 FROM expressions e "
+                    "      WHERE e.source_type = 'search_session_summary' "
+                    "        AND e.source_id = ss.id "
+                    "  ) ORDER BY ss.id"
+                )
+            ).scalars().all()
+
+        with self._lock:
+            self.uningested_query_ids = deque(query_ids)
+            self.uningested_summary_session_ids = deque(summary_ids)
+
         logger.info(
             "SweepState loaded — %d known hashes | %d pending segments | "
-            "%d unindexed transcripts",
+            "%d unindexed transcripts | %d uningested search queries | "
+            "%d uningested summaries",
             len(self.known_hashes),
             len(self.pending_segment_ids),
             len(self.unindexed_transcript_ids),
+            len(self.uningested_query_ids),
+            len(self.uningested_summary_session_ids),
         )
 
     def sync_indexed_expression_ids(self) -> None:
@@ -133,9 +180,11 @@ class SweepState:
             from audiobench.memory.memory_store import MemoryStore
 
             store = MemoryStore.__new__(MemoryStore)  # reuse existing table
-            from audiobench.core.settings import get_settings
             from pathlib import Path
+
             import lancedb
+
+            from audiobench.core.settings import get_settings
 
             settings = get_settings()
             lancedb_dir = Path(settings.data_dir) / "lancedb"
@@ -249,6 +298,54 @@ class SweepState:
         """Put failed transcript IDs back at the front of the deque."""
         with self._lock:
             self.unindexed_transcript_ids.extendleft(reversed(ids))
+
+    # ------------------------------------------------------------------
+    # Search query deque — O(1) pop
+    # ------------------------------------------------------------------
+
+    def push_query(self, query_id: int) -> None:
+        """Enqueue a search_query ID for expression ingestion."""
+        with self._lock:
+            self.uningested_query_ids.append(query_id)
+
+    def push_queries(self, ids: list[int]) -> None:
+        """Enqueue multiple search_query IDs."""
+        with self._lock:
+            self.uningested_query_ids.extend(ids)
+
+    def pop_query_batch(self, size: int = 50) -> list[int]:
+        """Pop up to *size* search_query IDs. O(1) per pop."""
+        with self._lock:
+            n = min(size, len(self.uningested_query_ids))
+            return [self.uningested_query_ids.popleft() for _ in range(n)]
+
+    def requeue_queries(self, ids: list[int]) -> None:
+        """Put failed query IDs back at the front of the deque."""
+        with self._lock:
+            self.uningested_query_ids.extendleft(reversed(ids))
+
+    def uningested_query_count(self) -> int:
+        return len(self.uningested_query_ids)
+
+    # ------------------------------------------------------------------
+    # Summary session deque — O(1) pop
+    # ------------------------------------------------------------------
+
+    def push_summary_session(self, session_id: int) -> None:
+        """Enqueue a session ID whose summary needs expression ingestion."""
+        with self._lock:
+            self.uningested_summary_session_ids.append(session_id)
+
+    def pop_summary_session_batch(self, size: int = 20) -> list[int]:
+        """Pop up to *size* session IDs. O(1) per pop."""
+        with self._lock:
+            n = min(size, len(self.uningested_summary_session_ids))
+            return [self.uningested_summary_session_ids.popleft() for _ in range(n)]
+
+    def requeue_summary_sessions(self, ids: list[int]) -> None:
+        """Put failed session IDs back at the front of the deque."""
+        with self._lock:
+            self.uningested_summary_session_ids.extendleft(reversed(ids))
 
 
 # ---------------------------------------------------------------------------

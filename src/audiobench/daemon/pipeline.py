@@ -22,8 +22,8 @@ Streaming verbs (synthesize):
 from __future__ import annotations
 
 import time
-from typing import Any, AsyncGenerator
-
+from collections.abc import AsyncGenerator
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Verb handler registry — module-level so tests can patch individual entries.
@@ -37,9 +37,9 @@ def _get_verb_handlers() -> dict[str, Any]:
     """Return the verb handler table, populating it on first call."""
     if not _VERB_HANDLERS:
         from audiobench.daemon.server import (
-            _handle_search,
             _handle_chunk,
             _handle_embed,
+            _handle_search,
         )
         _VERB_HANDLERS["search"] = _handle_search
         _VERB_HANDLERS["chunk"] = _handle_chunk

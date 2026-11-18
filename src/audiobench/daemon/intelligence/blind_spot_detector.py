@@ -11,6 +11,7 @@ class BlindSpotDetector(IntelligenceTask):
     INTERVAL_SECONDS = 3600  # 1 hour
     MIN_SAMPLE_SIZE = 5
     BLIND_SPOT_THRESHOLD = 0.30
+    IS_INFERENCE_TASK = False
 
     async def run(self) -> None:
         logger.info("Running BlindSpotDetector...")
@@ -32,7 +33,8 @@ class BlindSpotDetector(IntelligenceTask):
                         store.add_expression(
                             source_type="daemon_calibration",
                             content=content,
-                            inference_status="system"
+                            inference_status="system",
+                            calibration_key="blind_spot_advisory",
                         )
                     except Exception as e:
                         logger.error(f"Failed to record blind spot for {region_id}: {e}")

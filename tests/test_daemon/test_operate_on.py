@@ -13,12 +13,12 @@ These three tests verify the remaining invariants:
    operate_on must have a 'pct' value in [0.0, 1.0].
 """
 
-import pytest
 from unittest.mock import MagicMock
+
+import pytest
 
 from audiobench.daemon.operators import operate_on
 from audiobench.memory.memory_store import MemoryStore
-
 
 # ---------------------------------------------------------------------------
 # 1. Unknown verb raises ValueError with verb name in message

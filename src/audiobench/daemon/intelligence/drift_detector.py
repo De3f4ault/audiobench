@@ -39,6 +39,7 @@ class DriftDetector(IntelligenceTask):
     INTERVAL_SECONDS = 86400
     DRIFT_THRESHOLD = 0.15
     MIN_ITEMS = 10
+    IS_INFERENCE_TASK = False
 
     async def run(self) -> None:
         logger.info("Running DriftDetector...")
@@ -61,7 +62,9 @@ class DriftDetector(IntelligenceTask):
             rows_a = session.execute(
                 sql_text("""
                 SELECT id FROM expressions
-                WHERE created_at >= :start AND created_at < :end
+                WHERE source_type = 'audio_transcript'
+                  AND graph_role = 'sweep_chunk'
+                  AND created_at >= :start AND created_at < :end
                 ORDER BY created_at DESC
                 LIMIT 500
                 """),
@@ -72,7 +75,9 @@ class DriftDetector(IntelligenceTask):
             rows_b = session.execute(
                 sql_text("""
                 SELECT id FROM expressions
-                WHERE created_at >= :start AND created_at <= :end
+                WHERE source_type = 'audio_transcript'
+                  AND graph_role = 'sweep_chunk'
+                  AND created_at >= :start AND created_at <= :end
                 ORDER BY created_at DESC
                 LIMIT 500
                 """),

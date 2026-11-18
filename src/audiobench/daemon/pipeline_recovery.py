@@ -1,14 +1,13 @@
 """
 pipeline_recovery.py - Background sweep to resume stuck transcriptions.
 """
-import time
 import logging
-import json
+import time
 from pathlib import Path
 
 from audiobench.storage.repository import TranscriptionRepository
 from audiobench.transcribe.transcriber import TranscriptionPipeline
-from audiobench.transcribe.transcription_result import Transcript, Segment
+from audiobench.transcribe.transcription_result import Segment, Transcript
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +44,7 @@ def _is_system_idle() -> bool:
         if cpu > 80.0:
             logger.debug("Backfill gate: CPU %.1f%% > 80%%, skipping", cpu)
             return False
-        
+
         rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
         if rss_mb > 4096:
             logger.debug("Backfill gate: RSS %.1fMB > 4096MB, skipping", rss_mb)
@@ -54,10 +53,11 @@ def _is_system_idle() -> bool:
         pass  # psutil not available — skip resource checks, proceed
 
     # Check for active live transcription in the DB
-    from audiobench.storage.models import TranscriptionRecord
+    from datetime import UTC, datetime, timedelta
+
     from audiobench.core.db_session import get_session
-    from datetime import datetime, UTC, timedelta
-    
+    from audiobench.storage.models import TranscriptionRecord
+
     cutoff = datetime.now(UTC) - timedelta(minutes=10)
     active_phases = ("transcribing", "uploading", "processing")
     with get_session() as session:
@@ -79,7 +79,8 @@ def _run_alignment_subprocess(wav_path: Path, transcript: Transcript, tx_id: int
     TimeoutExpired is re-raised as RuntimeError so the caller's except-and-cap
     path (backfill_attempt_count / mark_backfill_exhausted) handles it uniformly.
     """
-    import subprocess, sys
+    import subprocess
+    import sys
     worker = Path(__file__).parent / "alignment_worker.py"
     try:
         result = subprocess.run(
@@ -104,7 +105,7 @@ def _do_sweep_once(transcriber: TranscriptionPipeline) -> None:
     repo = TranscriptionRepository()
     # Find incomplete records that haven't been updated in 5+ minutes
     stuck_records = repo.get_incomplete_transcriptions(max_age_minutes=5)
-    
+
     if not stuck_records:
         logger.debug("Pipeline Sweep: No stuck transcriptions found.")
     else:
@@ -117,36 +118,47 @@ def _do_sweep_once(transcriber: TranscriptionPipeline) -> None:
                 logger.warning("Pipeline Sweep: Tx %d has exceeded max attempts (%d), marking failed.", record.id, MAX_ATTEMPTS)
                 repo.mark_transcription_failed(record.id, "Max attempts exceeded", record.pipeline_phase)
                 continue
-                
+
             logger.info("Pipeline Sweep: Resuming stuck tx %d (phase=%s, attempt=%d)", record.id, record.pipeline_phase, record.attempt_count + 1)
-            
+
             try:
                 repo.increment_attempt_count(record.id)
-                
+
                 if record.pipeline_phase == "transcribing":
-                    # The Gemini step crashed before any data was committed. 
+                    # The Gemini step crashed before any data was committed.
                     # Do NOT auto-retry this expensive step.
                     logger.warning("Pipeline Sweep: Tx %d stuck during 'transcribing'. Marking failed.", record.id)
                     repo.mark_transcription_failed(record.id, "Crashed during extraction", record.pipeline_phase)
                     continue
-                    
+
+                # Gemini jobs: diarization is handled inside the Gemini engine at
+                # transcription time, and alignment runs via the subprocess worker
+                # (alignment_worker.py). Neither should be re-run here by the sweep.
+                # Attempting either would crash because the sweep only has the library
+                # .m4a path, not the 16kHz mono WAV that torchaudio/faster-whisper expect.
+                is_gemini = getattr(record, "engine", "") == "gemini"
+                if is_gemini:
+                    logger.debug("Pipeline Sweep: Tx %d is a Gemini job — skipping local alignment/diarization", record.id)
+                    # Fall through to finalize below — just commit whatever state we have.
+
                 # If phase is transcribed, aligned, diarized, we CAN resume because we have the transcript object!
                 # We reconstruct it.
-                data = repo.get_by_id(record.id)
+                data = repo.get_by_id(record.id, session=None)
                 if not data or not data.get("file_path"):
                     logger.warning("Pipeline Sweep: Tx %d has no file path. Marking failed.", record.id)
                     repo.mark_transcription_failed(record.id, "No linked audio file", record.pipeline_phase)
                     continue
-                    
+
                 wav_path = Path(data["file_path"])
                 transcript = _reconstruct_transcript(data)
-                
+
                 # Since we are bypassing _run_single_pipeline, we run the remaining steps directly.
                 def _dummy_emit(phase: str, msg: str, pct: float = 0.0) -> None:
                     pass
-                    
-                if record.pipeline_phase == "transcribed":
-                    # Need to run alignment — trigger if file meets the configured minimum duration
+
+                if not is_gemini and record.pipeline_phase == "transcribed":
+                    # Need to run alignment — trigger if file meets the configured minimum duration.
+                    # Gemini jobs are excluded: their alignment runs via alignment_worker.py subprocess.
                     align_threshold_secs = settings.align_threshold_min * 60
                     if transcript.duration_seconds >= align_threshold_secs:
                         try:
@@ -159,9 +171,12 @@ def _do_sweep_once(transcriber: TranscriptionPipeline) -> None:
                             logger.warning("Pipeline Sweep: Alignment failed for %d: %s", record.id, exc)
                             repo.mark_transcription_degraded(record.id, "alignment_failed", "aligning")
                             # Skip diarization if degraded? We can continue.
-                            
-                if record.pipeline_phase in ["transcribed", "aligned"]:
-                    # Need to run diarization
+
+                if not is_gemini and record.pipeline_phase in ["transcribed", "aligned"]:
+                    # Need to run diarization.
+                    # Gemini jobs are excluded: diarization is handled inside the Gemini engine
+                    # and the sweep only has the .m4a library path, not the 16kHz WAV that
+                    # torchaudio requires.
                     if settings.enable_diarization and not transcript.speaker_map:
                         try:
                             transcript = transcriber._run_diarization(
@@ -187,13 +202,27 @@ def _do_sweep_once(transcriber: TranscriptionPipeline) -> None:
                     transcriber._apply_speaker_naming(
                         transcript, None, False, settings.enable_diarization, _dummy_emit
                     )
-                    
-                    # Fetch audio metadata if we can
-                    from audiobench.transcribe.audio_converter import AudioLoader
+
+                    # Probe audio metadata (ffprobe only — no decode, ~50ms).
+                    # AudioLoader.load() was used here before but it performs a full
+                    # ffmpeg decode just to get duration/rate/channels, then discards
+                    # the WAV immediately — causing a double-decode with the biometric
+                    # pass that finalize_transcription() schedules right after.
+                    from audiobench.transcribe.audio_converter import probe
+                    from audiobench.transcribe.transcription_result import AudioMetadata
                     audio_metadata = None
                     try:
-                        with AudioLoader() as loader:
-                            _, audio_metadata = loader.load(wav_path)
+                        _path = Path(wav_path)
+                        _info = probe(_path)
+                        audio_metadata = AudioMetadata(
+                            file_path=str(_path),
+                            file_name=_path.name,
+                            file_size_bytes=_path.stat().st_size,
+                            format=_path.suffix.lstrip(".").lower(),
+                            duration_seconds=round(_info.duration, 3),
+                            sample_rate=_info.sample_rate,
+                            channels=_info.channels,
+                        )
                     except Exception:
                         pass
 
@@ -206,9 +235,9 @@ def _do_sweep_once(transcriber: TranscriptionPipeline) -> None:
                         audio_metadata=audio_metadata,
                         run_inline=True,  # daemon process — thread is safe, no shutdown race
                     )
-                    
+
                     logger.info("Pipeline Sweep: Successfully finalized tx %d", record.id)
-                    
+
                     # Fire event
                     try:
                         from audiobench.events import get_bus
@@ -245,7 +274,7 @@ def _do_sweep_once(transcriber: TranscriptionPipeline) -> None:
     delay = backoff_seconds[min(record.backfill_attempt_count, len(backoff_seconds) - 1)]
     repo.increment_backfill_attempt(record.id, next_attempt_delay_seconds=delay)
 
-    data = repo.get_by_id(record.id)
+    data = repo.get_by_id(record.id, session=None)
     if not data or not data.get("file_path"):
         logger.warning("Backfill: tx %d has no file path, marking exhausted", record.id)
         repo.mark_backfill_exhausted(record.id)
@@ -264,14 +293,15 @@ def _do_sweep_once(transcriber: TranscriptionPipeline) -> None:
             record.failure_reason == "diarization_failed"
             or "diariz" in (record.failure_reason or "").lower()
         )
-        
-        if is_diarization_failure:
-            from audiobench.transcribe.transcriber import TranscriptionPipeline
+        is_gemini_record = getattr(record, "engine", "") == "gemini"
+
+        if is_diarization_failure and not is_gemini_record:
             from audiobench.core.settings import get_settings
-            
+            from audiobench.transcribe.transcriber import TranscriptionPipeline
+
             def _dummy_emit(phase: str, msg: str, pct: float = 0.0) -> None:
                 pass
-            
+
             settings = get_settings()
             transcriber = TranscriptionPipeline()
             transcript = transcriber._run_diarization(
@@ -281,20 +311,28 @@ def _do_sweep_once(transcriber: TranscriptionPipeline) -> None:
             )
             repo.commit_diarization(record.id, transcript)
             logger.info("Backfill: diarization committed for tx %d", record.id)
-            
+
             # Post-diarization cleanup
             from audiobench.diarization.verification import _classifiers
             _device = settings.resolve_diarization_device()
             _classifiers.pop(_device, None)
             import gc; gc.collect()
-            
+
             # Change phase so next normal sweep finalizes it
-            from audiobench.storage.database import get_session
+            from audiobench.core.db_session import get_session
+
             from audiobench.storage.models import TranscriptionRecord
             with get_session() as session:
                 rec = session.query(TranscriptionRecord).get(record.id)
                 rec.pipeline_phase = "diarized"
                 session.commit()
+        elif record.failure_reason == "timeline_clamped":
+            logger.info(
+                "Backfill: tx %d has failure_reason='timeline_clamped' — "
+                "alignment succeeded with monotonic clamping; skipping retry to preserve diagnostic label.",
+                record.id,
+            )
+            return
         else:
             if record.failure_reason not in ("alignment_failed",) and not (record.failure_reason or "").startswith("alignment_timeout"):
                 logger.warning("Backfill: Unrecognized failure reason '%s' for tx %d, defaulting to alignment backfill",

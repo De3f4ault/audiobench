@@ -221,16 +221,29 @@ def test_action_authorize_proposal_calls_daemon_client():
     mock_client.authorize_proposal.assert_called_once_with(7)
 
 
-def test_action_reject_proposal_calls_daemon_client():
-    """
-    ProposalsFeed.action_reject_proposal() must call
-    DaemonClient.reject_inference(expression_id) — proposals are rejected
-    via the same inference rejection path (sets inference_status='rejected').
-    """
+def test_action_defer_proposal_calls_daemon_client():
+    """ProposalsFeed.action_defer_proposal() must call DaemonClient.defer_proposal(expression_id)."""
     from audiobench.cli.tui.panels.proposals import ProposalsFeed
 
     mock_client = MagicMock()
-    mock_client.reject_inference.return_value = {"status": "ok"}
+    mock_client.defer_proposal.return_value = {"status": "ok", "action": "deferred"}
+
+    panel = ProposalsFeed()
+    panel._client = mock_client
+    panel._selected_id = 7
+    panel.notify = MagicMock()
+
+    panel.action_defer_proposal()
+
+    mock_client.defer_proposal.assert_called_once_with(7)
+
+
+def test_action_reject_proposal_calls_daemon_client():
+    """ProposalsFeed.action_reject_proposal() must call DaemonClient.reject_proposal(expression_id)."""
+    from audiobench.cli.tui.panels.proposals import ProposalsFeed
+
+    mock_client = MagicMock()
+    mock_client.reject_proposal.return_value = {"status": "ok", "action": "rejected"}
 
     panel = ProposalsFeed()
     panel._client = mock_client
@@ -239,7 +252,7 @@ def test_action_reject_proposal_calls_daemon_client():
 
     panel.action_reject_proposal()
 
-    mock_client.reject_inference.assert_called_once_with(7)
+    mock_client.reject_proposal.assert_called_once_with(7)
 
 
 # ---------------------------------------------------------------------------
@@ -275,25 +288,30 @@ def test_forwarding_subscriber_installed_at_cli_startup():
     # Re-import to ensure module-level code in __main__ has run.
     import importlib
 
-    import audiobench.__main__ as main_mod
-    importlib.reload(main_mod)
-
     from audiobench.events import get_bus
     from audiobench.observatory.forwarding_subscriber import ForwardingSubscriber
 
-    wildcard_handlers = get_bus()._handlers.get("*", [])
-    # At least one handler must be a bound method named 'record' on a
-    # ForwardingSubscriber instance.
-    assert any(
-        callable(h)
-        and getattr(h, "__self__", None) is not None
-        and isinstance(h.__self__, ForwardingSubscriber)
-        and h.__name__ == "record"
-        for h in wildcard_handlers
-    ), (
-        "No ForwardingSubscriber.record handler found on the EventBus wildcard. "
-        "Check that __main__.py calls ForwardingSubscriber().install() at module level."
-    )
+    bus = get_bus()
+    orig_wildcards = list(bus._handlers.get("*", []))
+    try:
+        import audiobench.__main__ as main_mod
+        importlib.reload(main_mod)
+
+        wildcard_handlers = bus._handlers.get("*", [])
+        # At least one handler must be a bound method named 'record' on a
+        # ForwardingSubscriber instance.
+        assert any(
+            callable(h)
+            and getattr(h, "__self__", None) is not None
+            and isinstance(h.__self__, ForwardingSubscriber)
+            and h.__name__ == "record"
+            for h in wildcard_handlers
+        ), (
+            "No ForwardingSubscriber.record handler found on the EventBus wildcard. "
+            "Check that __main__.py calls ForwardingSubscriber().install() at module level."
+        )
+    finally:
+        bus._handlers["*"] = orig_wildcards
 
 
 def test_inferences_and_proposals_panels_mounted_in_observatory():
