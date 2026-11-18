@@ -1,6 +1,5 @@
 """Query reformulation using LLMs for multi-strategy retrieval."""
 
-from dataclasses import replace
 import json
 from typing import Any
 
@@ -24,8 +23,6 @@ class QueryReformulator:
         self.model = model
         if router is not None:
             self.router = router
-        elif model and model.lower() == "gemini":
-            self.router = ProviderRouter(replace(self.settings, llm_provider_order=["gemini"]))
         else:
             self.router = router_for_settings(self.settings)
             if model:

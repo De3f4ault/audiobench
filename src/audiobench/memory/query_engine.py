@@ -538,10 +538,7 @@ class ResearchEngine:
             )
             settings = get_settings()
             router = router_for_settings(settings)
-            if model and model.lower() == "gemini":
-                from dataclasses import replace
-                router = ProviderRouter(replace(settings, llm_provider_order=["gemini"]))
-            elif model:
+            if model:
                 router.set_primary_model(model)
 
             outcome = router.generate(
@@ -847,10 +844,7 @@ class ResearchEngine:
         t_synth = time.perf_counter()
 
         router = router_for_settings(settings)
-        if model_name.lower() == "gemini":
-            from dataclasses import replace
-            router = ProviderRouter(replace(settings, llm_provider_order=["gemini"]))
-        elif model_name:
+        if model_name:
             router.set_primary_model(model_name)
 
         outcome = router.generate(
