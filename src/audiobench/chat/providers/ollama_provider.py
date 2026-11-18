@@ -49,6 +49,11 @@ class OllamaClient:
         # (connect_timeout, read_timeout)
         self._stream_timeout = (10, 600)
 
+    @property
+    def model(self) -> str | None:
+        """Public accessor for the configured model name."""
+        return self._model
+
     @staticmethod
     def _handle_http_error(e: Any, model_name: str) -> AIError:
         """Format helpful error message from requests.HTTPError."""
@@ -62,12 +67,16 @@ class OllamaClient:
             pass
 
         if status_code == 404:
-            return AIError(
+            err = AIError(
                 f"Model '{model_name}' not available on Ollama server",
                 f"{err_msg}\n"
                 f"Run /model to switch to an available model, or run 'ollama pull {model_name}'.",
             )
-        return AIError(f"Ollama API error ({status_code or 'unknown'})", err_msg)
+        else:
+            err = AIError(f"Ollama API error ({status_code or 'unknown'})", err_msg)
+
+        err.status_code = status_code  # read by _classify_ollama in llm_providers.py
+        return err
 
     def _ensure_requests(self):
         """Lazy import of requests."""

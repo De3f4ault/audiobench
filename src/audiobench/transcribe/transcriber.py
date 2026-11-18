@@ -1054,18 +1054,13 @@ class TranscriptionPipeline:
 
         def _refine() -> None:
             try:
-                from audiobench.chat.providers.ollama_provider import OllamaClient
+                from audiobench.chat.providers.router import router_for_settings
                 from audiobench.transcribe.refiner import TranscriptRefiner
 
-                client = OllamaClient(
-                    base_url=self._settings.ollama_base_url,
-                    model=self._settings.clean_model,
-                )
-                if not client.is_available():
-                    logger.info("Ollama not available, skipping refinement for #%d", tx_id)
-                    return
+                router = router_for_settings(self._settings)
+                router.set_primary_model(self._settings.clean_model)
 
-                refiner = TranscriptRefiner(client, model=self._settings.clean_model)
+                refiner = TranscriptRefiner(router, model=self._settings.clean_model)
                 seg_texts = [seg.text for seg in segments]
                 cleaned, has_failures = refiner.refine_segments(seg_texts)
 

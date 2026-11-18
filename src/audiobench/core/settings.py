@@ -196,6 +196,32 @@ class AudioBenchSettings(BaseSettings):
         description="Ollama model for transcript cleaning (spelling/punctuation correction)",
     )
 
+    # --- Provider Router ---
+    llm_chain_enabled: bool = Field(
+        default=True,
+        description="Master switch. False → all LLM calls return LlmOutcome(type=FAILED) immediately.",
+    )
+    llm_local_enabled: bool = Field(
+        default=True,
+        description="Include local Ollama in the provider chain.",
+    )
+    llm_cloud_enabled: bool = Field(
+        default=True,
+        description="Include cloud providers (Gemini, cloud-routed Ollama) in the chain.",
+    )
+    llm_provider_order: list[str] = Field(
+        default=["ollama", "gemini"],
+        description="Provider priority. First = highest priority.",
+    )
+    circuit_breaker_threshold: int = Field(
+        default=3,
+        description="Consecutive failures before a provider's breaker opens.",
+    )
+    circuit_breaker_timeout_seconds: float = Field(
+        default=60.0,
+        description="Seconds before an open breaker transitions to HALF_OPEN for a probe.",
+    )
+
     # --- Daemon & Memory Layer ---
     disable_memory: bool = Field(
         default=False,
@@ -693,3 +719,8 @@ def get_settings() -> AudioBenchSettings:
 def invalidate_settings_cache() -> None:
     """Clear the cached settings so the next call to get_settings() reloads from disk."""
     get_settings.cache_clear()
+    try:
+        from audiobench.chat.providers.router import invalidate_router
+        invalidate_router()
+    except ImportError:
+        pass

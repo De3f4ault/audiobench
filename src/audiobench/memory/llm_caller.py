@@ -63,6 +63,30 @@ class CircuitBreaker:
         self.last_failure_time = 0.0
         logger.info("CircuitBreaker manually reset to CLOSED state.")
 
+    def can_call(self) -> bool:
+        """True if the breaker permits a call attempt.
+
+        Transitions OPEN → HALF_OPEN inline when recovery_timeout has elapsed,
+        allowing one probe attempt without wrapping the call in self.call(fn).
+        """
+        if self.state == "CLOSED":
+            return True
+        if self.state == "OPEN":
+            if time.monotonic() - self.last_failure_time > self.recovery_timeout:
+                self.state = "HALF_OPEN"
+                logger.info("CircuitBreaker transitioning to HALF_OPEN for probe.")
+                return True
+            return False
+        return True  # HALF_OPEN: allow the probe
+
+    def record_success(self) -> None:
+        """Record a successful call and close the circuit if necessary."""
+        self._record_success()
+
+    def record_failure(self) -> None:
+        """Record a failed call and potentially trip the circuit."""
+        self._record_failure()
+
     def _record_failure(self) -> None:
         """Record a failure and potentially trip the circuit."""
         self.failures += 1

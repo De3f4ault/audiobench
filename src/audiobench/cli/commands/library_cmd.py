@@ -48,15 +48,10 @@ def _spawn_janitor():
 
             logger.info("Janitor found %d files pending auto-rename", len(pending_records))
 
-            gemini_client = None
-            from google import genai
+            from audiobench.chat.providers.router import router_for_settings
 
-            from audiobench.chat.providers.ollama_provider import OllamaClient
-
-            if settings.gemini_api_key:
-                gemini_client = genai.Client(api_key=settings.gemini_api_key)
-
-            ollama = OllamaClient(base_url=settings.ollama_base_url, model=settings.clean_model)
+            router = router_for_settings(settings)
+            router.set_primary_model(settings.clean_model)
 
             for audio_record in pending_records:
                 try:
@@ -84,19 +79,12 @@ def _spawn_janitor():
 
                     new_title = ""
                     try:
-                        if gemini_client:
-                            response = gemini_client.models.generate_content(
-                                model="gemini-2.5-pro", contents=prompt
-                            )
-                            new_title = response.text.strip()
-                        else:
-                            raise ValueError("No Gemini API key")
-                    except Exception:
-                        if ollama.is_available():
-                            response = ollama.chat(
-                                [{"role": "user", "content": prompt}], think=False
-                            )
-                            new_title = response.get("content", "").strip()
+                        new_title = router.generate_text(
+                            [{"role": "user", "content": prompt}],
+                            digest_mode="silent",
+                        ).strip()
+                    except Exception as e:
+                        logger.warning("Failed to generate title: %s", e)
 
                     if not new_title:
                         continue  # Still offline, keep the tag for next time

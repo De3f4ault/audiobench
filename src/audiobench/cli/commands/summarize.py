@@ -96,12 +96,16 @@ def summarize(
     """
     import sys
 
-    from audiobench.chat.providers.ollama_provider import OllamaClient
+    from audiobench.chat.providers.router import router_for_settings
     from audiobench.core.db_engine import init_db
     from audiobench.storage.repository import TranscriptionRepository
 
     settings = get_settings()
     model_name = model or settings.ollama_model
+
+    client = router_for_settings(settings)
+    if model_name:
+        client.set_primary_model(model_name)
 
     if interactive_mode:
         from audiobench.cli.wizard import prompt_menu, prompt_transcription
@@ -141,19 +145,6 @@ def summarize(
     record = repo.get_by_id(transcript_id, session=None)
     if not record:
         console.print(error_panel("Not found", f"Transcript #{transcript_id} not found"))
-        sys.exit(1)
-
-    client = OllamaClient(
-        base_url=settings.ollama_base_url,
-        model=model_name,
-    )
-    if not client.is_available():
-        console.print(
-            error_panel(
-                "Ollama not running",
-                f"Start with: ollama serve\nThen pull the model: ollama pull {model_name}",
-            )
-        )
         sys.exit(1)
 
     audio_file_id = record.get("audio_file_id")

@@ -2039,6 +2039,14 @@ class ChatREPL:
                     audio_path=audio_path,
                     segment_id=segment_id,
                 ):
+                    if notice := chunk.get("notice"):
+                        console.print(f"  [yellow]{notice}[/]")
+                        content_parts.clear()
+                        thinking_parts.clear()
+                        continue
+                    if chunk.get("failed"):
+                        break
+
                     thinking = chunk.get("thinking", "")
                     content = chunk.get("content", "")
 
@@ -2127,60 +2135,6 @@ class ChatREPL:
 
         except (AIError, AudioBenchError) as e:
             err_msg = str(e)
-            cur_m = (self.session.model or "").lower()
-
-            # Auto-recovery 1: Gemini model wrongly routed to Ollama
-            if "gemini" in cur_m and not getattr(self, "_retrying_stream", False):
-                try:
-                    from audiobench.chat.providers.gemini_provider import GeminiClient
-
-                    g_client = GeminiClient(model=self.session.model)
-                    if g_client.is_available():
-                        console.print(
-                            f"  [yellow]Notice: Re-routing '{self.session.model}' to Gemini provider...[/]"
-                        )
-                        self.session.switch_model(self.session.model)
-                        self.client = self.session._client
-                        self._retrying_stream = True
-                        try:
-                            self._stream_and_render(user_text)
-                            return
-                        finally:
-                            self._retrying_stream = False
-                except Exception:
-                    pass
-
-            # Auto-recovery 2: Model not found on Ollama server -> fallback to an available model
-            if (
-                "not found" in err_msg.lower()
-                or "not available on ollama" in err_msg.lower()
-                or "try pulling it" in err_msg.lower()
-            ) and not getattr(self, "_retrying_stream", False):
-                try:
-                    client = getattr(self.session, "_client", None)
-                    if client and hasattr(client, "list_models"):
-                        avail = client.list_models()
-                        if avail:
-                            fallback = (
-                                self.settings.ollama_model
-                                if self.settings.ollama_model in avail
-                                and self.settings.ollama_model != self.session.model
-                                else [m for m in avail if m != self.session.model][0]
-                            )
-                            console.print(
-                                f"  [yellow]Notice: Model '{self.session.model}' not found on server. Auto-switching to '{fallback}'...[/]"
-                            )
-                            self.session.switch_model(fallback)
-                            self.client = self.session._client
-                            self._retrying_stream = True
-                            try:
-                                self._stream_and_render(user_text)
-                                return
-                            finally:
-                                self._retrying_stream = False
-                except Exception:
-                    pass
-
             console.print(error_panel("AI Error", err_msg))
             console.print()
 

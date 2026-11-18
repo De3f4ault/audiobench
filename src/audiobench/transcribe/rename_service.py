@@ -110,40 +110,24 @@ def _build_sparse_sample(segments: list, duration_seconds: float) -> str:
 
 
 def _call_llm(prompt: str, settings, force_gemini: bool = False) -> str:
-    """Try Ollama first, fall back to Gemini.  Returns the raw title string or ''."""
-    new_title = ""
+    """Try Ollama first, fall back to Gemini via ProviderRouter. Returns raw title or ''."""
+    from audiobench.chat.providers.router import router_for_settings
 
-    if not force_gemini:
-        try:
-            from audiobench.chat.providers.ollama_provider import OllamaClient
-            ollama = OllamaClient(
-                base_url=settings.ollama_base_url,
-                model=settings.clean_model,
-            )
-            if ollama.is_available():
-                response = ollama.chat([{"role": "user", "content": prompt}], think=False)
-                new_title = response.get("content", "").strip()
-            else:
-                raise ValueError("Ollama not available or not running")
-        except Exception as e:
-            logger.warning("Ollama auto-rename failed/unavailable (%s), falling back to Gemini", e)
+    router = router_for_settings(settings)
+    if settings.clean_model:
+        router.set_primary_model(settings.clean_model)
+    if force_gemini:
+        router._slots.sort(key=lambda s: 0 if s.name == "gemini" else 1)
 
-    if not new_title:
-        try:
-            if settings.gemini_api_key:
-                from google import genai
-                client = genai.Client(api_key=settings.gemini_api_key)
-                response = client.models.generate_content(
-                    model="gemini-2.5-flash", contents=prompt
-                )
-                if response and response.text:
-                    new_title = response.text.strip()
-            else:
-                raise ValueError("No Gemini API key configured for fallback")
-        except Exception as fallback_e:
-            logger.warning("Gemini fallback also failed: %s", fallback_e)
-
-    return new_title
+    try:
+        return router.generate_text(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            digest_mode="silent",
+        ).strip()
+    except Exception as e:
+        logger.warning("LLM call failed in rename service: %s", e)
+        return ""
 
 
 # ─── Main entry point ─────────────────────────────────────────────────────────

@@ -619,7 +619,8 @@ def auto_cmd(target: str, model: str | None, focus: str | None, dry_run: bool) -
     import re
 
     from audiobench.chat.context_builder import AUTO_BOOKMARK_SYSTEM, auto_bookmark
-    from audiobench.chat.providers.ollama_provider import AIError, OllamaClient
+    from audiobench.chat.providers.provider_errors import AIError
+    from audiobench.chat.providers.router import router_for_settings
     from audiobench.core.db_engine import init_db
     from audiobench.core.settings import get_settings
     from audiobench.storage.bookmark_repository import BookmarkRepository
@@ -681,29 +682,22 @@ def auto_cmd(target: str, model: str | None, focus: str | None, dry_run: bool) -
 
     # ── Call AI ──
     try:
-        client = OllamaClient(
-            base_url=settings.ollama_base_url,
-            model=model_name,
-        )
-
-        if not client.is_available():
-            console.print(
-                error_panel(
-                    "Ollama not running",
-                    f"Start with: ollama serve\nThen pull: ollama pull {model_name}",
-                )
-            )
-            sys.exit(1)
+        router = router_for_settings(settings)
+        if model_name:
+            router.set_primary_model(model_name)
 
         prompt = auto_bookmark(timestamped_text, focus=focus)
 
         console.print(f"  [{DIM}]Analyzing transcript...[/]")
 
-        response = client.generate(
-            prompt,
-            model=model_name,
-            system_prompt=AUTO_BOOKMARK_SYSTEM,
+        messages = [
+            {"role": "system", "content": AUTO_BOOKMARK_SYSTEM},
+            {"role": "user", "content": prompt},
+        ]
+        response = router.generate_text(
+            messages=messages,
             temperature=0.2,
+            digest_mode="passthrough",
         )
 
     except AIError as e:

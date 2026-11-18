@@ -4,7 +4,8 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from audiobench.chat.providers.ollama_provider import AIError, OllamaClient
+from audiobench.chat.providers.provider_errors import AIError
+from audiobench.chat.providers.router import router_for_settings
 from audiobench.core.logger_factory import get_logger
 from audiobench.core.settings import get_settings
 
@@ -21,12 +22,14 @@ class ConversationSummaryResult:
 
 
 class SummaryGenerator:
-    """Uses Ollama to generate structured JSON summaries of chat sessions."""
+    """Uses ProviderRouter to generate structured JSON summaries of chat sessions."""
 
     def __init__(self, model_name: str | None = None):
         settings = get_settings()
         self.model_name = model_name or settings.ollama_model
-        self.client = OllamaClient(base_url=settings.ollama_base_url, model=self.model_name)
+        self.router = router_for_settings(settings)
+        if model_name:
+            self.router.set_primary_model(model_name)
 
     def generate(self, messages: list[dict]) -> ConversationSummaryResult | None:
         """Generate a summary from a list of chat messages."""
@@ -55,11 +58,10 @@ class SummaryGenerator:
         )
 
         try:
-            # We use format="json" if supported, but just asking for json often works.
-            # Using generate instead of chat since we are just passing a single big prompt.
-            raw_response = self.client.generate(
-                prompt=prompt,
+            raw_response = self.router.generate_text(
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
+                digest_mode="silent",
             )
 
             # Attempt to extract JSON if it was wrapped in markdown

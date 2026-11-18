@@ -73,8 +73,7 @@ def clean(
       audiobench clean 3 --model qwen4:14b    Use a different model
       audiobench clean 3 --gemini             Use Gemini instead of Ollama
     """
-    from audiobench.chat.providers.gemini_provider import GeminiClient
-    from audiobench.chat.providers.ollama_provider import OllamaClient
+    from audiobench.chat.providers.router import router_for_settings
     from audiobench.core.db_engine import init_db
     from audiobench.core.settings import get_settings
     from audiobench.storage.repository import TranscriptionRepository
@@ -145,30 +144,11 @@ def clean(
         return
 
     # ── Set up client ──
+    client = router_for_settings(settings)
     if gemini:
-        client = GeminiClient(model=model)
-        if not client.is_available():
-            console.print(
-                error_panel(
-                    "Gemini not available",
-                    "Please set GEMINI_API_KEY in your environment or config.",
-                )
-            )
-            sys.exit(1)
-    else:
-        client = OllamaClient(
-            base_url=settings.ollama_base_url,
-            model=model,
-        )
-        if not client.is_available():
-            console.print(
-                error_panel(
-                    "Ollama not available",
-                    f"Cannot reach {settings.ollama_base_url}. "
-                    "Is Ollama running with cloud routing enabled?",
-                )
-            )
-            sys.exit(1)
+        client._slots.sort(key=lambda s: 0 if s.name == "gemini" else 1)
+    elif model:
+        client.set_primary_model(model)
 
     refiner = TranscriptRefiner(client, model=model)
 

@@ -67,3 +67,21 @@ def test_backoff_delays_increase_exponentially(monkeypatch):
     assert delays[0] == pytest.approx(1.0, abs=0.01)
     assert delays[1] == pytest.approx(2.0, abs=0.01)
     assert delays[2] == pytest.approx(4.0, abs=0.01)
+
+
+def test_can_call_lifecycle():
+    cb = CircuitBreaker(failure_threshold=1, recovery_timeout=0.02)
+    assert cb.can_call() is True
+    # Trip it
+    try:
+        cb.call(lambda: (_ for _ in ()).throw(RuntimeError("err")))
+    except RuntimeError:
+        pass
+    assert cb.state == "OPEN"
+    assert cb.can_call() is False
+
+    import time
+    time.sleep(0.03)
+    # After timeout, can_call() transitions to HALF_OPEN and returns True
+    assert cb.can_call() is True
+    assert cb.state == "HALF_OPEN"

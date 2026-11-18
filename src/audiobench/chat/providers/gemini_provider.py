@@ -20,8 +20,10 @@ class GeminiClient:
     def __init__(
         self,
         model: str | None = None,
+        api_key: str | None = None,
     ) -> None:
         self.settings = get_settings()
+        self._api_key = api_key or self.settings.gemini_api_key
         
         # Resolve convenience keyword to configured model
         if model and model.lower() != "gemini":
@@ -35,7 +37,7 @@ class GeminiClient:
         try:
             from google import genai
 
-            if self.settings.gemini_api_key:
+            if self._api_key:
                 # Attempt to set a 30 s HTTP timeout at the client level so
                 # streaming and non-streaming calls both bail out promptly when
                 # the network is unavailable.  The google-genai SDK has no
@@ -47,11 +49,11 @@ class GeminiClient:
                 try:
                     from google.genai import types as genai_types
                     self._client = genai.Client(
-                        api_key=self.settings.gemini_api_key,
+                        api_key=self._api_key,
                         http_options=genai_types.HttpOptions(timeout=30_000),  # ms
                     )
                 except (TypeError, AttributeError, Exception):
-                    self._client = genai.Client(api_key=self.settings.gemini_api_key)
+                    self._client = genai.Client(api_key=self._api_key)
                 self._is_available = True
         except ImportError:
             pass
@@ -94,7 +96,10 @@ class GeminiClient:
             )
             return response.text
         except Exception as e:
-            raise AIError("Gemini API call failed", str(e)) from e
+            code = getattr(e, "code", None) or getattr(e, "status_code", None)
+            err = AIError("Gemini API call failed", str(e))
+            err.status_code = int(code) if code is not None else None
+            raise err from e
 
     def stream(
         self,
@@ -133,7 +138,10 @@ class GeminiClient:
                 if chunk.text:
                     yield chunk.text
         except Exception as e:
-            raise AIError("Gemini API stream failed", str(e)) from e
+            code = getattr(e, "code", None) or getattr(e, "status_code", None)
+            err = AIError("Gemini API stream failed", str(e))
+            err.status_code = int(code) if code is not None else None
+            raise err from e
 
     def chat_stream(
         self,
@@ -182,7 +190,10 @@ class GeminiClient:
                     yield {"content": chunk.text, "done": False}
             yield {"content": "", "done": True}
         except Exception as e:
-            raise AIError("Gemini API stream failed", str(e)) from e
+            code = getattr(e, "code", None) or getattr(e, "status_code", None)
+            err = AIError("Gemini API stream failed", str(e))
+            err.status_code = int(code) if code is not None else None
+            raise err from e
 
     def chat(
         self,
@@ -231,5 +242,8 @@ class GeminiClient:
                 "thinking": None,
             }
         except Exception as e:
-            raise AIError("Gemini API call failed", str(e)) from e
+            code = getattr(e, "code", None) or getattr(e, "status_code", None)
+            err = AIError("Gemini API call failed", str(e))
+            err.status_code = int(code) if code is not None else None
+            raise err from e
 

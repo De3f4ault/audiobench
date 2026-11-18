@@ -38,33 +38,13 @@ MAX_CONTEXT_WORDS = 6000
 
 
 def create_chat_client(model: str | None = None, settings: Any = None) -> Any:
-    """Instantiate the appropriate LLM client for the given model name."""
-    if settings is None:
-        from audiobench.core.settings import get_settings
+    """Instantiate the ProviderRouter for chat."""
+    from audiobench.chat.providers.router import router_for_settings
 
-        settings = get_settings()
-
-    model_clean = (model or "").lower().strip()
-
-    # Check for Gemini provider
-    if model_clean.startswith("gemini"):
-        from audiobench.chat.providers.gemini_provider import GeminiClient
-
-        gemini_client = GeminiClient(model=model or settings.gemini_model)
-        if gemini_client.is_available():
-            return gemini_client
-        logger.warning(
-            "Gemini model requested (%s) but GeminiClient is not available (check GEMINI_API_KEY).",
-            model,
-        )
-
-    # Default to Ollama provider
-    from audiobench.chat.providers.ollama_provider import OllamaClient
-
-    return OllamaClient(
-        base_url=settings.ollama_base_url,
-        model=model or settings.ollama_model,
-    )
+    router = router_for_settings(settings)
+    if model:
+        router.set_primary_model(model)
+    return router
 
 
 def _format_transcript_context_text(t: dict) -> tuple[str, bool]:
@@ -707,15 +687,20 @@ class ChatSession:
                 first_message=first_message[:200],
                 first_response=first_response[:200],
             )
-            # GeminiClient exposes .generate() for single-shot non-streaming prompts.
-            # OllamaClient exposes .chat() which returns {"content": "..."}.
-            # Use whichever the current client supports.
             if hasattr(self._client, "generate"):
-                title = self._client.generate(
-                    prompt=prompt,
-                    model=self._model,
-                    temperature=0.3,
-                ).strip()
+                try:
+                    outcome = self._client.generate(
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.3,
+                        digest_mode="passthrough",
+                    )
+                    title = outcome.content.strip() if hasattr(outcome, "content") else str(outcome).strip()
+                except TypeError:
+                    title = self._client.generate(
+                        prompt=prompt,
+                        model=self._model,
+                        temperature=0.3,
+                    ).strip()
             else:
                 result = self._client.chat(
                     messages=[{"role": "user", "content": prompt}],
@@ -780,32 +765,35 @@ class ChatSession:
 
         self._model = model
 
-        _is_gemini = model.lower().startswith("gemini")
-        _current_is_gemini = type(self._client).__name__ == "GeminiClient"
-
-        if _is_gemini:
-            from audiobench.chat.providers.gemini_provider import GeminiClient
-
-            if not _current_is_gemini or getattr(self._client, "_model", None) != model:
-                new_client = GeminiClient(model=model)
-                if not new_client.is_available():
-                    raise RuntimeError(
-                        "Gemini not available — check GEMINI_API_KEY in settings."
-                    )
-                self._client = new_client
+        if hasattr(self._client, "set_primary_model"):
+            self._client.set_primary_model(model)
         else:
-            from audiobench.chat.providers.ollama_provider import OllamaClient
+            _is_gemini = model.lower().startswith("gemini")
+            _current_is_gemini = type(self._client).__name__ == "GeminiClient"
 
-            if _current_is_gemini:
-                self._client = OllamaClient(
-                    base_url=settings.ollama_base_url,
-                    model=model,
-                )
+            if _is_gemini:
+                from audiobench.chat.providers.gemini_provider import GeminiClient
+
+                if not _current_is_gemini or getattr(self._client, "_model", None) != model:
+                    new_client = GeminiClient(model=model)
+                    if not new_client.is_available():
+                        raise RuntimeError(
+                            "Gemini not available — check GEMINI_API_KEY in settings."
+                        )
+                    self._client = new_client
             else:
-                if hasattr(self._client, "_model"):
-                    self._client._model = model
-                if hasattr(self._client, "model"):
-                    self._client.model = model
+                from audiobench.chat.providers.ollama_provider import OllamaClient
+
+                if _current_is_gemini:
+                    self._client = OllamaClient(
+                        base_url=settings.ollama_base_url,
+                        model=model,
+                    )
+                else:
+                    if hasattr(self._client, "_model"):
+                        self._client._model = model
+                    if hasattr(self._client, "model"):
+                        self._client.model = model
 
         if self._conversation_id and self._chat_repo:
             engine = "gemini" if _is_gemini else "ollama"

@@ -224,40 +224,26 @@ def _call_llm(
     llm: OllamaClient,
     api_key: str | None,
 ) -> LLMResult:
-    """Try Ollama, fall back to Gemini, return Ok or Err.
+    """DEPRECATED: delegates to ProviderRouter. Remove in wave 2."""
+    from audiobench.chat.providers.provider_outcome import OutcomeType
+    from audiobench.chat.providers.router import router_for_settings
+    from audiobench.core.settings import get_settings
 
-    When Ollama fails but Gemini succeeds, the returned Ok carries
-    ``fallback_from='ollama'`` and ``fallback_reason=<primary error>`` so
-    callers can surface the fallback in diagnostics (e.g. the synthesis footer).
-
-    Callers use structural pattern matching:
-
-        match _call_llm(prompt, 0.2, llm, api_key):
-            case Ok(value=answer): ...
-            case Err(error=reason): ...
-    """
-    result = _call_ollama(prompt, temperature, llm)
-    if isinstance(result, Ok):
-        return result  # no fallback; fallback_from / fallback_reason are None
-
-    primary_error = result.error
-    logger.warning("Ollama LLM call failed (%s), trying Gemini fallback", primary_error)
-
-    if not api_key:
-        return Err(error=f"{primary_error} | gemini: no api key configured")
-
-    gemini_result = _call_gemini(prompt, temperature, api_key)
-    if isinstance(gemini_result, Ok):
-        # Carry the primary failure info through so the synthesis footer can
-        # report "Ollama failed (reason), fell back to Gemini".
+    router = router_for_settings(get_settings())
+    outcome = router.generate(
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature,
+    )
+    if outcome.type == OutcomeType.OK:
         return Ok(
-            value=gemini_result.value,
-            model=gemini_result.model,
-            fallback_from="ollama",
-            fallback_reason=primary_error,
+            value=outcome.content,
+            model=outcome.provider or "unknown",
+            fallback_from=outcome.fallback_from,
+            fallback_reason=outcome.fallback_reason,
         )
-
-    return Err(error=f"{primary_error} | {gemini_result.error}")
+    if outcome.error is not None:
+        return Err(error=str(outcome.error))
+    return Err(error=f"Providers degraded ({outcome.degraded_mode or 'unknown'})")
 
 
 def _call_llm_for_model(
