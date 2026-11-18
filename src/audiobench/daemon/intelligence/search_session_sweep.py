@@ -59,6 +59,7 @@ class SearchSessionSweep(IntelligenceTask):
     EMBED_DIM: int = 768
 
     async def run(self) -> int:
+        logger.debug("SearchSessionSweep: cycle start")
         logger.info("SearchSessionSweep: starting run")
         await self._repair_missing_thematic_links()
         summaries = await self._auto_summarize_sessions()
