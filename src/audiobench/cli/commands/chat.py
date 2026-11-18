@@ -179,16 +179,17 @@ def ask(
     prompt = qa(record["full_text"], question)
 
     try:
-        client = OllamaClient(
-            base_url=settings.ollama_base_url,
-            model=model_name,
-        )
+        from audiobench.chat.chat_session import create_chat_client
+
+        client = create_chat_client(model_name, settings)
 
         if not client.is_available():
             console.print(
                 error_panel(
-                    "Ollama not running",
-                    "Start with: ollama serve",
+                    "No LLM provider available",
+                    "Neither local Ollama nor Gemini API is available.\n"
+                    "Start Ollama with: ollama serve\n"
+                    "Or set GEMINI_API_KEY for cloud access.",
                 )
             )
             return

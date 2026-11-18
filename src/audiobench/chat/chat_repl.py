@@ -134,15 +134,10 @@ class ChatREPL:
         self.start_voice = start_voice
 
         if session is None:
+            from audiobench.chat.chat_session import create_chat_client
+
             model_name = model or self.settings.ollama_model
-            if model_name.lower().startswith("gemini"):
-                from audiobench.chat.providers.gemini_provider import GeminiClient
-                client = GeminiClient(model=model_name)
-            else:
-                client = OllamaClient(
-                    base_url=self.settings.ollama_base_url,
-                    model=model_name,
-                )
+            client = create_chat_client(model_name, self.settings)
             self.session = ChatSession(
                 client=client,
                 chat_repo=self.chat_repo,
@@ -1259,11 +1254,18 @@ class ChatREPL:
                         first_response=last_assistant[:500]
                     )
                     try:
-                        if hasattr(self.session._client, "generate"):
-                            new_title = self.session._client.generate(
-                                prompt=prompt,
+                        if hasattr(self.session._client, "generate_text"):
+                            new_title = self.session._client.generate_text(
+                                [{"role": "user", "content": prompt}],
                                 temperature=0.3,
                             ).strip()
+                        elif hasattr(self.session._client, "generate"):
+                            res = self.session._client.generate(
+                                messages=[{"role": "user", "content": prompt}],
+                                temperature=0.3,
+                            )
+                            content = res.content if hasattr(res, "content") else res
+                            new_title = str(content).strip()
                         else:
                             result = self.session._client.chat(
                                 [{"role": "user", "content": prompt}], temperature=0.3

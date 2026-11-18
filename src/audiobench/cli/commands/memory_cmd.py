@@ -2130,12 +2130,15 @@ def _stream_expanded_synthesis(result: "ResearchResult") -> None:  # type: ignor
     from rich.markdown import Markdown as RichMarkdown
     from rich.padding import Padding
 
-    from audiobench.chat.providers.ollama_provider import OllamaClient
+    from audiobench.chat.providers.router import FallbackPolicy, router_for_settings
     from audiobench.cli.display.theme import CHAT_CODE_THEME, chat_console
     from audiobench.core.settings import get_settings
 
     settings = get_settings()
-    client = OllamaClient(base_url=settings.ollama_base_url, model=settings.ollama_model)
+    router = router_for_settings(settings)
+    active_model = getattr(state, "model", None) or settings.ollama_model
+    if active_model:
+        router.set_primary_model(active_model)
 
     prompt = (
         f"QUERY: {result.query}\n\n"
@@ -2159,7 +2162,7 @@ def _stream_expanded_synthesis(result: "ResearchResult") -> None:  # type: ignor
 
     try:
         with Live(console=chat_console, refresh_per_second=8, transient=True) as live:
-            for chunk in client.stream(
+            for chunk in router.stream(
                 prompt=prompt,
                 system_prompt=(
                     "You are a deep research assistant working with audio transcript fragments "
@@ -2170,6 +2173,7 @@ def _stream_expanded_synthesis(result: "ResearchResult") -> None:  # type: ignor
                     "Identify patterns, tensions, and open questions the user has not asked about explicitly. "
                     "Be thorough — this is a deep dive, not a summary."
                 ),
+                fallback_policy=FallbackPolicy.NO_LOCAL_CPU,
             ):
                 if chunk:
                     content_parts.append(chunk)

@@ -432,6 +432,7 @@ class ProviderRouter:
         think: bool = True,
         digest_mode: str = "notice",
         disclosure_fn: Callable[[str], None] | None = None,
+        fallback_policy: FallbackPolicy = FallbackPolicy.ALLOW_LOCAL,
         **kw,
     ) -> Iterator[dict]:
         """Streaming variant of generate."""
@@ -556,6 +557,35 @@ class ProviderRouter:
             if not retry_this_slot:
                 idx += 1
 
+        # ── All configured slots exhausted ────────────────────────────────────
+        # Last resort: try a small local Ollama model if permitted and error was quota
+        if (
+            fallback_policy == FallbackPolicy.ALLOW_LOCAL
+            and prev_err
+            and "quota" in prev_err.lower()
+        ):
+            local = self._discover_local_ollama()
+            if local:
+                try:
+                    from audiobench.chat.providers.ollama_provider import OllamaClient
+
+                    local_client = OllamaClient(
+                        base_url=self._settings.ollama_base_url, model=local
+                    )
+                    if tokens_emitted:
+                        yield {
+                            "notice": f"⚡ Cloud quota exhausted — continuing on local {local}",
+                            "content": "",
+                            "done": False,
+                        }
+                    for chunk in local_client.chat_stream(
+                        messages, temperature=temperature, think=False
+                    ):
+                        yield chunk
+                    return
+                except Exception as e:
+                    logger.warning("Local streaming fallback %s failed: %s", local, e)
+
         digest_content = self._digest.generate(messages, digest_mode=digest_mode, **kw)
         if disclosure_fn:
             disclosure_fn(f"⚠ All providers unavailable — showing degraded response ({digest_mode})")
@@ -573,8 +603,9 @@ class ProviderRouter:
         temperature: float = 0.7,
         num_ctx: int | None = None,
         think: bool = True,
+        **kw,
     ) -> Iterator[dict]:
-        yield from self.generate_stream(messages, temperature=temperature, think=think)
+        yield from self.generate_stream(messages, model=model, temperature=temperature, think=think, **kw)
 
     def chat(
         self,
